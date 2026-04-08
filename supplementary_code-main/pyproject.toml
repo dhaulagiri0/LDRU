@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ldru"
+version = "0.1.0"
+description = "Log-Depth Recurrent Unit Experiments"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "jax",
+    "jaxlib",
+    "dm-haiku",
+    "flax",
+    "chex",
+    "optax",
+    "tqdm",
+    "dm-tree",
+    "absl-py",
+    "tensorboardX",
+    "scikit-learn",
+    "matplotlib",
+    "pandas",
+    "seaborn",
+]
+
+[tool.setuptools]
+packages = ["ldru"]

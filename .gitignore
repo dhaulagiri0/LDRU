@@ -3,7 +3,6 @@ checkpoints/
 seq_seq_logs/
 my_comparison/
 my_comparison_2/
-supplementary_code-main/
 *.model
 *.vocab
 *.txt

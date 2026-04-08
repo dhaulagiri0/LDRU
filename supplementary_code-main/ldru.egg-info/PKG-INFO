@@ -1,0 +1,20 @@
+Metadata-Version: 2.4
+Name: ldru
+Version: 0.1.0
+Summary: Log-Depth Recurrent Unit Experiments
+Requires-Python: >=3.10
+Requires-Dist: numpy
+Requires-Dist: jax
+Requires-Dist: jaxlib
+Requires-Dist: dm-haiku
+Requires-Dist: flax
+Requires-Dist: chex
+Requires-Dist: optax
+Requires-Dist: tqdm
+Requires-Dist: dm-tree
+Requires-Dist: absl-py
+Requires-Dist: tensorboardX
+Requires-Dist: scikit-learn
+Requires-Dist: matplotlib
+Requires-Dist: pandas
+Requires-Dist: seaborn
