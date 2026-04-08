@@ -172,7 +172,7 @@ def layer_norm(x: jnp.ndarray, name: Optional[str] = None) -> jnp.ndarray:
 class CausalLDRULayer(hk.Module):
     """Modified LDRU layer that handles causal masking and position preservation."""
 
-    def __init__(self, config: CausalLDRUConfig):
+    def __init__(self, config: CausalLDRUConfig, use_mlp: bool = False):
         super().__init__(name="CausalLDRULayer")
         self.config = config
         self.inner_norm = hk.LayerNorm(
@@ -195,6 +195,7 @@ class CausalLDRULayer(hk.Module):
         )
         self.fc_1 = hk.Linear(config.embedding_dim, w_init=init)
         self.fc = hk.Sequential([self.fc_0, jnn.silu, self.fc_1])
+        self.mlp = self._resnet_feedforward if use_mlp else None
 
     def _make_pure_binary_op(self, dummy_input):
         """
@@ -804,13 +805,12 @@ class CausalLDRULayer(hk.Module):
         # Apply layer norm first for stability
         h = self.init_norm(h)
 
-        # Apply feedforward network (can switch between simple and ResNet-inspired)
-        original_h = h  # Store for global residual connection
-        h = self._resnet_feedforward(h)
-        # h = self._simple_feedforward(h)
-
-        # Add global residual connection (like in ResNet)
-        h = h + original_h  # Scale down the residual for stability
+        if self.mlp is not None:
+            # Apply feedforward network (can switch between simple and ResNet-inspired)
+            original_h = h  # Store for global residual connection
+            h = self.mlp(h)
+            # Add global residual connection (like in ResNet)
+            h = h + original_h  # Scale down the residual for stability
 
         # Apply simplified causal processing
         if L > 1:
@@ -878,7 +878,9 @@ class CausalLDRUEncoder(hk.Module):
         h = x
 
         # Apply multiple LDRU layers with residual connections
-        for layer_idx in range(self.config.num_layers):
+        first_layer = CausalLDRULayer(self.config, use_mlp=True)
+        h = first_layer(h) + 0.1 * h  # Small residual for stability
+        for layer_idx in range(self.config.num_layers - 1):
             layer = CausalLDRULayer(self.config)
             h = layer(h) + 0.1 * h  # Small residual for stability
 
@@ -937,6 +939,12 @@ class CausalLDRULanguageModel(hk.Module):
             positions = jnp.arange(L)[None, :]  # [1, L]
             pos_embeddings = self.pos_embedding(positions)
             embeddings = embeddings + pos_embeddings
+
+        # dropout on embeddings for regularization
+        if is_training:
+            embeddings = hk.dropout(
+                hk.next_rng_key(), self.config.dropout_prob, embeddings
+            )
 
         # Apply LDRU encoder
         hidden_states = self.encoder(embeddings)

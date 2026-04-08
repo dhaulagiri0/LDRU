@@ -35,8 +35,10 @@ import sentencepiece as spm
 DEFAULT_TOKENIZER_FOLDER = "tokenizers"
 
 
-# Enum for tokenizer types
-class TokenizerType:
+from enum import Enum
+
+
+class TokenizerType(str, Enum):
     SENTENCEPIECE = "sentencepiece"
     TEXT = "text"
 
@@ -682,7 +684,7 @@ def create_transformer_model(config: CausalLDRUConfig):
             positional_encodings_params=pos_encs_lib.SinCosParams(
                 max_time=config.max_sequence_length
             ),
-            widening_factor=4,
+            widening_factor=16,
             causal_masking=True,  # Critical for causal language modeling
         )
 
@@ -942,9 +944,9 @@ def train_model(
     config_params = {
         "embedding_dim": 300,  # Larger for word-level
         "num_layers": 1,
-        "max_sequence_length": 512,
+        "max_sequence_length": 128,
         "dropout_prob": 0.3,
-        "hidden_dim": 512,
+        "hidden_dim": 256,
         "use_positional_encoding": (
             True if use_transformer or use_transformer_ldru else False
         ),
@@ -2586,6 +2588,219 @@ def _plot_comparison_metrics(
     plt.close(fig)
 
 
+def evaluate_sequence_length_range(
+    checkpoint_path: str,
+    eval_text_file: str,
+    step: int = 1,
+    min_seq_len: int = 4,
+    max_seq_len: int = 64,
+    plot_dir: str = None,
+    batch_size: int = 64,
+):
+    """
+    Evaluate a checkpoint across a range of sequence lengths (min_seq_len to
+    max_seq_len inclusive, step 1).  For each length L the evaluation text is
+    re-tokenised into windows of length L and the aggregate loss / perplexity /
+    accuracy are computed.  A summary plot of perplexity vs sequence length is
+    saved to *plot_dir*.
+
+    Usage example::
+
+        python train_causal_ldru.py \\
+            --eval_seq_len_range checkpoints/my_model \\
+            --eval_file ptb_test.txt \\
+            --min_seq_len 4 --max_seq_len 64
+
+    Args:
+        checkpoint_path: Directory of the Orbax checkpoint to load.
+        eval_text_file:  Path to the .txt evaluation file.
+        step:            Checkpoint step to load (default: 1).
+        min_seq_len:     Smallest sequence length to evaluate (default: 4).
+        max_seq_len:     Largest  sequence length to evaluate (default: 64).
+        plot_dir:        Where to save the summary plot and CSV.  Defaults to
+                         ``eval_plots/<checkpoint_stem>_seqlen_range/``.
+        batch_size:      Batch size for evaluation (default: 64).
+
+    Returns:
+        List of dicts, one per evaluated length, with keys
+        ``seq_len``, ``n_sequences``, ``loss``, ``perplexity``, ``accuracy``.
+    """
+    if min_seq_len < 2:
+        raise ValueError("min_seq_len must be >= 2 (need at least input + one target)")
+    if max_seq_len < min_seq_len:
+        raise ValueError("max_seq_len must be >= min_seq_len")
+
+    # --- load checkpoint once ---
+    params, _, config, epoch, best_ppl, tokenizer = load_checkpoint(
+        checkpoint_path, step=step
+    )
+    if tokenizer is None:
+        raise ValueError(
+            "Checkpoint does not contain a saved tokenizer. "
+            "Please pass --tokenizer_path so the tokenizer can be loaded."
+        )
+
+    model_creation_fn, model_type_str, seq2seq = _detect_model_type(checkpoint_path)
+    eval_model = create_evaluation_model(config, model_creation_fn)
+
+    cp_lower = checkpoint_path.lower()
+    use_lstm = "lstm" in cp_lower
+    use_transformer_ldru = (
+        "transformer_ldru" in cp_lower and "ldru_transformer" not in cp_lower
+    )
+    use_ldru_transformer = "ldru_transformer" in cp_lower
+    use_transformer = (
+        "transformer" in cp_lower
+        and not use_transformer_ldru
+        and not use_ldru_transformer
+    )
+
+    # --- read the raw text once ---
+    with open(eval_text_file, "r", encoding="utf-8") as fh:
+        text = fh.read()
+
+    seq_lengths = list(range(min_seq_len, max_seq_len + 1, 4))
+
+    if plot_dir is None:
+        ckpt_stem = os.path.basename(checkpoint_path.rstrip("/"))
+        plot_dir = os.path.join("eval_plots", f"{ckpt_stem}_seqlen_range")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    print(f"\n{'=' * 60}")
+    print(f"  Sequence-Length Range Evaluation")
+    print(f"{'=' * 60}")
+    print(f"  Checkpoint : {checkpoint_path}")
+    print(f"  Eval file  : {eval_text_file}")
+    print(f"  Model type : {model_type_str}")
+    print(f"  Lengths    : {min_seq_len} → {max_seq_len} (step 1)")
+    print(f"  Output dir : {plot_dir}")
+    print(f"{'=' * 60}\n")
+
+    results = []
+    rng_key = jax.random.PRNGKey(0)
+
+    for seq_len in tqdm.tqdm(seq_lengths, desc="Seq lengths"):
+        stride = max(1, seq_len // 2)
+        sequences = create_text_dataset(text, tokenizer, seq_len, stride)
+
+        if len(sequences) == 0:
+            print(f"  [seq_len={seq_len}] No sequences produced – skipping.")
+            continue
+
+        rng_key, eval_key = jax.random.split(rng_key)
+        avg_loss, avg_metrics = evaluate_model(
+            params=params,
+            model=None,
+            rng_key=eval_key,
+            val_data=sequences,
+            batch_size=batch_size,
+            use_lstm=use_lstm,
+            use_transformer=use_transformer,
+            use_transformer_ldru=use_transformer_ldru,
+            use_ldru_transformer=use_ldru_transformer,
+            seq2seq=seq2seq,
+            eval_model=eval_model,
+        )
+
+        row = {
+            "seq_len": seq_len,
+            "n_sequences": int(len(sequences)),
+            "loss": float(avg_loss),
+            "perplexity": float(avg_metrics["perplexity"]),
+            "accuracy": float(avg_metrics["accuracy"]),
+        }
+        results.append(row)
+        print(
+            f"  seq_len={seq_len:4d} | n={row['n_sequences']:6,} | "
+            f"loss={row['loss']:.4f} | ppl={row['perplexity']:.4f} | acc={row['accuracy']:.4f}"
+        )
+
+    if not results:
+        print("No results collected – check that the eval file has enough text.")
+        return results
+
+    # --- save CSV ---
+    csv_path = os.path.join(plot_dir, "seqlen_range_results.csv")
+    with open(csv_path, "w") as fh:
+        fh.write("seq_len,n_sequences,loss,perplexity,accuracy\n")
+        for r in results:
+            fh.write(
+                f"{r['seq_len']},{r['n_sequences']},{r['loss']:.6f},{r['perplexity']:.6f},{r['accuracy']:.6f}\n"
+            )
+    print(f"\n  CSV  → {csv_path}")
+
+    # --- save JSON ---
+    json_path = os.path.join(plot_dir, "seqlen_range_results.json")
+    with open(json_path, "w") as fh:
+        json.dump(results, fh, indent=2)
+    print(f"  JSON → {json_path}")
+
+    # --- plot ---
+    seq_lens_arr = np.array([r["seq_len"] for r in results])
+    perplexities = np.array([r["perplexity"] for r in results])
+    accuracies = np.array([r["accuracy"] for r in results])
+
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+
+    color_ppl = "#4C72B0"
+    ax1.plot(
+        seq_lens_arr,
+        perplexities,
+        color=color_ppl,
+        marker="o",
+        markersize=4,
+        linewidth=1.5,
+        label="Perplexity",
+    )
+    ax1.set_xlabel("Sequence Length", fontsize=12)
+    ax1.set_ylabel("Perplexity", color=color_ppl, fontsize=12)
+    ax1.tick_params(axis="y", labelcolor=color_ppl)
+    ax1.set_yscale("log")
+
+    ax2 = ax1.twinx()
+    color_acc = "#DD8452"
+    ax2.plot(
+        seq_lens_arr,
+        accuracies,
+        color=color_acc,
+        marker="s",
+        markersize=4,
+        linewidth=1.5,
+        linestyle="--",
+        label="Accuracy",
+    )
+    ax2.set_ylabel("Accuracy", color=color_acc, fontsize=12)
+    ax2.tick_params(axis="y", labelcolor=color_acc)
+    ax2.set_ylim(0, 1.05)
+
+    ckpt_stem = os.path.basename(checkpoint_path.rstrip("/"))
+    ax1.set_title(
+        f"Perplexity & Accuracy vs Sequence Length\n{ckpt_stem}  |  lengths {min_seq_len}–{max_seq_len}",
+        fontsize=11,
+        fontweight="bold",
+    )
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=9, loc="upper right")
+
+    fig.tight_layout()
+    plot_path = os.path.join(plot_dir, "seqlen_range_plot.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Plot → {plot_path}")
+
+    print(
+        f"\n  Best PPL  : {perplexities.min():.4f} at seq_len={seq_lens_arr[perplexities.argmin()]}"
+    )
+    print(
+        f"  Best Acc  : {accuracies.max():.4f} at seq_len={seq_lens_arr[accuracies.argmax()]}"
+    )
+    print(f"{'=' * 60}\n")
+
+    return results
+
+
 def compare_models(
     checkpoint_paths: List[str],
     eval_text_file: str,
@@ -2970,7 +3185,43 @@ if __name__ == "__main__":
         default=1e-2,
         help="L2 regularization lambda for training (default: 1e-2)",
     )
+    parser.add_argument(
+        "--eval_seq_len_range",
+        type=str,
+        default=None,
+        metavar="CHECKPOINT_DIR",
+        help="Evaluate a checkpoint over a range of sequence lengths. "
+        "Use with --eval_file, --min_seq_len, and --max_seq_len.",
+    )
+    parser.add_argument(
+        "--min_seq_len",
+        type=int,
+        default=4,
+        help="Minimum sequence length for --eval_seq_len_range (default: 4)",
+    )
+    parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=64,
+        help="Maximum sequence length for --eval_seq_len_range (default: 64)",
+    )
     args = parser.parse_args()
+
+    # Sequence-length range evaluation mode
+    if args.eval_seq_len_range:
+        eval_file = args.eval_file if args.eval_file else args.text_file
+        if not eval_file:
+            print("Error: --eval_seq_len_range requires --eval_file (or --text_file).")
+            exit(1)
+        evaluate_sequence_length_range(
+            checkpoint_path=args.eval_seq_len_range,
+            eval_text_file=eval_file,
+            step=args.eval_step,
+            min_seq_len=args.min_seq_len,
+            max_seq_len=args.max_seq_len,
+            plot_dir=args.plot_dir,
+        )
+        exit(0)
 
     # Compare mode - evaluate multiple models on the same sequences
     if args.compare:
@@ -3128,4 +3379,6 @@ if __name__ == "__main__":
     print(f"- Uses positional encoding: {config.use_positional_encoding}")
 
     if tokenizer:
-        print(f"- Word-level tokenization with {tokenizer.vocab_size} unique words")
+        print(
+            f"- Word-level tokenization with {tokenizer.get_piece_size()} unique words"
+        )
