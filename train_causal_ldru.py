@@ -939,6 +939,8 @@ def train_model(
     max_vocab_size: int = 1500,  # Maximum vocabulary size for tokenizer
     tokenizer_type: TokenizerType = TokenizerType.SENTENCEPIECE,  # Type of tokenizer to use
     model_prefix: str = "",  # Prefix for model name in checkpoints and logs
+    seq_length: int = 32,
+    batch_size: int = 512,  # Batch size for training
 ):
     """Main training function."""
 
@@ -957,9 +959,11 @@ def train_model(
 
     # Training hyperparameters - adjusted for LDRU's single-output nature
     learning_rate = initial_learning_rate  # Use parameter instead of hardcoded value
-    batch_size = 512  # Larger batch size for more stable gradients
+    batch_size = batch_size  # Larger batch size for more stable gradients
     num_epochs = 100
-    seq_length = 32  # Shorter sequences: [31 context tokens] -> [1 target token]
+    seq_length = (
+        seq_length  # Shorter sequences: [31 context tokens] -> [1 target token]
+    )
     min_learning_rate = 1e-6  # Minimum learning rate threshold
 
     model_type = (
@@ -2898,6 +2902,12 @@ if __name__ == "__main__":
         default=None,
         help="Path to the log file for printing (default: None)",
     )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=512,
+        help="Batch size for aggregate evaluation when --n_sequences 0 (default: 32)",
+    )
     args = parser.parse_args()
 
     configure_output(args.print_log_file)
@@ -3062,6 +3072,8 @@ if __name__ == "__main__":
         tokenizer_type=args.tokenizer_type,
         model_prefix=args.model_name_prefix,
         l2_lambda=args.l2_lambda,
+        seq_length=args.max_seq_len,
+        batch_size=args.batch_size,
     )
 
     print(f"\\nModel Summary:")
