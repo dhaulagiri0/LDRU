@@ -2481,7 +2481,7 @@ def evaluate_sequence_length_range(
     min_seq_len: int = 4,
     max_seq_len: int = 64,
     plot_dir: str = None,
-    batch_size: int = 64,
+    batch_size: int = 512,
 ):
     """
     Evaluate a checkpoint across a range of sequence lengths (min_seq_len to
@@ -2545,7 +2545,7 @@ def evaluate_sequence_length_range(
     with open(eval_text_file, "r", encoding="utf-8") as fh:
         text = fh.read()
 
-    seq_lengths = list(range(min_seq_len, max_seq_len + 1, 4))
+    seq_lengths = list(range(min_seq_len, max_seq_len + 1, 32))
 
     if plot_dir is None:
         ckpt_stem = os.path.basename(checkpoint_path.rstrip("/"))
@@ -2572,6 +2572,10 @@ def evaluate_sequence_length_range(
         if len(sequences) == 0:
             print(f"  [seq_len={seq_len}] No sequences produced – skipping.")
             continue
+
+        # change batch size dynamically based on sequence length to keep evaluation time reasonable
+        max_batch_size_seq_len = 512 * 256
+        batch_size = min(batch_size, max_batch_size_seq_len // seq_len)
 
         rng_key, eval_key = jax.random.split(rng_key)
         avg_loss, avg_metrics = evaluate_model(
