@@ -62,6 +62,9 @@ class CausalLDRUConfig:
     # Whether to apply attention at each scan step in custom associative scan
     attention_per_scan_step: bool = False
 
+    # specifies transformer encoding type
+    use_alibi: bool = False  # defaults to sin cos
+
 
 class BinaryOperator(hk.Module):
     """Binary operator from LDRU v2 - handles (..., 2, E) input."""
