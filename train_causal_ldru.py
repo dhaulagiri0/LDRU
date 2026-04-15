@@ -13,6 +13,7 @@ import os
 import json
 import orbax.checkpoint as ocp
 import datetime
+import shutil
 
 matplotlib.use("Agg")  # Non-interactive backend for saving plots
 import matplotlib.pyplot as plt
@@ -668,7 +669,7 @@ def create_lstm_model(config: CausalLDRUConfig):
 def create_transformer_model(config: CausalLDRUConfig):
     """Create a transformer decoder model for causal language modeling."""
     import haiku as hk
-    
+
     if True:
         print("Using ALiBi positional encodings for transformer model.")
         pos_encs = pos_encs_lib.PositionalEncodings.ALIBI
@@ -1230,6 +1231,7 @@ def train_model(
                         "val_perplexity": val_metrics["perplexity"],
                     },
                     tokenizer=tokenizer,  # Save tokenizer with checkpoint
+                    save_best_only=True,  # Only save when we have a new best validation perplexity
                 )
                 print(f"New best validation perplexity: {best_val_perplexity:.4f}")
         else:
@@ -1278,10 +1280,8 @@ def train_model(
 
     # Save final checkpoint
     if save_checkpoints:
-        model_type = "lstm" if use_lstm else "ldru"
-        loss_type = "seq2seq" if seq2seq else "lastpos"
-        final_checkpoint_filename = f"final_model_{model_type}_{loss_type}"
-        final_checkpoint_path = os.path.join(checkpoint_dir, final_checkpoint_filename)
+        # save to the same checkpoint path
+        final_checkpoint_path = os.path.join(checkpoint_dir, f"{model_name}")
 
         save_checkpoint(
             checkpoint_dir=final_checkpoint_path,
@@ -1291,6 +1291,7 @@ def train_model(
             config=config,
             best_val_perplexity=best_val_perplexity,
             metrics={"final_training": True},
+            save_best_only=False,  # Save final model regardless of validation performance
         )
         print(f"Saved final checkpoint: {final_checkpoint_path}")
 
@@ -1397,9 +1398,16 @@ def save_checkpoint(
     best_val_perplexity: float,
     metrics: dict = None,
     tokenizer: Optional[BaseTokenizer] = None,
+    save_best_only: bool = True,
 ):
     """
     Save JAX training state using Orbax.
+
+    This implementation keeps only a single "step_*" checkpoint inside the
+    provided checkpoint directory. When called during training to save an
+    improved validation checkpoint, older step_* directories are removed so
+    disk usage does not grow. Final models should be saved to a separate
+    directory (the training code already does this) and will not be affected.
     """
     checkpoint_dir = os.path.abspath(checkpoint_dir)
     # Ensure directory exists
@@ -1414,41 +1422,70 @@ def save_checkpoint(
         "optimizer_state": optimizer_state,
     }
 
-    # Save PyTree
-    checkpointer.save(
-        os.path.join(checkpoint_dir, f"step_{step}"),
-        ckpt,
-    )
-
-    # Save metadata separately (JSON is safer than pickle)
-    # Convert config to dict for JSON serialization
-    if hasattr(config, "__dict__"):
-        config_dict = config.__dict__.copy()
-    else:
-        config_dict = dict(config) if isinstance(config, dict) else {}
-
-    metadata = {
-        "step": step,
-        "best_val_perplexity": best_val_perplexity,
-        "config": config_dict,
-        "tokenizer_type": tokenizer.get_tokenizer_type() if tokenizer else None,
-        "tokenizer_path": tokenizer.get_tokenizer_path() if tokenizer else None,
-    }
-
-    # Include metrics in metadata if provided
-    if metrics is not None:
-        for key, value in metrics.items():
-            if isinstance(value, (float, int)):
-                metadata[key] = value
+    # Save PyTree to a step-specific subdirectory
+    if save_best_only:
+        # check if metadata already exists to determine if this is the first checkpoint
+        metadata_path = os.path.join(checkpoint_dir, "metadata.json")
+        if os.path.exists(metadata_path):
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+            old_best_ppl = metadata.get("best_val_perplexity", float("inf"))
+            if best_val_perplexity >= old_best_ppl:
+                print(
+                    f"Current validation perplexity ({best_val_perplexity:.4f}) is not better than the previous best ({old_best_ppl:.4f}). Skipping checkpoint save."
+                )
+                return
             else:
                 print(
-                    f"Warning: Metric '{key}' has non-scalar value and will not be saved."
+                    f"New best validation perplexity ({best_val_perplexity:.4f}) is better than the previous best ({old_best_ppl:.4f}). Saving checkpoint."
                 )
+        # Remove old checkpoints in the directory
+        for filename in os.listdir(checkpoint_dir):
+            # assume all best models are saved in best_model subdirectory
+            if filename.startswith("best_model"):
+                old_checkpoint_path = os.path.join(checkpoint_dir, filename)
+                if os.path.isdir(old_checkpoint_path):
+                    shutil.rmtree(old_checkpoint_path)
+                    print(f"Removed old checkpoint: {old_checkpoint_path}")
+        step_path = os.path.join(checkpoint_dir, f"best_model")
+    else:
+        step_path = os.path.join(checkpoint_dir, f"step_{step}")
+    checkpointer.save(step_path, ckpt)
 
-    with open(os.path.join(checkpoint_dir, "metadata.json"), "w") as f:
-        json.dump(metadata, f, indent=2)
+    # skip writing metadata if we are not saving this checkpoint
+    if save_best_only:
+        print(
+            f"Checkpoint saved to {step_path} (best validation perplexity: {best_val_perplexity:.4f})"
+        )
+        # Save metadata separately (JSON is safer than pickle)
+        # Convert config to dict for JSON serialization
+        if hasattr(config, "__dict__"):
+            config_dict = config.__dict__.copy()
+        else:
+            config_dict = dict(config) if isinstance(config, dict) else {}
 
-    print(f"Saved checkpoint at step {step}")
+        metadata = {
+            "step": step,
+            "best_val_perplexity": best_val_perplexity,
+            "config": config_dict,
+            "tokenizer_type": tokenizer.get_tokenizer_type() if tokenizer else None,
+            "tokenizer_path": tokenizer.get_tokenizer_path() if tokenizer else None,
+        }
+
+        # Include metrics in metadata if provided
+        if metrics is not None:
+            for key, value in metrics.items():
+                if isinstance(value, (float, int)):
+                    metadata[key] = value
+                else:
+                    print(
+                        f"Warning: Metric '{key}' has non-scalar value and will not be saved."
+                    )
+
+        with open(os.path.join(checkpoint_dir, "metadata.json"), "w") as f:
+            json.dump(metadata, f, indent=2)
+
+    print(f"Saved checkpoint at step {step} -> {step_path}")
 
 
 def load_checkpoint(checkpoint_dir: str, step: int):
@@ -2319,7 +2356,7 @@ def evaluate_from_checkpoint(
         eval_text_file: Path to the .txt file to evaluate on.
         seq_length: Sequence length (default: 32).
         stride: Stride between sequences (default: seq_length // 2).
-        n_sequences: Number of sequences to evaluate and plot.
+        n_sequences: Number of sequences to evaluate and plot (default: 10).
                      0 = aggregate-only over all sequences (no plots).
         plot_dir: Directory to save plots.  Defaults to
                   ``eval_plots/<checkpoint_stem>/``.
@@ -2713,6 +2750,7 @@ def compare_models(
         seq_length: Sequence length (default: 32).
         stride: Stride between sequences (default: seq_length // 2).
         n_sequences: Number of sequences to compare (default: 10).
+                     0 = aggregate-only over all sequences (no plots).
         plot_dir: Output directory.  Defaults to ``eval_plots/comparison/``.
 
     Returns:
@@ -2766,19 +2804,6 @@ def compare_models(
     text = load_text(eval_text_file)
     sequences = create_text_dataset(text, tokenizer, seq_length, stride)
     print(f"  Total sequences available: {len(sequences):,}")
-
-    # Diagnostic: UNK rate
-    unk_id = tokenizer.word_to_id.get("<UNK>", 1)
-    flat_tokens = np.array(sequences).flatten()
-    n_unk = int(np.sum(flat_tokens == unk_id))
-    n_total_tokens = len(flat_tokens)
-    unk_rate = n_unk / max(n_total_tokens, 1)
-    print(f"  UNK tokens : {n_unk:,} / {n_total_tokens:,} ({unk_rate:.2%})")
-    if unk_rate > 0.05:
-        print(
-            f"High UNK rate ({unk_rate:.1%})! The eval text has many words "
-            f"not in the training vocabulary. This will inflate perplexity."
-        )
 
     chosen_indices = _choose_sequence_indices(len(sequences), n_sequences)
     n_sequences = len(chosen_indices)
