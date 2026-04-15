@@ -668,34 +668,34 @@ def create_lstm_model(config: CausalLDRUConfig):
 def create_transformer_model(config: CausalLDRUConfig):
     """Create a transformer decoder model for causal language modeling."""
     import haiku as hk
+    
+    if True:
+        print("Using ALiBi positional encodings for transformer model.")
+        pos_encs = pos_encs_lib.PositionalEncodings.ALIBI
+    else:
+        pos_encs = pos_encs_lib.PositionalEncodings.SIN_COS
+    # Create transformer config with causal masking enabled
+    transformer_config = TransformerConfig(
+        output_size=config.vocab_size,
+        embedding_dim=config.embedding_dim,
+        num_layers=5,
+        num_heads=8,
+        dropout_prob=config.dropout_prob,
+        emb_init_scale=0.02,
+        use_embeddings=True,
+        share_embeddings=False,
+        chunk_size=None,  # Use full attention
+        positional_encodings=pos_encs,
+        positional_encodings_params=(
+            pos_encs_lib.SinCosParams(max_time=config.max_sequence_length)
+            if not config.use_alibi
+            else None
+        ),
+        widening_factor=16,
+        causal_masking=True,  # Critical for causal language modeling
+    )
 
     def transformer_forward(token_ids):
-        if config.use_alibi:
-            print("Using ALiBi positional encodings for transformer model.")
-            pos_encs = pos_encs_lib.PositionalEncodings.ALIBI
-        else:
-            pos_encs = pos_encs_lib.PositionalEncodings.SIN_COS
-        # Create transformer config with causal masking enabled
-        transformer_config = TransformerConfig(
-            output_size=config.vocab_size,
-            embedding_dim=config.embedding_dim,
-            num_layers=5,
-            num_heads=8,
-            dropout_prob=config.dropout_prob,
-            emb_init_scale=0.02,
-            use_embeddings=True,
-            share_embeddings=False,
-            chunk_size=None,  # Use full attention
-            positional_encodings=pos_encs,
-            positional_encodings_params=(
-                pos_encs_lib.SinCosParams(max_time=config.max_sequence_length)
-                if not config.use_alibi
-                else None
-            ),
-            widening_factor=16,
-            causal_masking=True,  # Critical for causal language modeling
-        )
-
         # Convert token_ids to one-hot encoding as expected by the transformer
         one_hot_inputs = jax.nn.one_hot(token_ids, config.vocab_size)
 
@@ -2545,7 +2545,7 @@ def evaluate_sequence_length_range(
     with open(eval_text_file, "r", encoding="utf-8") as fh:
         text = fh.read()
 
-    seq_lengths = list(range(min_seq_len, max_seq_len + 1, 32))
+    seq_lengths = list(range(min_seq_len, max_seq_len + 1, 128))
 
     if plot_dir is None:
         ckpt_stem = os.path.basename(checkpoint_path.rstrip("/"))
@@ -2574,7 +2574,7 @@ def evaluate_sequence_length_range(
             continue
 
         # change batch size dynamically based on sequence length to keep evaluation time reasonable
-        max_batch_size_seq_len = 512 * 256
+        max_batch_size_seq_len = 512 * 128
         batch_size = min(batch_size, max_batch_size_seq_len // seq_len)
 
         rng_key, eval_key = jax.random.split(rng_key)
@@ -2924,6 +2924,7 @@ def configure_output(file_path: Optional[str]):
         return
 
     # Ensure directory exists
+    print(f"directory provided: {file_path}")
     dir_name = os.path.dirname(file_path)
     if dir_name:
         os.makedirs(dir_name, exist_ok=True)
