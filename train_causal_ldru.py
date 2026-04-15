@@ -970,7 +970,7 @@ def train_model(
     # Training hyperparameters - adjusted for LDRU's single-output nature
     learning_rate = initial_learning_rate  # Use parameter instead of hardcoded value
     batch_size = batch_size  # Larger batch size for more stable gradients
-    num_epochs = 100
+    num_epochs = 1
     seq_length = (
         seq_length  # Shorter sequences: [31 context tokens] -> [1 target token]
     )
@@ -1439,17 +1439,19 @@ def save_checkpoint(
                 print(
                     f"New best validation perplexity ({best_val_perplexity:.4f}) is better than the previous best ({old_best_ppl:.4f}). Saving checkpoint."
                 )
-        # Remove old checkpoints in the directory
-        for filename in os.listdir(checkpoint_dir):
-            # assume all best models are saved in best_model subdirectory
-            if filename.startswith("best_model"):
-                old_checkpoint_path = os.path.join(checkpoint_dir, filename)
-                if os.path.isdir(old_checkpoint_path):
-                    shutil.rmtree(old_checkpoint_path)
-                    print(f"Removed old checkpoint: {old_checkpoint_path}")
+        save_folder_name = f"best_model"
         step_path = os.path.join(checkpoint_dir, f"best_model")
     else:
+        save_folder_name = f"step_{step}"
         step_path = os.path.join(checkpoint_dir, f"step_{step}")
+    # Remove old checkpoints in the directory
+    for filename in os.listdir(checkpoint_dir):
+        # check if step_path already exists to avoid deleting the checkpoint we just saved
+        if filename == save_folder_name:
+            old_checkpoint_path = os.path.join(checkpoint_dir, filename)
+            if os.path.isdir(old_checkpoint_path):
+                shutil.rmtree(old_checkpoint_path)
+                print(f"Removed old checkpoint: {old_checkpoint_path}")
     checkpointer.save(step_path, ckpt)
 
     # skip writing metadata if we are not saving this checkpoint
@@ -1676,7 +1678,10 @@ def evaluate_model(
     per_position_perplexities = []  # For seq2seq models
     per_position_losses = []
 
-    for batch in val_loader:
+    # Wrap validation iterator with tqdm for progress reporting
+    pbar = tqdm.tqdm(val_loader, desc="Validation", leave=False)
+
+    for batch in pbar:
         rng_key, step_key = jax.random.split(rng_key)
 
         # Choose appropriate loss function
@@ -1731,6 +1736,14 @@ def evaluate_model(
                 np.array(metrics["per_position_perplexity"])
             )
             per_position_losses.append(np.array(metrics["per_position_loss"]))
+
+        pbar.set_postfix(
+            {
+                "Loss": f"{np.mean(losses):.4f}",
+                "Acc": f"{np.mean(accuracies):.4f}",
+                "PPL": f"{np.mean(perplexities):.1f}",
+            }
+        )
 
     avg_loss = np.mean(losses)
     avg_metrics = {"accuracy": np.mean(accuracies), "perplexity": np.mean(perplexities)}
