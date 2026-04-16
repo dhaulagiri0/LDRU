@@ -925,6 +925,25 @@ def create_datasets_for_training(
 
     return train_data, val_data, test_data
 
+def make_eval_step(
+    model,
+    use_lstm=False,
+    use_transformer=False,
+    use_transformer_ldru=False,
+    use_ldru_transformer=False,
+    seq2seq=True,
+):
+    if use_transformer or use_transformer_ldru or use_ldru_transformer:
+        loss_fn = ldru_seq2seq_loss if seq2seq else next_token_loss
+    elif use_lstm:
+        loss_fn = lstm_next_token_loss if seq2seq else lstm_last_position_loss
+    else:
+        loss_fn = ldru_seq2seq_loss if seq2seq else next_token_loss
+
+    def _eval_step(params, key, batch):
+        return loss_fn(params, model, key, batch)
+
+    return jax.jit(_eval_step)
 
 def train_model(
     log_dir: str,
@@ -957,7 +976,7 @@ def train_model(
     config_params = {
         "embedding_dim": 300,  # Larger for word-level
         "num_layers": 1,
-        "max_sequence_length": 128,
+        "max_sequence_length": 3072,
         "dropout_prob": 0.3,
         "hidden_dim": 256,
         "use_positional_encoding": (
@@ -1064,6 +1083,15 @@ def train_model(
         ),  # Use AMSGrad for better convergence
     )
     opt_state = optimizer.init(params)
+
+    compiled_eval_step = make_eval_step(
+        eval_model,
+        use_lstm=use_lstm,
+        use_transformer=use_transformer,
+        use_transformer_ldru=use_transformer_ldru,
+        use_ldru_transformer=use_ldru_transformer,
+        seq2seq=seq2seq,
+    )
 
     # Learning rate tracking variables
     current_learning_rate = learning_rate
@@ -1192,6 +1220,7 @@ def train_model(
                 seq2seq=seq2seq,
                 dataset_name="Validation",
                 writer=writer,
+                compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
             )
 
             # Check for improvement and update learning rate if stagnant
@@ -1263,6 +1292,7 @@ def train_model(
                 seq2seq=seq2seq,
                 dataset_name="Test",
                 writer=writer,
+                compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
             )
 
         # Generate text after each epoch to monitor progress
@@ -1324,6 +1354,7 @@ def evaluate_model_on_dataset(
     seq2seq=True,
     dataset_name="Validation",
     writer: SummaryWriter = None,
+    compiled_eval_step=None,
 ):
     rng_key, dataset_key = jax.random.split(rng_key)
     dataset_loss, dataset_metrics = evaluate_model(
@@ -1337,6 +1368,7 @@ def evaluate_model_on_dataset(
         use_transformer_ldru=use_transformer_ldru,
         seq2seq=seq2seq,
         eval_model=eval_model,  # Use dropout-free model for evaluation
+        compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
     )
     print(f"{dataset_name} loss: {dataset_loss:.4f}")
     print(f"{dataset_name} accuracy: {dataset_metrics['accuracy']:.4f}")
@@ -1674,6 +1706,7 @@ def evaluate_model(
     use_ldru_transformer=False,
     seq2seq=True,
     eval_model=None,  # Optional evaluation model with dropout disabled
+    compiled_eval_step=None,  # Optional pre-compiled evaluation step for efficiency
 ):
     """Evaluate model on validation data."""
     val_loader = create_data_loader(val_data, batch_size, rng_key)
@@ -1688,18 +1721,20 @@ def evaluate_model(
     per_position_losses = []
 
     # ---- choose loss function ONCE ----
-    if use_transformer or use_transformer_ldru or use_ldru_transformer:
-        loss_fn = ldru_seq2seq_loss if seq2seq else next_token_loss
-    elif use_lstm:
-        loss_fn = lstm_next_token_loss if seq2seq else lstm_last_position_loss
-    else:
-        loss_fn = ldru_seq2seq_loss if seq2seq else next_token_loss
+    if compiled_eval_step is  None:
+        if use_transformer or use_transformer_ldru or use_ldru_transformer:
+            loss_fn = ldru_seq2seq_loss if seq2seq else next_token_loss
+        elif use_lstm:
+            loss_fn = lstm_next_token_loss if seq2seq else lstm_last_position_loss
+        else:
+            loss_fn = ldru_seq2seq_loss if seq2seq else next_token_loss
 
 
-    # ---- jit ONCE ----
-    @jax.jit
-    def eval_step(params, key, batch):
-        return loss_fn(params, model_for_eval, key, batch)
+        # ---- jit ONCE ----
+        @jax.jit
+        def eval_step(params, key, batch):
+            return loss_fn(params, model_for_eval, key, batch)
+        compiled_eval_step = jax.jit(eval_step)
 
 
     # Wrap validation iterator with tqdm for progress reporting
@@ -1709,11 +1744,11 @@ def evaluate_model(
         rng_key, step_key = jax.random.split(rng_key)
 
         # ---- fast compiled call ----
-        loss, metrics = eval_step(params, step_key, batch)
+        loss, metrics = compiled_eval_step(params, step_key, batch)
 
-        losses.append(loss)
-        accuracies.append(metrics["accuracy"])
-        perplexities.append(metrics["perplexity"])
+        losses.append(float(loss))
+        accuracies.append(float(metrics["accuracy"]))
+        perplexities.append(float(metrics["perplexity"]))
 
         # collect per-position metrics
         if seq2seq and "per_position_perplexity" in metrics:
@@ -1723,21 +1758,6 @@ def evaluate_model(
             per_position_losses.append(
                 np.array(metrics["per_position_loss"])
             )
-
-        pbar.set_postfix(
-            {
-                "Loss": f"{np.mean(losses):.4f}",
-                "Acc": f"{np.mean(accuracies):.4f}",
-                "PPL": f"{np.mean(perplexities):.1f}",
-            }
-        )
-
-        # Collect per-position metrics for seq2seq models
-        if seq2seq and "per_position_perplexity" in metrics:
-            per_position_perplexities.append(
-                np.array(metrics["per_position_perplexity"])
-            )
-            per_position_losses.append(np.array(metrics["per_position_loss"]))
 
         pbar.set_postfix(
             {
