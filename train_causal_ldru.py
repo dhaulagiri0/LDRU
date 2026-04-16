@@ -970,7 +970,7 @@ def train_model(
     # Training hyperparameters - adjusted for LDRU's single-output nature
     learning_rate = initial_learning_rate  # Use parameter instead of hardcoded value
     batch_size = batch_size  # Larger batch size for more stable gradients
-    num_epochs = 1
+    num_epochs = 100
     seq_length = (
         seq_length  # Shorter sequences: [31 context tokens] -> [1 target token]
     )
@@ -1678,57 +1678,50 @@ def evaluate_model(
     per_position_perplexities = []  # For seq2seq models
     per_position_losses = []
 
+    # ---- choose loss function ONCE ----
+    if use_transformer or use_transformer_ldru or use_ldru_transformer:
+        loss_fn = ldru_seq2seq_loss if seq2seq else next_token_loss
+    elif use_lstm:
+        loss_fn = lstm_next_token_loss if seq2seq else lstm_last_position_loss
+    else:
+        loss_fn = ldru_seq2seq_loss if seq2seq else next_token_loss
+
+
+    # ---- jit ONCE ----
+    @jax.jit
+    def eval_step(params, key, batch):
+        return loss_fn(params, model_for_eval, key, batch)
+
+
     # Wrap validation iterator with tqdm for progress reporting
     pbar = tqdm.tqdm(val_loader, desc="Validation", leave=False)
 
     for batch in pbar:
         rng_key, step_key = jax.random.split(rng_key)
 
-        # Choose appropriate loss function
-        if use_transformer:
-            # Use dedicated transformer loss function
-            if seq2seq:
-                loss, metrics = ldru_seq2seq_loss(
-                    params, model_for_eval, step_key, batch
-                )
-            else:
-                loss, metrics = next_token_loss(params, model_for_eval, step_key, batch)
-        elif use_transformer_ldru:
-            # Transformer+LDRU hybrid: use LDRU loss functions
-            if seq2seq:
-                loss, metrics = ldru_seq2seq_loss(
-                    params, model_for_eval, step_key, batch
-                )
-            else:
-                loss, metrics = next_token_loss(params, model_for_eval, step_key, batch)
-        elif use_ldru_transformer:
-            # LDRU+Transformer hybrid: use transformer loss functions
-            if seq2seq:
-                loss, metrics = ldru_seq2seq_loss(
-                    params, model_for_eval, step_key, batch
-                )
-            else:
-                loss, metrics = next_token_loss(params, model_for_eval, step_key, batch)
-        elif use_lstm:
-            if seq2seq:
-                loss, metrics = lstm_next_token_loss(
-                    params, model_for_eval, step_key, batch
-                )
-            else:
-                loss, metrics = lstm_last_position_loss(
-                    params, model_for_eval, step_key, batch
-                )
-        else:
-            if seq2seq:
-                loss, metrics = ldru_seq2seq_loss(
-                    params, model_for_eval, step_key, batch
-                )
-            else:
-                loss, metrics = next_token_loss(params, model_for_eval, step_key, batch)
+        # ---- fast compiled call ----
+        loss, metrics = eval_step(params, step_key, batch)
 
         losses.append(float(loss))
         accuracies.append(float(metrics["accuracy"]))
         perplexities.append(float(metrics["perplexity"]))
+
+        # collect per-position metrics
+        if seq2seq and "per_position_perplexity" in metrics:
+            per_position_perplexities.append(
+                np.array(metrics["per_position_perplexity"])
+            )
+            per_position_losses.append(
+                np.array(metrics["per_position_loss"])
+            )
+
+        pbar.set_postfix(
+            {
+                "Loss": f"{np.mean(losses):.4f}",
+                "Acc": f"{np.mean(accuracies):.4f}",
+                "PPL": f"{np.mean(perplexities):.1f}",
+            }
+        )
 
         # Collect per-position metrics for seq2seq models
         if seq2seq and "per_position_perplexity" in metrics:
