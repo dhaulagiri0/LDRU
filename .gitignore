@@ -5,7 +5,6 @@ my_comparison/
 my_comparison_2/
 *.model
 *.vocab
-*.txt
 stable_causal_ldru_v2.py
 train_causal_ldru_old.py
 .DS_Store
