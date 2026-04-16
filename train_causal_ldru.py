@@ -1237,6 +1237,15 @@ def train_model(
         else:
             # Without validation data, we do no checkpointing and just print training metrics
             print("No validation data provided, skipping validation and checkpointing.")
+        
+        # check if epoch has no improvement for a certain number of epochs and reduce learning rate if needed
+        if epochs_without_improvement >= 10:
+            # terminate
+            print(
+                f"Early stopping triggered after {epochs_without_improvement} epochs without improvement."
+            )
+            break
+
 
         if test_data is not None and len(test_data) > 0 and new_best:
             print("\nEvaluating on test set...")
@@ -1702,9 +1711,9 @@ def evaluate_model(
         # ---- fast compiled call ----
         loss, metrics = eval_step(params, step_key, batch)
 
-        losses.append(float(loss))
-        accuracies.append(float(metrics["accuracy"]))
-        perplexities.append(float(metrics["perplexity"]))
+        losses.append(loss)
+        accuracies.append(metrics["accuracy"])
+        perplexities.append(metrics["perplexity"])
 
         # collect per-position metrics
         if seq2seq and "per_position_perplexity" in metrics:
