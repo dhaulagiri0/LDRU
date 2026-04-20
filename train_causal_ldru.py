@@ -1187,6 +1187,36 @@ def train_model(
         seq2seq=seq2seq,
     )
 
+    print("Warming up JIT compilation...")
+
+    dummy_batch = train_data[:batch_size]
+
+    # warmup train
+    params, opt_state, _, _ = compiled_train_step(
+        params, opt_state, rng_key, dummy_batch
+    )
+
+    # warmup eval
+    _ = compiled_eval_step(
+        params, rng_key, dummy_batch
+    )
+
+    # warmup generation
+    rng_key, gen_key = jax.random.split(rng_key)
+    _ = test_generation(
+        model,
+        params,
+        config,
+        gen_key,
+        tokenizer,
+        max_length=8,   # small for compile
+        verbose=False,
+        seq2seq=seq2seq,
+        eval_model=eval_model,
+    )
+
+    print("Warmup complete.")
+
     # Count parameters
     param_count = sum(x.size for x in jax.tree.leaves(params))
     print(f"Model has {param_count:,} parameters")
