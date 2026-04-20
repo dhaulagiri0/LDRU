@@ -62,7 +62,7 @@ def make_objective(
             config=config,
             enable_logging=False,
             text_file_path="wikitext-2-raw-train.txt",
-            validation_text_file_path="ptb_val.txt",
+            validation_text_file_path="wikitext-2-raw-validation.txt",
             model_creation_fn=model_creation_fn,  # Replace with the appropriate model creation function
             use_lstm=use_lstm,
             use_transformer=use_transformer,
