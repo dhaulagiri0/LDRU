@@ -12,3 +12,13 @@ train_causal_ldru_old.py
 .DS_Store
 __pycache__/
 supplementary_code-main/ldru/models/__pycache__/
+*.db
+optuna_checkpoints/
+remote_training_logs/
+results/
+remote_eval_logs/
+remote_eval_plots/
+remote_eval_plots_1/
+remote_logs_1
+remote_training_logs_1/
+remote_checkpoints_1/

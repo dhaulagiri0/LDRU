@@ -97,6 +97,8 @@ class LDRUExperimenstConfig:
     num_epochs: int = (100,)
     dropout_prob: float = 0.3
 
+    blelloch_random: bool = False  # Whether to use random pairing in Blelloch scan
+
 
 # base tokenizer class to define the interface for different tokenizers (SPTokenizer, TextTokenizer, etc.)
 class BaseTokenizer:
@@ -1015,6 +1017,7 @@ def train_model(
     use_lstm=False,
     use_transformer=False,
     use_transformer_ldru=False,  # New parameter for hybrid model
+    use_ldru_transformer=False,  # New parameter for hybrid model
     seq2seq=True,  # Use seq2seq loss for LDRU by default
     save_checkpoints: bool = True,
     checkpoint_dir: str = "checkpoints",
@@ -1048,7 +1051,7 @@ def train_model(
         )
     )
     loss_type = "seq2seq" if seq2seq else "lastpos"
-    scan_type = "blelloch_random" if args.blelloch_random else "default"
+    scan_type = "blelloch_random" if config.blelloch_random else "default"
     model_name = f"{model_prefix}_model_{model_type}_{loss_type}_silu_{scan_type}_{seq_length}_SP"
     checkpoint_path = os.path.join(checkpoint_dir, f"{model_name}")
     if enable_logging:
@@ -1238,9 +1241,10 @@ def train_model(
         print(f"Average perplexity: {avg_perplexity:.4f}")
         print(f"Current learning rate: {current_learning_rate:.2e}")
 
-        writer.add_scalar("Loss/Train", avg_loss, epoch + 1)
-        writer.add_scalar("Accuracy/Train", avg_accuracy, epoch + 1)
-        writer.add_scalar("Perplexity/Train", avg_perplexity, epoch + 1)
+        if enable_logging:
+            writer.add_scalar("Loss/Train", avg_loss, epoch + 1)
+            writer.add_scalar("Accuracy/Train", avg_accuracy, epoch + 1)
+            writer.add_scalar("Perplexity/Train", avg_perplexity, epoch + 1)
 
         # Validation if available
         if val_data is not None and len(val_data) > 0:
@@ -1257,7 +1261,7 @@ def train_model(
                 use_transformer_ldru=use_transformer_ldru,
                 seq2seq=seq2seq,
                 dataset_name="Validation",
-                writer=writer,
+                writer=writer if enable_logging else None,
                 compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
             )
 
@@ -1328,7 +1332,7 @@ def train_model(
                 use_transformer_ldru=use_transformer_ldru,
                 seq2seq=seq2seq,
                 dataset_name="Test",
-                writer=writer,
+                writer=writer if enable_logging else None,
                 compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
             )
 
@@ -1428,7 +1432,7 @@ def evaluate_model_on_dataset(
                 f"Worst: pos {trends['worst_position']} (PPL={trends['worst_perplexity']:.2f})"
             )
 
-    if enable_logging:
+    if writer is not None:
         writer.add_scalar("Loss/{}".format(dataset_name), dataset_loss, epoch + 1)
         writer.add_scalar(
             "Accuracy/{}".format(dataset_name), dataset_metrics["accuracy"], epoch + 1
