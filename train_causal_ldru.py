@@ -1026,6 +1026,7 @@ def train_model(
     test_text_file_path: str = None,  # Path to test text file
     tokenizer_type: TokenizerType = TokenizerType.SENTENCEPIECE,  # Type of tokenizer to use
     model_prefix: str = "",  # Prefix for model name in checkpoints and logs
+    generate_samples: bool = True,  # Whether to generate sample text after training
 ):
     """Main training function."""
 
@@ -1197,9 +1198,7 @@ def train_model(
     )
 
     # warmup eval
-    _ = compiled_eval_step(
-        params, rng_key, dummy_batch
-    )
+    _ = compiled_eval_step(params, rng_key, dummy_batch)
 
     # warmup generation
     rng_key, gen_key = jax.random.split(rng_key)
@@ -1209,7 +1208,7 @@ def train_model(
         config,
         gen_key,
         tokenizer,
-        max_length=8,   # small for compile
+        max_length=8,  # small for compile
         verbose=False,
         seq2seq=seq2seq,
         eval_model=eval_model,
@@ -1368,23 +1367,24 @@ def train_model(
 
         # Generate text after each epoch to monitor progress
         print("\nSample generation:")
-        rng_key, gen_key = jax.random.split(rng_key)
-        try:
-            _ = test_generation(
-                model,
-                params,
-                config,
-                gen_key,
-                tokenizer,
-                max_length=32,
-                verbose=False,
-                seq2seq=seq2seq,
-                eval_model=eval_model,  # Use dropout-free model for generation
-            )
-            print()  # Add spacing after generation
-        except Exception as e:
-            print(f"Generation failed: {e}")
-            print()
+        if generate_samples is True:
+            rng_key, gen_key = jax.random.split(rng_key)
+            try:
+                _ = test_generation(
+                    model,
+                    params,
+                    config,
+                    gen_key,
+                    tokenizer,
+                    max_length=32,
+                    verbose=False,
+                    seq2seq=seq2seq,
+                    eval_model=eval_model,  # Use dropout-free model for generation
+                )
+                print()  # Add spacing after generation
+            except Exception as e:
+                print(f"Generation failed: {e}")
+                print()
 
     print("\nTraining completed")
 

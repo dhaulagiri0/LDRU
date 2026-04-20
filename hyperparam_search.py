@@ -103,6 +103,7 @@ def make_objective(
             checkpoint_dir="optuna_checkpoints",
             resume_from_checkpoint=None,
             tokenizer_path=tokenizer_path,
+            generate_samples=False,  # Disable sample generation during hyperparameter search for faster trials
         )
 
         # Return the best validation perplexity as the objective value
