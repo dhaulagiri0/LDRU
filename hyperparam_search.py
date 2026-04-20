@@ -1,3 +1,7 @@
+import datetime
+import os
+import sys
+from typing import Optional
 import optuna
 from causal_ldru_v2 import create_causal_ldru_model
 from train_causal_ldru import (
@@ -6,6 +10,34 @@ from train_causal_ldru import (
     create_transformer_model,
     train_model,
 )
+
+
+def configure_output(file_path: Optional[str]):
+    """Redirect stdout/stderr to the given file path (append, line-buffered).
+
+    Provide a path via environment variable LDRU_PRINT_FILE to enable redirection
+    without changing function signatures. If file_path is None or empty, do nothing.
+    """
+    if not file_path:
+        return
+
+    # Ensure directory exists
+    print(f"directory provided: {file_path}")
+    dir_name = os.path.dirname(file_path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+
+    # Open file in append mode with line buffering
+    f = open(file_path, "a", buffering=1)
+
+    # Redirect stdout and stderr
+    sys.stdout = f
+    sys.stderr = f
+
+    # Log the redirection timestamp
+    print(
+        f"[{datetime.datetime.now().isoformat()}] Redirecting stdout/stderr to: {file_path}"
+    )
 
 
 def make_objective(
@@ -141,6 +173,12 @@ if __name__ == "__main__":
         default=None,
         help="Path to a pre-trained tokenizer (optional, if not provided, a new tokenizer will be trained on the dataset)",
     )
+    parser.add_argument(
+        "--print_log_file",
+        type=str,
+        default=None,
+        help="Path to a file to redirect stdout/stderr (optional, if not provided, output will go to console)",
+    )
     args = parser.parse_args()
 
     num_trials = args.num_trials
@@ -151,6 +189,8 @@ if __name__ == "__main__":
     vocab_size = args.vocab_size
     batch_size = args.batch_size
     study_name = args.study_name
+    print_log_file = args.print_log_file
+    configure_output(print_log_file)
 
     study = optuna.create_study(
         study_name=study_name,
