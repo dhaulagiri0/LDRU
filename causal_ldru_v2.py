@@ -966,6 +966,9 @@ class CausalLDRULanguageModel(hk.Module):
 def create_causal_ldru_model(config: CausalLDRUConfig) -> hk.Transformed:
     """Create a transformed causal LDRU model."""
 
+    print("Creating Causal LDRU model with configuration:")
+    print(config)
+
     def forward_fn(token_ids: jnp.ndarray, is_training: bool = True) -> jnp.ndarray:
         model = CausalLDRULanguageModel(config)
         return model(token_ids, is_training)

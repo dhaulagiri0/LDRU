@@ -1,8 +1,9 @@
+import chex
 import jax
 import jax.numpy as jnp
 import optax
 import numpy as np
-from typing import Tuple, Dict, List, Optional
+from typing import Callable, Tuple, Dict, List, Optional
 import tqdm
 import re
 import os
@@ -43,6 +44,58 @@ from enum import Enum
 class TokenizerType(str, Enum):
     SENTENCEPIECE = "sentencepiece"
     TEXT = "text"
+
+
+@chex.dataclass
+class LDRUExperimenstConfig:
+    """Configuration for causal LDRU language model."""
+
+    # Model architecture
+    embedding_dim: int
+    vocab_size: int
+    num_layers: int = 1
+    hidden_dim: int = 512
+
+    # LDRU specific
+    widening_factor: int = 4
+    emb_init_scale: float = 0.02
+
+    # Causal modeling
+    causal_masking: bool = True
+    max_sequence_length: int = 1024
+    use_positional_encoding: bool = False
+
+    # Binary operator
+    operator: Optional[Callable] = None
+
+    # Scan method: 'default' (assoc_scan), or 'simple'
+    scan_method: str = "default"
+
+    # Whether to expand sequence to power of 2 with random zero insertion
+    expand_to_power_of_2: bool = False
+
+    # Whether to apply attention at each scan step in custom associative scan
+    attention_per_scan_step: bool = False
+
+    # specifies transformer encoding type
+    use_alibi: bool = False  # defaults to sin cos
+
+    num_transformer_layers: int = 5
+    num_transformer_heads: int = 8
+    use_embeddings: bool = True
+    share_embeddings: bool = False
+    chunk_size: Optional[int] = None  # Use full attention
+    widening_factor: int = 16
+    causal_masking: bool = True  # Critical for causal language modeling
+
+    # General training hyperparameters
+    initial_learning_rate: float = (1e-3,)
+    l2_lambda: float = (0.2,)
+    seq_length: int = (32,)
+    batch_size: int = (128,)
+    min_learning_rate: float = (1e-6,)  # Set min LR for cosine decay
+    num_epochs: int = (100,)
+    dropout_prob: float = 0.3
 
 
 # base tokenizer class to define the interface for different tokenizers (SPTokenizer, TextTokenizer, etc.)
@@ -637,7 +690,7 @@ def make_train_step(
     return jax.jit(_train_step)
 
 
-def create_lstm_model(config: CausalLDRUConfig):
+def create_lstm_model(config: LDRUExperimenstConfig):
     """Create a simple LSTM model for comparison."""
     import haiku as hk
 
@@ -666,35 +719,39 @@ def create_lstm_model(config: CausalLDRUConfig):
     return hk.transform(lstm_forward)
 
 
-def create_transformer_model(config: CausalLDRUConfig):
+def create_transformer_model(config: LDRUExperimenstConfig):
     """Create a transformer decoder model for causal language modeling."""
     import haiku as hk
 
-    if True:
+    if config.use_alibi:
         print("Using ALiBi positional encodings for transformer model.")
         pos_encs = pos_encs_lib.PositionalEncodings.ALIBI
     else:
         pos_encs = pos_encs_lib.PositionalEncodings.SIN_COS
+
     # Create transformer config with causal masking enabled
     transformer_config = TransformerConfig(
         output_size=config.vocab_size,
         embedding_dim=config.embedding_dim,
-        num_layers=5,
-        num_heads=8,
+        num_layers=config.num_transformer_layers,
+        num_heads=config.num_transformer_heads,
         dropout_prob=config.dropout_prob,
-        emb_init_scale=0.02,
-        use_embeddings=True,
-        share_embeddings=False,
-        chunk_size=None,  # Use full attention
+        emb_init_scale=config.emb_init_scale,
+        use_embeddings=config.use_embeddings,
+        share_embeddings=config.share_embeddings,
+        chunk_size=config.chunk_size,
         positional_encodings=pos_encs,
         positional_encodings_params=(
             pos_encs_lib.SinCosParams(max_time=config.max_sequence_length)
             if not config.use_alibi
             else None
         ),
-        widening_factor=16,
-        causal_masking=True,  # Critical for causal language modeling
+        widening_factor=config.widening_factor,
+        causal_masking=config.causal_masking,
     )
+    # Print config
+    print("Transformer Config:")
+    print(transformer_config)
 
     def transformer_forward(token_ids):
         # Convert token_ids to one-hot encoding as expected by the transformer
@@ -715,7 +772,7 @@ def create_transformer_model(config: CausalLDRUConfig):
     return hk.transform(transformer_forward)
 
 
-def create_ldru_transformer_model(config: CausalLDRUConfig):
+def create_ldru_transformer_model(config: LDRUExperimenstConfig):
     """Create a hybrid model: LDRU encoder -> transformer decoder for causal language modeling."""
     import haiku as hk
 
@@ -775,7 +832,7 @@ def create_ldru_transformer_model(config: CausalLDRUConfig):
     return hk.transform(ldru_transformer_forward)
 
 
-def create_transformer_ldru_model(config: CausalLDRUConfig):
+def create_transformer_ldru_model(config: LDRUExperimenstConfig):
     """Create a hybrid model: transformer encoder -> LDRU for causal language modeling."""
     import haiku as hk
 
@@ -854,6 +911,7 @@ def prepare_tokenizer(
     seq_length: int,
     model_name: str,
     tokenizer_folder: str = DEFAULT_TOKENIZER_FOLDER,
+    dataset_name: str = "ptb",
 ):
     # verify tokenizer folder
     if not os.path.exists(tokenizer_folder):
@@ -864,7 +922,7 @@ def prepare_tokenizer(
         tokenizer = TextTokenizer(text_file_path, vocab_size=max_vocab_size)
     else:
         print("Using SPTokenizer for subword tokenization.")
-        model_prefix = f"{tokenizer_folder}/ptb_tokenizer_vocab{max_vocab_size}_seq{seq_length}_for_{model_name}"
+        model_prefix = f"{tokenizer_folder}/{dataset_name}_tokenizer_vocab{max_vocab_size}_seq{seq_length}_for_{model_name}"
         print(f"Tokenizer model will be saved to: {model_prefix}.model")
         # No cleaning for text is necessary
         tokenizer = SPTokenizer(
@@ -925,6 +983,7 @@ def create_datasets_for_training(
 
     return train_data, val_data, test_data
 
+
 def make_eval_step(
     model,
     use_lstm=False,
@@ -945,8 +1004,10 @@ def make_eval_step(
 
     return jax.jit(_eval_step)
 
+
 def train_model(
     log_dir: str,
+    config: LDRUExperimenstConfig,
     enable_logging: bool = True,
     text_file_path: str = None,
     validation_text_file_path: str = None,
@@ -958,42 +1019,20 @@ def train_model(
     save_checkpoints: bool = True,
     checkpoint_dir: str = "checkpoints",
     resume_from_checkpoint: str = None,
-    initial_learning_rate: float = 1e-3,  # Added learning rate parameter
-    blelloch_random: bool = False,  # New parameter for scan method
-    l2_lambda: float = 1e-2,  # L2 regularization strength
     tokenizer_path: str = None,  # Path to save/load tokenizer model
     test_text_file_path: str = None,  # Path to test text file
-    max_vocab_size: int = 1500,  # Maximum vocabulary size for tokenizer
     tokenizer_type: TokenizerType = TokenizerType.SENTENCEPIECE,  # Type of tokenizer to use
     model_prefix: str = "",  # Prefix for model name in checkpoints and logs
-    seq_length: int = 32,
-    batch_size: int = 512,  # Batch size for training
-    use_alibi: bool = False,  # Whether to use ALiBi (Attention with Linear Biases)
 ):
     """Main training function."""
 
-    # Configuration - adjusted for word-level tokenization
-    config_params = {
-        "embedding_dim": 300,  # Larger for word-level
-        "num_layers": 1,
-        "max_sequence_length": 3072,
-        "dropout_prob": 0.3,
-        "hidden_dim": 256,
-        "use_positional_encoding": (
-            True if use_transformer or use_transformer_ldru else False
-        ),
-        "expand_to_power_of_2": True if blelloch_random else False,
-        "use_alibi": use_alibi,
-    }
-
     # Training hyperparameters - adjusted for LDRU's single-output nature
-    learning_rate = initial_learning_rate  # Use parameter instead of hardcoded value
-    batch_size = batch_size  # Larger batch size for more stable gradients
-    num_epochs = 100
-    seq_length = (
-        seq_length  # Shorter sequences: [31 context tokens] -> [1 target token]
-    )
-    min_learning_rate = 1e-6  # Minimum learning rate threshold
+    learning_rate = config.initial_learning_rate
+    batch_size = config.batch_size  # Larger batch size for more stable gradients
+    num_epochs = config.num_epochs
+    min_learning_rate = config.min_learning_rate  # Minimum learning rate threshold
+    max_vocab_size = config.vocab_size
+    seq_length = config.seq_length
 
     model_type = (
         "lstm"
@@ -1035,6 +1074,9 @@ def train_model(
         seq_length,
         model_name,
         tokenizer_folder=DEFAULT_TOKENIZER_FOLDER,
+        dataset_name=text_file_path.split("/")[-1].split(".")[
+            0
+        ],  # Use filename as dataset name
     )
 
     vocab_size = tokenizer.get_piece_size()
@@ -1047,10 +1089,6 @@ def train_model(
         tokenizer,
         seq_length,
     )
-
-    # Update config with actual vocab size
-    config_params["vocab_size"] = vocab_size
-    config = CausalLDRUConfig(**config_params)
 
     # Create model
     model = model_creation_fn(config)
@@ -1072,9 +1110,9 @@ def train_model(
 
     # Initialize optimizer with learning rate scheduling
     learning_rate_schedule = optax.schedules.cosine_decay_schedule(
-        init_value=initial_learning_rate,
+        init_value=config.initial_learning_rate,
         decay_steps=num_epochs * (len(train_data) // batch_size),
-        alpha=min_learning_rate / initial_learning_rate,
+        alpha=min_learning_rate / config.initial_learning_rate,
     )
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
@@ -1083,15 +1121,6 @@ def train_model(
         ),  # Use AMSGrad for better convergence
     )
     opt_state = optimizer.init(params)
-
-    compiled_eval_step = make_eval_step(
-        eval_model,
-        use_lstm=use_lstm,
-        use_transformer=use_transformer,
-        use_transformer_ldru=use_transformer_ldru,
-        use_ldru_transformer=use_ldru_transformer,
-        seq2seq=seq2seq,
-    )
 
     # Learning rate tracking variables
     current_learning_rate = learning_rate
@@ -1143,7 +1172,16 @@ def train_model(
         use_transformer_ldru=use_transformer_ldru,
         use_ldru_transformer=use_ldru_transformer,
         seq2seq=seq2seq,
-        lambda_l2=l2_lambda,
+        lambda_l2=config.l2_lambda,
+    )
+
+    compiled_eval_step = make_eval_step(
+        eval_model,
+        use_lstm=use_lstm,
+        use_transformer=use_transformer,
+        use_transformer_ldru=use_transformer_ldru,
+        use_ldru_transformer=use_ldru_transformer,
+        seq2seq=seq2seq,
     )
 
     # Count parameters
@@ -1266,7 +1304,7 @@ def train_model(
         else:
             # Without validation data, we do no checkpointing and just print training metrics
             print("No validation data provided, skipping validation and checkpointing.")
-        
+
         # check if epoch has no improvement for a certain number of epochs and reduce learning rate if needed
         if epochs_without_improvement >= 10:
             # terminate
@@ -1274,7 +1312,6 @@ def train_model(
                 f"Early stopping triggered after {epochs_without_improvement} epochs without improvement."
             )
             break
-
 
         if test_data is not None and len(test_data) > 0 and new_best:
             print("\nEvaluating on test set...")
@@ -1305,7 +1342,7 @@ def train_model(
                 config,
                 gen_key,
                 tokenizer,
-                max_length=10,
+                max_length=32,
                 verbose=False,
                 seq2seq=seq2seq,
                 eval_model=eval_model,  # Use dropout-free model for generation
@@ -1337,7 +1374,7 @@ def train_model(
         if best_val_perplexity < float("inf"):
             print(f"Best validation perplexity achieved: {best_val_perplexity:.4f}")
 
-    return params, model, config, tokenizer
+    return params, model, config, tokenizer, best_val_perplexity
 
 
 def evaluate_model_on_dataset(
@@ -1531,7 +1568,7 @@ def save_checkpoint(
     print(f"Saved checkpoint at step {step} -> {step_path}")
 
 
-def load_checkpoint(checkpoint_dir: str, step: int):
+def load_checkpoint(checkpoint_dir: str, step: int, load_best_only: bool = True):
     """
     Load JAX training state using Orbax.
     """
@@ -1539,7 +1576,11 @@ def load_checkpoint(checkpoint_dir: str, step: int):
 
     checkpointer = ocp.PyTreeCheckpointer()
 
-    ckpt_path = os.path.join(checkpoint_dir, f"step_{step}")
+    ckpt_path = (
+        os.path.join(checkpoint_dir, f"step_{step}")
+        if not load_best_only
+        else os.path.join(checkpoint_dir, "best_model")
+    )
 
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
@@ -1556,7 +1597,7 @@ def load_checkpoint(checkpoint_dir: str, step: int):
 
         # Reconstruct config from dict if available
         if "config" in metadata and isinstance(metadata["config"], dict):
-            config = CausalLDRUConfig(**metadata["config"])
+            config = LDRUExperimenstConfig(**metadata["config"])
 
     tokenizer_type = metadata.get("tokenizer_type")
     tokenizer_path = metadata.get("tokenizer_path")
@@ -1687,7 +1728,7 @@ def create_evaluation_model(config, model_creation_fn):
     # Create a copy of the config with dropout disabled
     eval_config_params = config.__dict__.copy()
     eval_config_params["dropout_prob"] = 0.0
-    eval_config = CausalLDRUConfig(**eval_config_params)
+    eval_config = LDRUExperimenstConfig(**eval_config_params)
 
     # Create the evaluation model
     eval_model = model_creation_fn(eval_config)
@@ -1721,7 +1762,7 @@ def evaluate_model(
     per_position_losses = []
 
     # ---- choose loss function ONCE ----
-    if compiled_eval_step is  None:
+    if compiled_eval_step is None:
         if use_transformer or use_transformer_ldru or use_ldru_transformer:
             loss_fn = ldru_seq2seq_loss if seq2seq else next_token_loss
         elif use_lstm:
@@ -1729,13 +1770,12 @@ def evaluate_model(
         else:
             loss_fn = ldru_seq2seq_loss if seq2seq else next_token_loss
 
-
         # ---- jit ONCE ----
         @jax.jit
         def eval_step(params, key, batch):
             return loss_fn(params, model_for_eval, key, batch)
-        compiled_eval_step = jax.jit(eval_step)
 
+        compiled_eval_step = jax.jit(eval_step)
 
     # Wrap validation iterator with tqdm for progress reporting
     pbar = tqdm.tqdm(val_loader, desc="Validation", leave=False)
@@ -1755,9 +1795,7 @@ def evaluate_model(
             per_position_perplexities.append(
                 np.array(metrics["per_position_perplexity"])
             )
-            per_position_losses.append(
-                np.array(metrics["per_position_loss"])
-            )
+            per_position_losses.append(np.array(metrics["per_position_loss"]))
 
         pbar.set_postfix(
             {
@@ -3201,6 +3239,36 @@ if __name__ == "__main__":
         default=False,
         help="Whether to use ALiBi (Attention with Linear Biases) for attention scores.",
     )
+    parser.add_argument(
+        "--num_epochs",
+        type=int,
+        default=100,
+        help="Number of training epochs (default: 100)",
+    )
+    parser.add_argument(
+        "--embedding_dim",
+        type=int,
+        default=300,
+        help="Dimension of token embeddings (default: 300)",
+    )
+    parser.add_argument(
+        "--num_layers",
+        type=int,
+        default=1,
+        help="Number of layers in the model for ldru and lstm (default: 1)",
+    )
+    parser.add_argument(
+        "--dropout_prob",
+        type=float,
+        default=0.3,
+        help="Dropout rate for training (default: 0.3)",
+    )
+    parser.add_argument(
+        "--hidden_dim",
+        type=int,
+        default=256,
+        help="Hidden dimension for LSTM and Transformer models (default: 256)",
+    )
     args = parser.parse_args()
 
     configure_output(args.print_log_file)
@@ -3344,9 +3412,31 @@ if __name__ == "__main__":
     if enable_logging:
         if not os.path.exists(LOG_DIR):
             os.makedirs(LOG_DIR)
+
+    config = LDRUExperimenstConfig(
+        embedding_dim=args.embedding_dim,  # Larger for word-level
+        num_layers=args.num_layers,
+        max_sequence_length=3072,
+        dropout_prob=args.dropout_prob,
+        hidden_dim=args.hidden_dim,
+        use_positional_encoding=(
+            True if use_transformer or use_transformer_ldru else False
+        ),
+        expand_to_power_of_2=True if args.blelloch_random else False,
+        use_alibi=args.use_alibi,
+        vocab_size=args.max_vocab_size,  # Set vocab size based on tokenizer
+        initial_learning_rate=args.lr,
+        l2_lambda=args.l2_lambda,
+        seq_length=args.max_seq_len,
+        batch_size=args.batch_size,
+        min_learning_rate=args.lr / 1000,  # Set min LR for cosine decay
+        num_epochs=args.num_epochs,
+    )
+
     # Run training
-    params, model, config, tokenizer = train_model(
+    params, model, config, tokenizer, _ = train_model(
         log_dir=LOG_DIR,
+        config=config,
         enable_logging=enable_logging,
         text_file_path=text_file_path,
         model_creation_fn=model_creation_fn,
@@ -3356,18 +3446,11 @@ if __name__ == "__main__":
         seq2seq=seq2seq,
         checkpoint_dir=checkpoint_dir,
         resume_from_checkpoint=resume_from_checkpoint,
-        initial_learning_rate=args.lr,  # Pass learning rate
-        blelloch_random=args.blelloch_random,  # Pass scan method
         tokenizer_path=tokenizer_path,  # Pass tokenizer path
         validation_text_file_path=val_text_file_path,  # Pass validation text file path
         test_text_file_path=test_text_file_path,
-        max_vocab_size=args.max_vocab_size,
         tokenizer_type=args.tokenizer_type,
         model_prefix=args.model_name_prefix,
-        l2_lambda=args.l2_lambda,
-        seq_length=args.max_seq_len,
-        batch_size=args.batch_size,
-        use_alibi=args.use_alibi,
     )
 
     print(f"\\nModel Summary:")
