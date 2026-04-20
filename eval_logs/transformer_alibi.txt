@@ -451,3 +451,13 @@ Each sequence: [context tokens (length 3071)] -> [target token]
   Best Acc  : 0.4851 at seq_len=2688
 ============================================================
 
+[2026-04-20T18:29:13.853302] Redirecting stdout/stderr to: /rds/general/user/kw1523/home/LDRU/eval_logs/transformer_alibi.txt
+Traceback (most recent call last):
+  File "/rds/general/user/kw1523/home/LDRU/train_causal_ldru.py", line 3214, in <module>
+    evaluate_sequence_length_range(
+  File "/rds/general/user/kw1523/home/LDRU/train_causal_ldru.py", line 2592, in evaluate_sequence_length_range
+    params, _, config, epoch, best_ppl, tokenizer = load_checkpoint(
+                                                    ^^^^^^^^^^^^^^^^
+  File "/rds/general/user/kw1523/home/LDRU/train_causal_ldru.py", line 1545, in load_checkpoint
+    raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+FileNotFoundError: Checkpoint not found: /rds/general/user/kw1523/home/LDRU/checkpoints/wikitext_transformer_seq256_alibi_model_transformer_seq2seq_silu_default_256_SP/step_2
