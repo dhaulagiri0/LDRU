@@ -1,0 +1,453 @@
+[2026-04-16T04:27:02.150397] Redirecting stdout/stderr to: /rds/general/user/kw1523/home/LDRU/eval_logs/transformer_alibi.txt
+/rds/general/user/kw1523/home/venv/ldru-venv/lib/python3.12/site-packages/orbax/checkpoint/_src/serialization/jax_array_handlers.py:701: UserWarning: Sharding info not provided when restoring. Populating sharding info from sharding file. Please note restoration time will be slightly increased due to reading from file. Note also that this option is unsafe when restoring on a different topology than the checkpoint was saved with.
+  warnings.warn(
+Loaded checkpoint from step 34
+Using ALiBi positional encodings for transformer model.
+
+============================================================
+  Sequence-Length Range Evaluation
+============================================================
+  Checkpoint : /rds/general/user/kw1523/home/LDRU/checkpoints/transformer_seq256_alibi_2_model_transformer_seq2seq_silu_default_256_SP
+  Eval file  : ptb_test.txt
+  Model type : Transformer
+  Lengths    : 256 → 3072 (step 1)
+  Output dir : eval_plots/transformer_seq256_alibi_2_model_transformer_seq2seq_silu_default_256_SP_seqlen_range
+============================================================
+
+Seq lengths:   0%|          | 0/23 [00:00<?, ?it/s]Tokenizing text...
+Total tokens: 154,133
+Created 1,203 sequences of length 256
+Each sequence: [context tokens (length 255)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [00:15, ?it/s, Loss=2.6237, Acc=0.4803, PPL=13.8][A
+Validation: 0it [00:15, ?it/s, Loss=2.6237, Acc=0.4803, PPL=13.8][A
+Validation: 1it [00:15, 15.53s/it, Loss=2.6237, Acc=0.4803, PPL=13.8][A
+Validation: 1it [00:15, 15.53s/it, Loss=2.6456, Acc=0.4767, PPL=14.1][A
+Validation: 1it [00:15, 15.53s/it, Loss=2.6456, Acc=0.4767, PPL=14.1][A
+Validation: 1it [00:15, 15.53s/it, Loss=2.6346, Acc=0.4788, PPL=13.9][A
+Validation: 1it [00:15, 15.53s/it, Loss=2.6346, Acc=0.4788, PPL=13.9][A
+Validation: 3it [00:15,  4.07s/it, Loss=2.6346, Acc=0.4788, PPL=13.9][A
+Validation: 3it [00:15,  4.07s/it, Loss=2.6284, Acc=0.4793, PPL=13.9][A
+Validation: 3it [00:15,  4.07s/it, Loss=2.6284, Acc=0.4793, PPL=13.9][A
+                                                                     [A  seq_len= 256 | n= 1,203 | loss=2.6284 | ppl=13.8556 | acc=0.4793
+Seq lengths:   4%|▍         | 1/23 [00:16<05:54, 16.11s/it]Tokenizing text...
+Total tokens: 154,133
+Created 801 sequences of length 384
+Each sequence: [context tokens (length 383)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [00:13, ?it/s, Loss=2.6059, Acc=0.4824, PPL=13.5][A
+Validation: 0it [00:13, ?it/s, Loss=2.6059, Acc=0.4824, PPL=13.5][A
+Validation: 1it [00:13, 13.92s/it, Loss=2.6059, Acc=0.4824, PPL=13.5][A
+Validation: 1it [00:13, 13.92s/it, Loss=2.6120, Acc=0.4812, PPL=13.6][A
+Validation: 1it [00:13, 13.92s/it, Loss=2.6120, Acc=0.4812, PPL=13.6][A
+Validation: 1it [00:14, 13.92s/it, Loss=2.6198, Acc=0.4803, PPL=13.7][A
+Validation: 1it [00:14, 13.92s/it, Loss=2.6198, Acc=0.4803, PPL=13.7][A
+Validation: 3it [00:14,  3.66s/it, Loss=2.6198, Acc=0.4803, PPL=13.7][A
+Validation: 3it [00:14,  3.66s/it, Loss=2.6205, Acc=0.4802, PPL=13.7][A
+Validation: 3it [00:14,  3.66s/it, Loss=2.6205, Acc=0.4802, PPL=13.7][A
+                                                                     [A  seq_len= 384 | n=   801 | loss=2.6205 | ppl=13.7437 | acc=0.4802
+Seq lengths:   9%|▊         | 2/23 [00:30<05:16, 15.09s/it]Tokenizing text...
+Total tokens: 154,133
+Created 601 sequences of length 512
+Each sequence: [context tokens (length 511)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [00:14, ?it/s, Loss=2.6297, Acc=0.4781, PPL=13.9][A
+Validation: 0it [00:14, ?it/s, Loss=2.6297, Acc=0.4781, PPL=13.9][A
+Validation: 1it [00:14, 14.91s/it, Loss=2.6297, Acc=0.4781, PPL=13.9][A
+Validation: 1it [00:14, 14.91s/it, Loss=2.6222, Acc=0.4792, PPL=13.8][A
+Validation: 1it [00:14, 14.91s/it, Loss=2.6222, Acc=0.4792, PPL=13.8][A
+Validation: 1it [00:15, 14.91s/it, Loss=2.6216, Acc=0.4800, PPL=13.8][A
+Validation: 1it [00:15, 14.91s/it, Loss=2.6216, Acc=0.4800, PPL=13.8][A
+Validation: 3it [00:15,  3.93s/it, Loss=2.6216, Acc=0.4800, PPL=13.8][A
+Validation: 3it [00:15,  3.93s/it, Loss=2.6169, Acc=0.4808, PPL=13.7][A
+Validation: 3it [00:15,  3.93s/it, Loss=2.6169, Acc=0.4808, PPL=13.7][A
+                                                                     [A  seq_len= 512 | n=   601 | loss=2.6169 | ppl=13.6942 | acc=0.4808
+Seq lengths:  13%|█▎        | 3/23 [00:45<05:04, 15.22s/it]Tokenizing text...
+Total tokens: 154,133
+Created 480 sequences of length 640
+Each sequence: [context tokens (length 639)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [00:16, ?it/s, Loss=2.6245, Acc=0.4798, PPL=13.8][A
+Validation: 0it [00:16, ?it/s, Loss=2.6245, Acc=0.4798, PPL=13.8][A
+Validation: 1it [00:16, 16.29s/it, Loss=2.6245, Acc=0.4798, PPL=13.8][A
+Validation: 1it [00:16, 16.29s/it, Loss=2.6300, Acc=0.4774, PPL=13.9][A
+Validation: 1it [00:16, 16.29s/it, Loss=2.6300, Acc=0.4774, PPL=13.9][A
+Validation: 1it [00:16, 16.29s/it, Loss=2.6230, Acc=0.4797, PPL=13.8][A
+Validation: 1it [00:16, 16.29s/it, Loss=2.6230, Acc=0.4797, PPL=13.8][A
+Validation: 3it [00:16,  4.29s/it, Loss=2.6230, Acc=0.4797, PPL=13.8][A
+Validation: 3it [00:16,  4.29s/it, Loss=2.6190, Acc=0.4801, PPL=13.7][A
+Validation: 3it [00:16,  4.29s/it, Loss=2.6190, Acc=0.4801, PPL=13.7][A
+                                                                     [A  seq_len= 640 | n=   480 | loss=2.6190 | ppl=13.7227 | acc=0.4801
+Seq lengths:  17%|█▋        | 4/23 [01:02<05:00, 15.83s/it]Tokenizing text...
+Total tokens: 154,133
+Created 400 sequences of length 768
+Each sequence: [context tokens (length 767)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [00:18, ?it/s, Loss=2.6158, Acc=0.4794, PPL=13.7][A
+Validation: 0it [00:18, ?it/s, Loss=2.6158, Acc=0.4794, PPL=13.7][A
+Validation: 1it [00:18, 18.94s/it, Loss=2.6158, Acc=0.4794, PPL=13.7][A
+Validation: 1it [00:19, 18.94s/it, Loss=2.6067, Acc=0.4825, PPL=13.6][A
+Validation: 1it [00:19, 18.94s/it, Loss=2.6067, Acc=0.4825, PPL=13.6][A
+Validation: 1it [00:19, 18.94s/it, Loss=2.6043, Acc=0.4820, PPL=13.5][A
+Validation: 1it [00:19, 18.94s/it, Loss=2.6043, Acc=0.4820, PPL=13.5][A
+Validation: 3it [00:19,  4.98s/it, Loss=2.6043, Acc=0.4820, PPL=13.5][A
+Validation: 3it [00:19,  4.98s/it, Loss=2.6101, Acc=0.4811, PPL=13.6][A
+Validation: 3it [00:19,  4.98s/it, Loss=2.6101, Acc=0.4811, PPL=13.6][A
+                                                                     [A  seq_len= 768 | n=   400 | loss=2.6101 | ppl=13.6016 | acc=0.4811
+Seq lengths:  22%|██▏       | 5/23 [01:22<05:08, 17.14s/it]Tokenizing text...
+Total tokens: 154,133
+Created 343 sequences of length 896
+Each sequence: [context tokens (length 895)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [00:22, ?it/s, Loss=2.6047, Acc=0.4805, PPL=13.5][A
+Validation: 0it [00:22, ?it/s, Loss=2.6047, Acc=0.4805, PPL=13.5][A
+Validation: 1it [00:22, 22.31s/it, Loss=2.6047, Acc=0.4805, PPL=13.5][A
+Validation: 1it [00:22, 22.31s/it, Loss=2.6154, Acc=0.4791, PPL=13.7][A
+Validation: 1it [00:22, 22.31s/it, Loss=2.6154, Acc=0.4791, PPL=13.7][A
+Validation: 2it [00:22,  9.25s/it, Loss=2.6154, Acc=0.4791, PPL=13.7][A
+Validation: 2it [00:22,  9.25s/it, Loss=2.6209, Acc=0.4792, PPL=13.7][A
+Validation: 2it [00:22,  9.25s/it, Loss=2.6209, Acc=0.4792, PPL=13.7][A
+Validation: 3it [00:22,  5.08s/it, Loss=2.6209, Acc=0.4792, PPL=13.7][A
+Validation: 3it [00:22,  5.08s/it, Loss=2.6208, Acc=0.4795, PPL=13.7][A
+Validation: 3it [00:22,  5.08s/it, Loss=2.6208, Acc=0.4795, PPL=13.7][A
+Validation: 4it [00:22,  3.11s/it, Loss=2.6208, Acc=0.4795, PPL=13.7][A
+                                                                     [A  seq_len= 896 | n=   343 | loss=2.6208 | ppl=13.7475 | acc=0.4795
+Seq lengths:  26%|██▌       | 6/23 [01:44<05:24, 19.08s/it]Tokenizing text...
+Total tokens: 154,133
+Created 300 sequences of length 1024
+Each sequence: [context tokens (length 1023)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [00:28, ?it/s, Loss=2.5975, Acc=0.4826, PPL=13.4][A
+Validation: 0it [00:28, ?it/s, Loss=2.5975, Acc=0.4826, PPL=13.4][A
+Validation: 1it [00:28, 28.69s/it, Loss=2.5975, Acc=0.4826, PPL=13.4][A
+Validation: 1it [00:28, 28.69s/it, Loss=2.5887, Acc=0.4855, PPL=13.3][A
+Validation: 1it [00:28, 28.69s/it, Loss=2.5887, Acc=0.4855, PPL=13.3][A
+Validation: 2it [00:28, 11.88s/it, Loss=2.5887, Acc=0.4855, PPL=13.3][A
+Validation: 2it [00:28, 11.88s/it, Loss=2.6026, Acc=0.4814, PPL=13.5][A
+Validation: 2it [00:28, 11.88s/it, Loss=2.6026, Acc=0.4814, PPL=13.5][A
+Validation: 3it [00:28,  6.51s/it, Loss=2.6026, Acc=0.4814, PPL=13.5][A
+Validation: 3it [00:29,  6.51s/it, Loss=2.6029, Acc=0.4828, PPL=13.5][A
+Validation: 3it [00:29,  6.51s/it, Loss=2.6029, Acc=0.4828, PPL=13.5][A
+Validation: 4it [00:29,  3.99s/it, Loss=2.6029, Acc=0.4828, PPL=13.5][A
+                                                                     [A  seq_len=1024 | n=   300 | loss=2.6029 | ppl=13.5049 | acc=0.4828
+Seq lengths:  30%|███       | 7/23 [02:14<05:58, 22.41s/it]Tokenizing text...
+Total tokens: 154,133
+Created 266 sequences of length 1152
+Each sequence: [context tokens (length 1151)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [00:35, ?it/s, Loss=2.6274, Acc=0.4761, PPL=13.8][A
+Validation: 0it [00:35, ?it/s, Loss=2.6274, Acc=0.4761, PPL=13.8][A
+Validation: 1it [00:35, 35.44s/it, Loss=2.6274, Acc=0.4761, PPL=13.8][A
+Validation: 1it [00:35, 35.44s/it, Loss=2.6210, Acc=0.4778, PPL=13.7][A
+Validation: 1it [00:35, 35.44s/it, Loss=2.6210, Acc=0.4778, PPL=13.7][A
+Validation: 2it [00:35, 14.67s/it, Loss=2.6210, Acc=0.4778, PPL=13.7][A
+Validation: 2it [00:35, 14.67s/it, Loss=2.5993, Acc=0.4829, PPL=13.5][A
+Validation: 2it [00:35, 14.67s/it, Loss=2.5993, Acc=0.4829, PPL=13.5][A
+Validation: 3it [00:35,  8.03s/it, Loss=2.5993, Acc=0.4829, PPL=13.5][A
+Validation: 3it [00:35,  8.03s/it, Loss=2.6087, Acc=0.4813, PPL=13.6][A
+Validation: 3it [00:35,  8.03s/it, Loss=2.6087, Acc=0.4813, PPL=13.6][A
+Validation: 4it [00:35,  4.91s/it, Loss=2.6087, Acc=0.4813, PPL=13.6][A
+                                                                     [A  seq_len=1152 | n=   266 | loss=2.6087 | ppl=13.5876 | acc=0.4813
+Seq lengths:  35%|███▍      | 8/23 [02:50<06:41, 26.75s/it]Tokenizing text...
+Total tokens: 154,133
+Created 239 sequences of length 1280
+Each sequence: [context tokens (length 1279)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [00:54, ?it/s, Loss=2.6246, Acc=0.4800, PPL=13.8][A
+Validation: 0it [00:54, ?it/s, Loss=2.6246, Acc=0.4800, PPL=13.8][A
+Validation: 1it [00:54, 54.50s/it, Loss=2.6246, Acc=0.4800, PPL=13.8][A
+Validation: 1it [00:54, 54.50s/it, Loss=2.6044, Acc=0.4818, PPL=13.5][A
+Validation: 1it [00:54, 54.50s/it, Loss=2.6044, Acc=0.4818, PPL=13.5][A
+Validation: 2it [00:54, 22.52s/it, Loss=2.6044, Acc=0.4818, PPL=13.5][A
+Validation: 2it [00:54, 22.52s/it, Loss=2.6085, Acc=0.4814, PPL=13.6][A
+Validation: 2it [00:54, 22.52s/it, Loss=2.6085, Acc=0.4814, PPL=13.6][A
+Validation: 3it [00:54, 12.30s/it, Loss=2.6085, Acc=0.4814, PPL=13.6][A
+Validation: 3it [00:54, 12.30s/it, Loss=2.6014, Acc=0.4830, PPL=13.5][A
+Validation: 3it [00:54, 12.30s/it, Loss=2.6014, Acc=0.4830, PPL=13.5][A
+Validation: 4it [00:54,  7.50s/it, Loss=2.6014, Acc=0.4830, PPL=13.5][A
+                                                                     [A  seq_len=1280 | n=   239 | loss=2.6014 | ppl=13.4851 | acc=0.4830
+Seq lengths:  39%|███▉      | 9/23 [03:45<08:18, 35.63s/it]Tokenizing text...
+Total tokens: 154,133
+Created 217 sequences of length 1408
+Each sequence: [context tokens (length 1407)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [01:11, ?it/s, Loss=2.5664, Acc=0.4900, PPL=13.0][A
+Validation: 0it [01:11, ?it/s, Loss=2.5664, Acc=0.4900, PPL=13.0][A
+Validation: 1it [01:11, 71.14s/it, Loss=2.5664, Acc=0.4900, PPL=13.0][A
+Validation: 1it [01:11, 71.14s/it, Loss=2.6020, Acc=0.4838, PPL=13.5][A
+Validation: 1it [01:11, 71.14s/it, Loss=2.6020, Acc=0.4838, PPL=13.5][A
+Validation: 2it [01:11, 29.38s/it, Loss=2.6020, Acc=0.4838, PPL=13.5][A
+Validation: 2it [01:11, 29.38s/it, Loss=2.6185, Acc=0.4805, PPL=13.7][A
+Validation: 2it [01:11, 29.38s/it, Loss=2.6185, Acc=0.4805, PPL=13.7][A
+Validation: 3it [01:11, 16.03s/it, Loss=2.6185, Acc=0.4805, PPL=13.7][A
+Validation: 3it [01:11, 16.03s/it, Loss=2.6114, Acc=0.4810, PPL=13.6][A
+Validation: 3it [01:11, 16.03s/it, Loss=2.6114, Acc=0.4810, PPL=13.6][A
+Validation: 4it [01:11,  9.76s/it, Loss=2.6114, Acc=0.4810, PPL=13.6][A
+                                                                     [A  seq_len=1408 | n=   217 | loss=2.6114 | ppl=13.6262 | acc=0.4810
+Seq lengths:  43%|████▎     | 10/23 [04:57<10:08, 46.78s/it]Tokenizing text...
+Total tokens: 154,133
+Created 199 sequences of length 1536
+Each sequence: [context tokens (length 1535)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [01:36, ?it/s, Loss=2.6433, Acc=0.4758, PPL=14.1][A
+Validation: 0it [01:36, ?it/s, Loss=2.6433, Acc=0.4758, PPL=14.1][A
+Validation: 1it [01:36, 96.73s/it, Loss=2.6433, Acc=0.4758, PPL=14.1][A
+Validation: 1it [01:36, 96.73s/it, Loss=2.5813, Acc=0.4876, PPL=13.2][A
+Validation: 1it [01:36, 96.73s/it, Loss=2.5813, Acc=0.4876, PPL=13.2][A
+Validation: 2it [01:36, 39.92s/it, Loss=2.5813, Acc=0.4876, PPL=13.2][A
+Validation: 2it [01:37, 39.92s/it, Loss=2.6061, Acc=0.4829, PPL=13.6][A
+Validation: 2it [01:37, 39.92s/it, Loss=2.6061, Acc=0.4829, PPL=13.6][A
+Validation: 3it [01:37, 21.76s/it, Loss=2.6061, Acc=0.4829, PPL=13.6][A
+Validation: 3it [01:37, 21.76s/it, Loss=2.6028, Acc=0.4833, PPL=13.5][A
+Validation: 3it [01:37, 21.76s/it, Loss=2.6028, Acc=0.4833, PPL=13.5][A
+Validation: 4it [01:37, 13.23s/it, Loss=2.6028, Acc=0.4833, PPL=13.5][A
+                                                                     [A  seq_len=1536 | n=   199 | loss=2.6028 | ppl=13.5201 | acc=0.4833
+Seq lengths:  48%|████▊     | 11/23 [06:34<12:27, 62.28s/it]Tokenizing text...
+Total tokens: 154,133
+Created 184 sequences of length 1664
+Each sequence: [context tokens (length 1663)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [02:01, ?it/s, Loss=2.6390, Acc=0.4781, PPL=14.0][A
+Validation: 0it [02:01, ?it/s, Loss=2.6390, Acc=0.4781, PPL=14.0][A
+Validation: 1it [02:01, 121.09s/it, Loss=2.6390, Acc=0.4781, PPL=14.0][A
+Validation: 1it [02:01, 121.09s/it, Loss=2.6192, Acc=0.4814, PPL=13.7][A
+Validation: 1it [02:01, 121.09s/it, Loss=2.6192, Acc=0.4814, PPL=13.7][A
+Validation: 2it [02:01, 49.96s/it, Loss=2.6192, Acc=0.4814, PPL=13.7] [A
+Validation: 2it [02:01, 49.96s/it, Loss=2.6175, Acc=0.4803, PPL=13.7][A
+Validation: 2it [02:01, 49.96s/it, Loss=2.6175, Acc=0.4803, PPL=13.7][A
+Validation: 3it [02:01, 27.22s/it, Loss=2.6175, Acc=0.4803, PPL=13.7][A
+Validation: 3it [02:01, 27.22s/it, Loss=2.6122, Acc=0.4813, PPL=13.6][A
+Validation: 3it [02:01, 27.22s/it, Loss=2.6122, Acc=0.4813, PPL=13.6][A
+Validation: 4it [02:01, 16.54s/it, Loss=2.6122, Acc=0.4813, PPL=13.6][A
+                                                                     [A  seq_len=1664 | n=   184 | loss=2.6122 | ppl=13.6308 | acc=0.4813
+Seq lengths:  52%|█████▏    | 12/23 [08:36<14:44, 80.39s/it]Tokenizing text...
+Total tokens: 154,133
+Created 171 sequences of length 1792
+Each sequence: [context tokens (length 1791)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [02:37, ?it/s, Loss=2.5688, Acc=0.4904, PPL=13.1][A
+Validation: 0it [02:37, ?it/s, Loss=2.5688, Acc=0.4904, PPL=13.1][A
+Validation: 1it [02:37, 157.03s/it, Loss=2.5688, Acc=0.4904, PPL=13.1][A
+Validation: 1it [02:37, 157.03s/it, Loss=2.5898, Acc=0.4847, PPL=13.3][A
+Validation: 1it [02:37, 157.03s/it, Loss=2.5898, Acc=0.4847, PPL=13.3][A
+Validation: 2it [02:37, 64.76s/it, Loss=2.5898, Acc=0.4847, PPL=13.3] [A
+Validation: 2it [02:37, 64.76s/it, Loss=2.5907, Acc=0.4848, PPL=13.3][A
+Validation: 2it [02:37, 64.76s/it, Loss=2.5907, Acc=0.4848, PPL=13.3][A
+Validation: 3it [02:37, 35.26s/it, Loss=2.5907, Acc=0.4848, PPL=13.3][A
+Validation: 3it [02:37, 35.26s/it, Loss=2.5985, Acc=0.4836, PPL=13.4][A
+Validation: 3it [02:37, 35.26s/it, Loss=2.5985, Acc=0.4836, PPL=13.4][A
+Validation: 4it [02:37, 21.41s/it, Loss=2.5985, Acc=0.4836, PPL=13.4][A
+                                                                     [A  seq_len=1792 | n=   171 | loss=2.5985 | ppl=13.4467 | acc=0.4836
+Seq lengths:  57%|█████▋    | 13/23 [11:14<17:18, 103.83s/it]Tokenizing text...
+Total tokens: 154,133
+Created 159 sequences of length 1920
+Each sequence: [context tokens (length 1919)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [04:00, ?it/s, Loss=2.5781, Acc=0.4884, PPL=13.2][A
+Validation: 0it [04:00, ?it/s, Loss=2.5781, Acc=0.4884, PPL=13.2][A
+Validation: 1it [04:00, 240.29s/it, Loss=2.5781, Acc=0.4884, PPL=13.2][A
+Validation: 1it [04:00, 240.29s/it, Loss=2.5925, Acc=0.4864, PPL=13.4][A
+Validation: 1it [04:00, 240.29s/it, Loss=2.5925, Acc=0.4864, PPL=13.4][A
+Validation: 2it [04:00, 99.05s/it, Loss=2.5925, Acc=0.4864, PPL=13.4] [A
+Validation: 2it [04:00, 99.05s/it, Loss=2.6035, Acc=0.4835, PPL=13.5][A
+Validation: 2it [04:00, 99.05s/it, Loss=2.6035, Acc=0.4835, PPL=13.5][A
+Validation: 3it [04:00, 53.90s/it, Loss=2.6035, Acc=0.4835, PPL=13.5][A
+Validation: 3it [04:00, 53.90s/it, Loss=2.6060, Acc=0.4820, PPL=13.5][A
+Validation: 3it [04:00, 53.90s/it, Loss=2.6060, Acc=0.4820, PPL=13.5][A
+Validation: 4it [04:00, 32.69s/it, Loss=2.6060, Acc=0.4820, PPL=13.5][A
+                                                                     [A  seq_len=1920 | n=   159 | loss=2.6060 | ppl=13.5474 | acc=0.4820
+Seq lengths:  61%|██████    | 14/23 [15:15<21:47, 145.28s/it]Tokenizing text...
+Total tokens: 154,133
+Created 149 sequences of length 2048
+Each sequence: [context tokens (length 2047)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [04:14, ?it/s, Loss=2.5873, Acc=0.4852, PPL=13.3][A
+Validation: 0it [04:14, ?it/s, Loss=2.5873, Acc=0.4852, PPL=13.3][A
+Validation: 1it [04:14, 254.11s/it, Loss=2.5873, Acc=0.4852, PPL=13.3][A
+Validation: 1it [04:14, 254.11s/it, Loss=2.6005, Acc=0.4831, PPL=13.5][A
+Validation: 1it [04:14, 254.11s/it, Loss=2.6005, Acc=0.4831, PPL=13.5][A
+Validation: 2it [04:14, 104.74s/it, Loss=2.6005, Acc=0.4831, PPL=13.5][A
+Validation: 2it [04:14, 104.74s/it, Loss=2.5959, Acc=0.4835, PPL=13.4][A
+Validation: 2it [04:14, 104.74s/it, Loss=2.5959, Acc=0.4835, PPL=13.4][A
+Validation: 3it [04:14, 57.00s/it, Loss=2.5959, Acc=0.4835, PPL=13.4] [A
+Validation: 3it [04:14, 57.00s/it, Loss=2.6017, Acc=0.4832, PPL=13.5][A
+Validation: 3it [04:14, 57.00s/it, Loss=2.6017, Acc=0.4832, PPL=13.5][A
+Validation: 4it [04:14, 34.57s/it, Loss=2.6017, Acc=0.4832, PPL=13.5][A
+                                                                     [A  seq_len=2048 | n=   149 | loss=2.6017 | ppl=13.4876 | acc=0.4832
+Seq lengths:  65%|██████▌   | 15/23 [19:30<23:46, 178.32s/it]Tokenizing text...
+Total tokens: 154,133
+Created 140 sequences of length 2176
+Each sequence: [context tokens (length 2175)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [06:00, ?it/s, Loss=2.6502, Acc=0.4759, PPL=14.2][A
+Validation: 0it [06:00, ?it/s, Loss=2.6502, Acc=0.4759, PPL=14.2][A
+Validation: 1it [06:00, 360.87s/it, Loss=2.6502, Acc=0.4759, PPL=14.2][A
+Validation: 1it [06:01, 360.87s/it, Loss=2.6337, Acc=0.4765, PPL=13.9][A
+Validation: 1it [06:01, 360.87s/it, Loss=2.6337, Acc=0.4765, PPL=13.9][A
+Validation: 2it [06:01, 148.71s/it, Loss=2.6337, Acc=0.4765, PPL=13.9][A
+Validation: 2it [06:01, 148.71s/it, Loss=2.5971, Acc=0.4833, PPL=13.4][A
+Validation: 2it [06:01, 148.71s/it, Loss=2.5971, Acc=0.4833, PPL=13.4][A
+Validation: 3it [06:01, 80.90s/it, Loss=2.5971, Acc=0.4833, PPL=13.4] [A
+Validation: 3it [06:01, 80.90s/it, Loss=2.5969, Acc=0.4834, PPL=13.4][A
+Validation: 3it [06:01, 80.90s/it, Loss=2.5969, Acc=0.4834, PPL=13.4][A
+Validation: 4it [06:01, 49.04s/it, Loss=2.5969, Acc=0.4834, PPL=13.4][A
+                                                                     [A  seq_len=2176 | n=   140 | loss=2.5969 | ppl=13.4363 | acc=0.4834
+Seq lengths:  70%|██████▉   | 16/23 [25:31<27:14, 233.51s/it]Tokenizing text...
+Total tokens: 154,133
+Created 132 sequences of length 2304
+Each sequence: [context tokens (length 2303)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [07:37, ?it/s, Loss=2.6034, Acc=0.4817, PPL=13.5][A
+Validation: 0it [07:37, ?it/s, Loss=2.6034, Acc=0.4817, PPL=13.5][A
+Validation: 1it [07:37, 457.64s/it, Loss=2.6034, Acc=0.4817, PPL=13.5][A
+Validation: 1it [07:37, 457.64s/it, Loss=2.6071, Acc=0.4819, PPL=13.6][A
+Validation: 1it [07:37, 457.64s/it, Loss=2.6071, Acc=0.4819, PPL=13.6][A
+Validation: 2it [07:37, 188.56s/it, Loss=2.6071, Acc=0.4819, PPL=13.6][A
+Validation: 2it [07:38, 188.56s/it, Loss=2.5995, Acc=0.4840, PPL=13.5][A
+Validation: 2it [07:38, 188.56s/it, Loss=2.5995, Acc=0.4840, PPL=13.5][A
+Validation: 3it [07:38, 102.56s/it, Loss=2.5995, Acc=0.4840, PPL=13.5][A
+Validation: 3it [07:38, 102.56s/it, Loss=2.6034, Acc=0.4830, PPL=13.5][A
+Validation: 3it [07:38, 102.56s/it, Loss=2.6034, Acc=0.4830, PPL=13.5][A
+Validation: 4it [07:38, 62.15s/it, Loss=2.6034, Acc=0.4830, PPL=13.5] [A
+                                                                     [A  seq_len=2304 | n=   132 | loss=2.6034 | ppl=13.5103 | acc=0.4830
+Seq lengths:  74%|███████▍  | 17/23 [33:10<30:06, 301.16s/it]Tokenizing text...
+Total tokens: 154,133
+Created 125 sequences of length 2432
+Each sequence: [context tokens (length 2431)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [09:28, ?it/s, Loss=2.6169, Acc=0.4791, PPL=13.7][A
+Validation: 0it [09:28, ?it/s, Loss=2.6169, Acc=0.4791, PPL=13.7][A
+Validation: 1it [09:28, 568.97s/it, Loss=2.6169, Acc=0.4791, PPL=13.7][A
+Validation: 1it [09:29, 568.97s/it, Loss=2.6007, Acc=0.4827, PPL=13.5][A
+Validation: 1it [09:29, 568.97s/it, Loss=2.6007, Acc=0.4827, PPL=13.5][A
+Validation: 2it [09:29, 234.41s/it, Loss=2.6007, Acc=0.4827, PPL=13.5][A
+Validation: 2it [09:29, 234.41s/it, Loss=2.6052, Acc=0.4825, PPL=13.5][A
+Validation: 2it [09:29, 234.41s/it, Loss=2.6052, Acc=0.4825, PPL=13.5][A
+Validation: 3it [09:29, 127.47s/it, Loss=2.6052, Acc=0.4825, PPL=13.5][A
+Validation: 3it [09:29, 127.47s/it, Loss=2.5964, Acc=0.4844, PPL=13.4][A
+Validation: 3it [09:29, 127.47s/it, Loss=2.5964, Acc=0.4844, PPL=13.4][A
+Validation: 4it [09:29, 77.23s/it, Loss=2.5964, Acc=0.4844, PPL=13.4] [A
+                                                                     [A  seq_len=2432 | n=   125 | loss=2.5964 | ppl=13.4179 | acc=0.4844
+Seq lengths:  78%|███████▊  | 18/23 [42:40<31:49, 381.89s/it]Tokenizing text...
+Total tokens: 154,133
+Created 119 sequences of length 2560
+Each sequence: [context tokens (length 2559)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [11:51, ?it/s, Loss=2.5745, Acc=0.4900, PPL=13.1][A
+Validation: 0it [11:51, ?it/s, Loss=2.5745, Acc=0.4900, PPL=13.1][A
+Validation: 1it [11:51, 711.29s/it, Loss=2.5745, Acc=0.4900, PPL=13.1][A
+Validation: 1it [11:51, 711.29s/it, Loss=2.6035, Acc=0.4837, PPL=13.5][A
+Validation: 1it [11:51, 711.29s/it, Loss=2.6035, Acc=0.4837, PPL=13.5][A
+Validation: 2it [11:51, 293.02s/it, Loss=2.6035, Acc=0.4837, PPL=13.5][A
+Validation: 2it [11:51, 293.02s/it, Loss=2.6017, Acc=0.4837, PPL=13.5][A
+Validation: 2it [11:51, 293.02s/it, Loss=2.6017, Acc=0.4837, PPL=13.5][A
+Validation: 3it [11:51, 159.32s/it, Loss=2.6017, Acc=0.4837, PPL=13.5][A
+Validation: 3it [11:51, 159.32s/it, Loss=2.6018, Acc=0.4832, PPL=13.5][A
+Validation: 3it [11:51, 159.32s/it, Loss=2.6018, Acc=0.4832, PPL=13.5][A
+Validation: 4it [11:51, 96.51s/it, Loss=2.6018, Acc=0.4832, PPL=13.5] [A
+                                                                     [A  seq_len=2560 | n=   119 | loss=2.6018 | ppl=13.4909 | acc=0.4832
+Seq lengths:  83%|████████▎ | 19/23 [54:32<32:04, 481.09s/it]Tokenizing text...
+Total tokens: 154,133
+Created 113 sequences of length 2688
+Each sequence: [context tokens (length 2687)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [12:38, ?it/s, Loss=2.6135, Acc=0.4811, PPL=13.6][A
+Validation: 0it [12:38, ?it/s, Loss=2.6135, Acc=0.4811, PPL=13.6][A
+Validation: 1it [12:38, 758.31s/it, Loss=2.6135, Acc=0.4811, PPL=13.6][A
+Validation: 1it [12:38, 758.31s/it, Loss=2.6361, Acc=0.4770, PPL=14.0][A
+Validation: 1it [12:38, 758.31s/it, Loss=2.6361, Acc=0.4770, PPL=14.0][A
+Validation: 2it [12:38, 312.39s/it, Loss=2.6361, Acc=0.4770, PPL=14.0][A
+Validation: 2it [12:38, 312.39s/it, Loss=2.5874, Acc=0.4867, PPL=13.3][A
+Validation: 2it [12:38, 312.39s/it, Loss=2.5874, Acc=0.4867, PPL=13.3][A
+Validation: 3it [12:38, 169.85s/it, Loss=2.5874, Acc=0.4867, PPL=13.3][A
+Validation: 3it [12:39, 169.85s/it, Loss=2.5913, Acc=0.4851, PPL=13.4][A
+Validation: 3it [12:39, 169.85s/it, Loss=2.5913, Acc=0.4851, PPL=13.4][A
+Validation: 4it [12:39, 102.89s/it, Loss=2.5913, Acc=0.4851, PPL=13.4][A
+                                                                      [A  seq_len=2688 | n=   113 | loss=2.5913 | ppl=13.3727 | acc=0.4851
+Seq lengths:  87%|████████▋ | 20/23 [1:07:11<28:13, 564.60s/it]Tokenizing text...
+Total tokens: 154,133
+Created 108 sequences of length 2816
+Each sequence: [context tokens (length 2815)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [16:05, ?it/s, Loss=2.6165, Acc=0.4784, PPL=13.7][A
+Validation: 0it [16:05, ?it/s, Loss=2.6165, Acc=0.4784, PPL=13.7][A
+Validation: 1it [16:05, 965.03s/it, Loss=2.6165, Acc=0.4784, PPL=13.7][A
+Validation: 1it [16:05, 965.03s/it, Loss=2.6219, Acc=0.4775, PPL=13.8][A
+Validation: 1it [16:05, 965.03s/it, Loss=2.6219, Acc=0.4775, PPL=13.8][A
+Validation: 2it [16:05, 397.51s/it, Loss=2.6219, Acc=0.4775, PPL=13.8][A
+Validation: 2it [16:05, 397.51s/it, Loss=2.6141, Acc=0.4800, PPL=13.7][A
+Validation: 2it [16:05, 397.51s/it, Loss=2.6141, Acc=0.4800, PPL=13.7][A
+Validation: 3it [16:05, 216.11s/it, Loss=2.6141, Acc=0.4800, PPL=13.7][A
+Validation: 3it [16:05, 216.11s/it, Loss=2.6066, Acc=0.4814, PPL=13.6][A
+Validation: 3it [16:05, 216.11s/it, Loss=2.6066, Acc=0.4814, PPL=13.6][A
+Validation: 4it [16:05, 130.89s/it, Loss=2.6066, Acc=0.4814, PPL=13.6][A
+                                                                      [A  seq_len=2816 | n=   108 | loss=2.6066 | ppl=13.5545 | acc=0.4814
+Seq lengths:  91%|█████████▏| 21/23 [1:23:17<22:50, 685.08s/it]Tokenizing text...
+Total tokens: 154,133
+Created 103 sequences of length 2944
+Each sequence: [context tokens (length 2943)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [16:29, ?it/s, Loss=2.5939, Acc=0.4854, PPL=13.4][A
+Validation: 0it [16:29, ?it/s, Loss=2.5939, Acc=0.4854, PPL=13.4][A
+Validation: 1it [16:29, 989.00s/it, Loss=2.5939, Acc=0.4854, PPL=13.4][A
+Validation: 1it [16:29, 989.00s/it, Loss=2.5782, Acc=0.4867, PPL=13.2][A
+Validation: 1it [16:29, 989.00s/it, Loss=2.5782, Acc=0.4867, PPL=13.2][A
+Validation: 2it [16:29, 407.39s/it, Loss=2.5782, Acc=0.4867, PPL=13.2][A
+Validation: 2it [16:29, 407.39s/it, Loss=2.5906, Acc=0.4846, PPL=13.3][A
+Validation: 2it [16:29, 407.39s/it, Loss=2.5906, Acc=0.4846, PPL=13.3][A
+Validation: 3it [16:29, 221.48s/it, Loss=2.5906, Acc=0.4846, PPL=13.3][A
+Validation: 3it [16:29, 221.48s/it, Loss=2.6010, Acc=0.4828, PPL=13.5][A
+Validation: 3it [16:29, 221.48s/it, Loss=2.6010, Acc=0.4828, PPL=13.5][A
+Validation: 4it [16:29, 134.14s/it, Loss=2.6010, Acc=0.4828, PPL=13.5][A
+                                                                      [A  seq_len=2944 | n=   103 | loss=2.6010 | ppl=13.4816 | acc=0.4828
+Seq lengths:  96%|█████████▌| 22/23 [1:39:47<12:56, 776.58s/it]Tokenizing text...
+Total tokens: 154,133
+Created 99 sequences of length 3072
+Each sequence: [context tokens (length 3071)] -> [target token]
+
+Validation: 0it [00:00, ?it/s][A
+Validation: 0it [18:37, ?it/s, Loss=2.6471, Acc=0.4742, PPL=14.1][A
+Validation: 0it [18:37, ?it/s, Loss=2.6471, Acc=0.4742, PPL=14.1][A
+Validation: 1it [18:37, 1117.75s/it, Loss=2.6471, Acc=0.4742, PPL=14.1][A
+Validation: 1it [18:38, 1117.75s/it, Loss=2.6525, Acc=0.4726, PPL=14.2][A
+Validation: 1it [18:38, 1117.75s/it, Loss=2.6525, Acc=0.4726, PPL=14.2][A
+Validation: 2it [18:38, 460.40s/it, Loss=2.6525, Acc=0.4726, PPL=14.2] [A
+Validation: 2it [18:38, 460.40s/it, Loss=2.6392, Acc=0.4758, PPL=14.0][A
+Validation: 2it [18:38, 460.40s/it, Loss=2.6392, Acc=0.4758, PPL=14.0][A
+Validation: 3it [18:38, 250.29s/it, Loss=2.6392, Acc=0.4758, PPL=14.0][A
+Validation: 3it [18:38, 250.29s/it, Loss=2.6198, Acc=0.4793, PPL=13.7][A
+Validation: 3it [18:38, 250.29s/it, Loss=2.6198, Acc=0.4793, PPL=13.7][A
+Validation: 4it [18:38, 151.58s/it, Loss=2.6198, Acc=0.4793, PPL=13.7][A
+                                                                      [A  seq_len=3072 | n=    99 | loss=2.6198 | ppl=13.7429 | acc=0.4793
+Seq lengths: 100%|██████████| 23/23 [1:58:26<00:00, 879.26s/it]Seq lengths: 100%|██████████| 23/23 [1:58:26<00:00, 308.97s/it]
+
+  CSV  → eval_plots/transformer_seq256_alibi_2_model_transformer_seq2seq_silu_default_256_SP_seqlen_range/seqlen_range_results.csv
+  JSON → eval_plots/transformer_seq256_alibi_2_model_transformer_seq2seq_silu_default_256_SP_seqlen_range/seqlen_range_results.json
+  Plot → eval_plots/transformer_seq256_alibi_2_model_transformer_seq2seq_silu_default_256_SP_seqlen_range/seqlen_range_plot.png
+
+  Best PPL  : 13.3727 at seq_len=2688
+  Best Acc  : 0.4851 at seq_len=2688
+============================================================
+

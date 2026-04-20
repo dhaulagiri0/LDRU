@@ -1,0 +1,66 @@
+[2026-04-15T09:12:42.655314] Redirecting stdout/stderr to: logs/seq_128/transformer_logs_alibi.txt
+No tokenizer path provided, training will create a new tokenizer from the training text
+Usage: python train_causal_ldru.py --tokenizer_path <path_to_tokenizer_file>
+Example: python train_causal_ldru.py --tokenizer_path /path/to/your/tokenizer.model
+Training with text file: ptb_train.txt
+Using validation text file: ptb_val.txt
+Using test text file for model testing: ptb_test.txt
+Creating dataset from text file...
+Using SPTokenizer for subword tokenization.
+Tokenizer model will be saved to: tokenizers/ptb_tokenizer_vocab1000_seq128_for_transformer_seq128_alibi_model_transformer_seq2seq_silu_default_128_SP.model
+Tokenizer vocab size: 1000
+Creating training dataset from text file...
+Loading text from: ptb_train.txt
+Tokenizing text...
+Total tokens: 1,735,164
+Created 27,110 sequences of length 128
+Each sequence: [context tokens (length 127)] -> [target token]
+All sequences used for dataset: 27,110
+\nSample sequence: 'and the ec  ⁇ unk ⁇  capital movements since then the government has left observers wondering if it ...'
+Creating validation dataset from text file...
+Loading text from: ptb_val.txt
+Tokenizing text...
+Total tokens: 135,593
+Created 2,117 sequences of length 128
+Each sequence: [context tokens (length 127)] -> [target token]
+All sequences used for dataset: 2,117
+Validation sequences: 2,117
+Creating test dataset from text file...
+Loading text from: ptb_test.txt
+Tokenizing text...
+Total tokens: 154,133
+Created 2,407 sequences of length 128
+Each sequence: [context tokens (length 127)] -> [target token]
+All sequences used for dataset: 2,407
+Test sequences: 2,407
+Created evaluation model with dropout disabled
+Initializing model...
+Checkpoints will be saved to: checkpoints
+Model has 3,842,500 parameters
+Initial learning rate: 1.00e-03
+Starting training...
+
+Epoch 1/100
+Training: 0it [00:00, ?it/s]Training: 0it [00:51, ?it/s, Loss=7.1906, Acc=0.0005, PPL=1326.8, LR=1.00e-03]Training: 1it [00:51, 51.77s/it, Loss=7.1906, Acc=0.0005, PPL=1326.8, LR=1.00e-03]Training: 1it [00:51, 51.77s/it, Loss=6.9285, Acc=0.0247, PPL=1056.2, LR=1.00e-03]Training: 2it [00:51, 21.43s/it, Loss=6.9285, Acc=0.0247, PPL=1056.2, LR=1.00e-03]Training: 2it [00:52, 21.43s/it, Loss=6.7562, Acc=0.0258, PPL=907.1, LR=1.00e-03] Training: 3it [00:52, 11.73s/it, Loss=6.7562, Acc=0.0258, PPL=907.1, LR=1.00e-03]Training: 3it [00:52, 11.73s/it, Loss=6.6175, Acc=0.0292, PPL=803.7, LR=1.00e-03]Training: 4it [00:52,  7.18s/it, Loss=6.6175, Acc=0.0292, PPL=803.7, LR=1.00e-03]Training: 4it [00:52,  7.18s/it, Loss=6.5285, Acc=0.0332, PPL=738.8, LR=1.00e-03]Training: 5it [00:52,  4.66s/it, Loss=6.5285, Acc=0.0332, PPL=738.8, LR=1.00e-03]Training: 5it [00:52,  4.66s/it, Loss=6.4504, Acc=0.0355, PPL=687.1, LR=1.00e-03]Training: 6it [00:52,  3.14s/it, Loss=6.4504, Acc=0.0355, PPL=687.1, LR=1.00e-03]Training: 6it [00:52,  3.14s/it, Loss=6.3898, Acc=0.0351, PPL=648.1, LR=1.00e-03]Training: 7it [00:52,  2.18s/it, Loss=6.3898, Acc=0.0351, PPL=648.1, LR=1.00e-03]Training: 7it [00:53,  2.18s/it, Loss=6.3377, Acc=0.0345, PPL=616.2, LR=1.00e-03]Training: 8it [00:53,  1.54s/it, Loss=6.3377, Acc=0.0345, PPL=616.2, LR=1.00e-03]Training: 8it [00:53,  1.54s/it, Loss=6.2966, Acc=0.0342, PPL=591.1, LR=1.00e-03]Training: 9it [00:53,  1.12s/it, Loss=6.2966, Acc=0.0342, PPL=591.1, LR=1.00e-03]Training: 9it [00:53,  1.12s/it, Loss=6.2616, Acc=0.0347, PPL=570.3, LR=1.00e-03]Training: 10it [00:53,  1.20it/s, Loss=6.2616, Acc=0.0347, PPL=570.3, LR=1.00e-03]Training: 10it [00:53,  1.20it/s, Loss=6.2314, Acc=0.0358, PPL=552.6, LR=1.00e-03]Training: 11it [00:53,  1.57it/s, Loss=6.2314, Acc=0.0358, PPL=552.6, LR=1.00e-03]Training: 11it [00:53,  1.57it/s, Loss=6.2070, Acc=0.0370, PPL=538.1, LR=1.00e-03]Training: 12it [00:53,  1.99it/s, Loss=6.2070, Acc=0.0370, PPL=538.1, LR=1.00e-03]Training: 12it [00:54,  1.99it/s, Loss=6.1868, Acc=0.0379, PPL=526.1, LR=1.00e-03]Training: 13it [00:54,  2.45it/s, Loss=6.1868, Acc=0.0379, PPL=526.1, LR=1.00e-03]Training: 13it [00:54,  2.45it/s, Loss=6.1691, Acc=0.0385, PPL=515.6, LR=1.00e-03]Training: 14it [00:54,  2.91it/s, Loss=6.1691, Acc=0.0385, PPL=515.6, LR=1.00e-03]Training: 14it [00:54,  2.91it/s, Loss=6.1540, Acc=0.0387, PPL=506.7, LR=1.00e-03]Training: 15it [00:54,  3.36it/s, Loss=6.1540, Acc=0.0387, PPL=506.7, LR=1.00e-03]Training: 15it [00:54,  3.36it/s, Loss=6.1403, Acc=0.0388, PPL=498.6, LR=1.00e-03]Training: 16it [00:54,  3.76it/s, Loss=6.1403, Acc=0.0388, PPL=498.6, LR=1.00e-03]Training: 16it [00:54,  3.76it/s, Loss=6.1294, Acc=0.0388, PPL=492.0, LR=1.00e-03]Training: 17it [00:54,  4.10it/s, Loss=6.1294, Acc=0.0388, PPL=492.0, LR=1.00e-03]Training: 17it [00:55,  4.10it/s, Loss=6.1197, Acc=0.0387, PPL=486.1, LR=1.00e-03]Training: 18it [00:55,  4.38it/s, Loss=6.1197, Acc=0.0387, PPL=486.1, LR=1.00e-03]Training: 18it [00:55,  4.38it/s, Loss=6.1108, Acc=0.0388, PPL=480.7, LR=1.00e-03]Training: 19it [00:55,  4.60it/s, Loss=6.1108, Acc=0.0388, PPL=480.7, LR=1.00e-03]Training: 19it [00:55,  4.60it/s, Loss=6.1013, Acc=0.0390, PPL=475.3, LR=1.00e-03]Training: 20it [00:55,  4.76it/s, Loss=6.1013, Acc=0.0390, PPL=475.3, LR=1.00e-03]Training: 20it [00:55,  4.76it/s, Loss=6.0939, Acc=0.0392, PPL=470.8, LR=1.00e-03]Training: 21it [00:55,  4.89it/s, Loss=6.0939, Acc=0.0392, PPL=470.8, LR=1.00e-03]Training: 21it [00:55,  4.89it/s, Loss=6.0858, Acc=0.0395, PPL=466.3, LR=1.00e-03]Training: 22it [00:55,  4.98it/s, Loss=6.0858, Acc=0.0395, PPL=466.3, LR=1.00e-03]Training: 22it [00:56,  4.98it/s, Loss=6.0786, Acc=0.0398, PPL=462.2, LR=1.00e-03]Training: 23it [00:56,  5.04it/s, Loss=6.0786, Acc=0.0398, PPL=462.2, LR=1.00e-03]Training: 23it [00:56,  5.04it/s, Loss=6.0711, Acc=0.0402, PPL=458.2, LR=1.00e-03]Training: 24it [00:56,  5.09it/s, Loss=6.0711, Acc=0.0402, PPL=458.2, LR=1.00e-03]Training: 24it [00:56,  5.09it/s, Loss=6.0650, Acc=0.0404, PPL=454.7, LR=1.00e-03]Training: 25it [00:56,  5.12it/s, Loss=6.0650, Acc=0.0404, PPL=454.7, LR=1.00e-03]Training: 25it [00:56,  5.12it/s, Loss=6.0592, Acc=0.0406, PPL=451.4, LR=1.00e-03]Training: 26it [00:56,  5.15it/s, Loss=6.0592, Acc=0.0406, PPL=451.4, LR=1.00e-03]Training: 26it [00:56,  5.15it/s, Loss=6.0547, Acc=0.0407, PPL=448.8, LR=1.00e-03]Training: 27it [00:56,  5.17it/s, Loss=6.0547, Acc=0.0407, PPL=448.8, LR=1.00e-03]Training: 27it [00:56,  5.17it/s, Loss=6.0498, Acc=0.0408, PPL=446.0, LR=1.00e-03]Training: 28it [00:56,  5.18it/s, Loss=6.0498, Acc=0.0408, PPL=446.0, LR=1.00e-03]Training: 28it [00:57,  5.18it/s, Loss=6.0448, Acc=0.0409, PPL=443.3, LR=1.00e-03]Training: 29it [00:57,  5.18it/s, Loss=6.0448, Acc=0.0409, PPL=443.3, LR=1.00e-03]Training: 29it [00:57,  5.18it/s, Loss=6.0401, Acc=0.0410, PPL=440.7, LR=1.00e-03]Training: 30it [00:57,  5.19it/s, Loss=6.0401, Acc=0.0410, PPL=440.7, LR=1.00e-03]Training: 30it [00:57,  5.19it/s, Loss=6.0360, Acc=0.0412, PPL=438.4, LR=1.00e-03]Training: 31it [00:57,  5.19it/s, Loss=6.0360, Acc=0.0412, PPL=438.4, LR=1.00e-03]Training: 31it [00:57,  5.19it/s, Loss=6.0319, Acc=0.0413, PPL=436.2, LR=1.00e-03]Training: 32it [00:57,  5.19it/s, Loss=6.0319, Acc=0.0413, PPL=436.2, LR=1.00e-03]Training: 32it [00:57,  5.19it/s, Loss=6.0288, Acc=0.0414, PPL=434.4, LR=1.00e-03]Training: 33it [00:57,  5.20it/s, Loss=6.0288, Acc=0.0414, PPL=434.4, LR=1.00e-03]Training: 33it [00:58,  5.20it/s, Loss=6.0254, Acc=0.0415, PPL=432.5, LR=1.00e-03]Training: 34it [00:58,  5.20it/s, Loss=6.0254, Acc=0.0415, PPL=432.5, LR=1.00e-03]Training: 34it [00:58,  5.20it/s, Loss=6.0223, Acc=0.0416, PPL=430.7, LR=1.00e-03]Training: 35it [00:58,  5.21it/s, Loss=6.0223, Acc=0.0416, PPL=430.7, LR=1.00e-03]Training: 35it [00:58,  5.21it/s, Loss=6.0190, Acc=0.0417, PPL=428.9, LR=1.00e-03]Training: 36it [00:58,  5.21it/s, Loss=6.0190, Acc=0.0417, PPL=428.9, LR=1.00e-03]Training: 36it [00:58,  5.21it/s, Loss=6.0164, Acc=0.0418, PPL=427.4, LR=1.00e-03]Training: 37it [00:58,  5.21it/s, Loss=6.0164, Acc=0.0418, PPL=427.4, LR=1.00e-03]Training: 37it [00:58,  5.21it/s, Loss=6.0134, Acc=0.0419, PPL=425.8, LR=1.00e-03]Training: 38it [00:58,  5.22it/s, Loss=6.0134, Acc=0.0419, PPL=425.8, LR=1.00e-03]Training: 38it [00:59,  5.22it/s, Loss=6.0101, Acc=0.0420, PPL=424.1, LR=1.00e-03]Training: 39it [00:59,  5.22it/s, Loss=6.0101, Acc=0.0420, PPL=424.1, LR=1.00e-03]Training: 39it [00:59,  5.22it/s, Loss=6.0071, Acc=0.0422, PPL=422.6, LR=1.00e-03]Training: 40it [00:59,  5.22it/s, Loss=6.0071, Acc=0.0422, PPL=422.6, LR=1.00e-03]Training: 40it [00:59,  5.22it/s, Loss=6.0044, Acc=0.0423, PPL=421.1, LR=1.00e-03]Training: 41it [00:59,  5.23it/s, Loss=6.0044, Acc=0.0423, PPL=421.1, LR=1.00e-03]Training: 41it [00:59,  5.23it/s, Loss=6.0016, Acc=0.0424, PPL=419.7, LR=1.00e-03]Training: 42it [00:59,  5.22it/s, Loss=6.0016, Acc=0.0424, PPL=419.7, LR=1.00e-03]Training: 42it [00:59,  5.22it/s, Loss=5.9988, Acc=0.0426, PPL=418.2, LR=1.00e-03]Training: 43it [00:59,  5.23it/s, Loss=5.9988, Acc=0.0426, PPL=418.2, LR=1.00e-03]Training: 43it [01:00,  5.23it/s, Loss=5.9964, Acc=0.0427, PPL=417.0, LR=1.00e-03]Training: 44it [01:00,  5.22it/s, Loss=5.9964, Acc=0.0427, PPL=417.0, LR=1.00e-03]Training: 44it [01:00,  5.22it/s, Loss=5.9939, Acc=0.0428, PPL=415.7, LR=1.00e-03]Training: 45it [01:00,  5.22it/s, Loss=5.9939, Acc=0.0428, PPL=415.7, LR=1.00e-03]Training: 45it [01:00,  5.22it/s, Loss=5.9916, Acc=0.0429, PPL=414.5, LR=1.00e-03]Training: 46it [01:00,  5.22it/s, Loss=5.9916, Acc=0.0429, PPL=414.5, LR=1.00e-03]Training: 46it [01:00,  5.22it/s, Loss=5.9890, Acc=0.0431, PPL=413.2, LR=1.00e-03]Training: 47it [01:00,  5.23it/s, Loss=5.9890, Acc=0.0431, PPL=413.2, LR=1.00e-03]Training: 47it [01:00,  5.23it/s, Loss=5.9863, Acc=0.0433, PPL=411.9, LR=1.00e-03]Training: 48it [01:00,  5.23it/s, Loss=5.9863, Acc=0.0433, PPL=411.9, LR=1.00e-03]Training: 48it [01:00,  5.23it/s, Loss=5.9838, Acc=0.0435, PPL=410.7, LR=1.00e-03]Training: 49it [01:00,  5.23it/s, Loss=5.9838, Acc=0.0435, PPL=410.7, LR=1.00e-03]Training: 49it [01:01,  5.23it/s, Loss=5.9816, Acc=0.0436, PPL=409.6, LR=1.00e-03]Training: 50it [01:01,  5.23it/s, Loss=5.9816, Acc=0.0436, PPL=409.6, LR=1.00e-03]Training: 50it [01:01,  5.23it/s, Loss=5.9800, Acc=0.0436, PPL=408.7, LR=1.00e-03]Training: 51it [01:01,  5.23it/s, Loss=5.9800, Acc=0.0436, PPL=408.7, LR=1.00e-03]Training: 51it [01:01,  5.23it/s, Loss=5.9779, Acc=0.0437, PPL=407.7, LR=1.00e-03]Training: 52it [01:01,  5.23it/s, Loss=5.9779, Acc=0.0437, PPL=407.7, LR=1.00e-03]Training: 52it [01:01,  1.18s/it, Loss=5.9779, Acc=0.0437, PPL=407.7, LR=1.00e-03]
+Average loss: 5.9779
+Average accuracy: 0.0437
+Average perplexity: 407.6747
+Current learning rate: 1.00e-03
+Validation loss: 5.8307
+Validation accuracy: 0.0512
+Validation perplexity: 340.6412
+Per-position PPL: [364.9 357.1 347.8 357.5 341.2 348.8 340.6 ... 351.3 333.7 344.2 346.3 343.4 334.4 343.3] → (μ=341.5, range=313.4-374.7)
+Position trend: stable (R²=0.004)
+Best: pos 74 (PPL=313.43), Worst: pos 53 (PPL=374.75)
+✅ Validation improved! Reset patience counter.
+Traceback (most recent call last):
+  File "/rds/general/user/kw1523/home/LDRU/train_causal_ldru.py", line 3287, in <module>
+    params, model, config, tokenizer = train_model(
+                                       ^^^^^^^^^^^^
+  File "/rds/general/user/kw1523/home/LDRU/train_causal_ldru.py", line 1217, in train_model
+    save_checkpoint(
+  File "/rds/general/user/kw1523/home/LDRU/train_causal_ldru.py", line 1418, in save_checkpoint
+    checkpointer.save(
+  File "/rds/general/user/kw1523/home/venv/ldru-venv/lib/python3.12/site-packages/orbax/checkpoint/_src/checkpointers/checkpointer.py", line 254, in save
+    raise ValueError(f'Destination {directory} already exists.')
+ValueError: Destination /rds/general/user/kw1523/home/LDRU/checkpoints/transformer_seq128_alibi_model_transformer_seq2seq_silu_default_128_SP/step_1 already exists.

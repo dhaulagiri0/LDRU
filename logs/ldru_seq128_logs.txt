@@ -1,0 +1,44 @@
+[2026-04-13T19:06:17.224318] Redirecting stdout/stderr to: ./logs/ldru_seq128_logs.txt
+No tokenizer path provided, training will create a new tokenizer from the training text
+Usage: python train_causal_ldru.py --tokenizer_path <path_to_tokenizer_file>
+Example: python train_causal_ldru.py --tokenizer_path /path/to/your/tokenizer.model
+Training with text file: ptb_train.txt
+Using validation text file: ptb_val.txt
+Using test text file for model testing: ptb_test.txt
+Creating dataset from text file...
+Using SPTokenizer for subword tokenization.
+Tokenizer model will be saved to: tokenizers/ptb_tokenizer_vocab1000_seq128_for_ldru_seq128_default_test_model_ldru_seq2seq_silu_default_128_SP.model
+Tokenizer vocab size: 1000
+Creating training dataset from text file...
+Loading text from: ptb_train.txt
+Tokenizing text...
+Total tokens: 1,735,164
+Created 27,110 sequences of length 128
+Each sequence: [context tokens (length 127)] -> [target token]
+All sequences used for dataset: 27,110
+\nSample sequence: 'and the ec  ⁇ unk ⁇  capital movements since then the government has left observers wondering if it ...'
+Creating validation dataset from text file...
+Loading text from: ptb_val.txt
+Tokenizing text...
+Total tokens: 135,593
+Created 2,117 sequences of length 128
+Each sequence: [context tokens (length 127)] -> [target token]
+All sequences used for dataset: 2,117
+Validation sequences: 2,117
+Creating test dataset from text file...
+Loading text from: ptb_test.txt
+Tokenizing text...
+Total tokens: 154,133
+Created 2,407 sequences of length 128
+Each sequence: [context tokens (length 127)] -> [target token]
+All sequences used for dataset: 2,407
+Test sequences: 2,407
+Created evaluation model with dropout disabled
+Initializing model...
+Checkpoints will be saved to: checkpoints
+Model has 4,630,600 parameters
+Initial learning rate: 1.00e-03
+Starting training...
+
+Epoch 1/100
+Training: 0it [00:00, ?it/s]Starting batch 1

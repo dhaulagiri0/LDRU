@@ -1,3 +1,5 @@
+eval_logs/
+logs/
 eval_plots/
 checkpoints/
 seq_seq_logs/

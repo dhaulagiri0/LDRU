@@ -1,0 +1,15 @@
+numpy
+jax
+jaxlib
+dm-haiku
+flax
+chex
+optax
+tqdm
+dm-tree
+absl-py
+tensorboardX
+scikit-learn
+matplotlib
+pandas
+seaborn
