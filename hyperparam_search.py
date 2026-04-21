@@ -198,6 +198,7 @@ if __name__ == "__main__":
         direction="minimize",
         storage=args.storage_url,
         load_if_exists=True,
+        pruner=optuna.pruners.MedianPruner(),
     )
     study.optimize(
         make_objective(
