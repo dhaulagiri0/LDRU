@@ -11,6 +11,8 @@ stable_causal_ldru_v2.py
 train_causal_ldru_old.py
 .DS_Store
 __pycache__/
+*.py[cod]
+*$py.class
 supplementary_code-main/ldru/models/__pycache__/
 *.db
 optuna_checkpoints/

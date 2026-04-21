@@ -3303,6 +3303,18 @@ if __name__ == "__main__":
         default=256,
         help="Hidden dimension for LSTM and Transformer models (default: 256)",
     )
+    parser.add_argument(
+        "--num_transformer_heads",
+        type=int,
+        default=4,
+        help="Number of attention heads for Transformer models (default: 4)",
+    )
+    parser.add_argument(
+        "--num_transformer_layers",
+        type=int,
+        default=2,
+        help="Number of transformer layers for Transformer models (default: 2)",
+    )
     args = parser.parse_args()
 
     configure_output(args.print_log_file)
@@ -3465,6 +3477,8 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         min_learning_rate=args.lr / 1000,  # Set min LR for cosine decay
         num_epochs=args.num_epochs,
+        num_transformer_heads=args.num_transformer_heads,
+        num_transformer_layers=args.num_transformer_layers,
     )
 
     # Run training
