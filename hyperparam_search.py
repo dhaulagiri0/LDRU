@@ -59,12 +59,30 @@ def make_objective(
                 "num_transformer_heads", [4, 8, 16]
             )
             num_transformer_layers = trial.suggest_int("num_transformer_layers", 2, 8)
-        hidden_dim = trial.suggest_int("hidden_dim", 256, 1024, step=128)
+        hidden_dim = trial.suggest_categorical("hidden_dim", [128, 256, 512, 1024])
         dropout_prob = trial.suggest_float("dropout_prob", 0.0, 0.6, step=0.1)
-        initial_learning_rate = trial.suggest_float(
-            "initial_learning_rate", 1e-4, 1e-2, log=True
+        initial_learning_rate = trial.suggest_categorical(
+            "initial_learning_rate",
+            [1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3],
         )
-        l2_lambda = trial.suggest_float("l2_lambda", 1e-5, 1e-2, log=True)
+        l2_lambda = trial.suggest_categorical(
+            "l2_lambda",
+            [
+                0.0,
+                1e-6,
+                5e-6,
+                1e-5,
+                5e-5,
+                1e-4,
+                5e-5,
+                1e-3,
+                5e-3,
+                1e-2,
+                5e-2,
+                1e-1,
+                5e-1,
+            ],
+        )
 
         # Create the model configuration
         config = LDRUExperimenstConfig(
