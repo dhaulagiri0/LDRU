@@ -50,6 +50,7 @@ def make_objective(
     num_epochs=20,
     seq_length=256,
     tokenizer_path=None,
+    use_alibi=True,
 ):
     def objective(trial):
         # Define the hyperparameter search space
@@ -102,7 +103,7 @@ def make_objective(
             min_learning_rate=initial_learning_rate
             / 1000,  # Set a minimum learning rate for the scheduler
             use_positional_encoding=(True if use_transformer else False),
-            use_alibi=(True if use_transformer else False),
+            use_alibi=(use_alibi if use_transformer else False),
         )
 
         # Call train_model and capture the best validation perplexity
@@ -164,7 +165,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--vocab_size",
         type=int,
-        default=16000,
+        default=8000,
         help="Vocabulary size to use for training (default: 16000)",
     )
     parser.add_argument(
@@ -196,6 +197,12 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Path to a file to redirect stdout/stderr (optional, if not provided, output will go to console)",
+    )
+    parser.add_argument(
+        "--use_alibi",
+        action="store_false",
+        default=True,
+        help="Whether to use ALiBi positional bias in the transformer model (only applicable if --model_type is transformer)",
     )
     args = parser.parse_args()
 
@@ -236,6 +243,7 @@ if __name__ == "__main__":
             num_epochs=epochs_per_trial,
             seq_length=seq_length,
             tokenizer_path=args.tokenizer_path,
+            use_alibi=args.use_alibi,
         ),
         n_trials=num_trials,
     )
