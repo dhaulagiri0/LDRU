@@ -53,7 +53,6 @@ def make_objective(
 ):
     def objective(trial):
         # Define the hyperparameter search space
-        embedding_dim = trial.suggest_int("embedding_dim", 128, 512, step=64)
         num_layers = trial.suggest_int("num_layers", 1, 4)
         if use_transformer:
             num_transformer_heads = trial.suggest_categorical(
@@ -69,7 +68,7 @@ def make_objective(
 
         # Create the model configuration
         config = LDRUExperimenstConfig(
-            embedding_dim=embedding_dim,
+            embedding_dim=512,
             num_layers=num_layers,
             max_sequence_length=3072,
             hidden_dim=hidden_dim,
