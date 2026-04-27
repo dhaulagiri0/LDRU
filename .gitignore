@@ -24,3 +24,7 @@ remote_eval_plots_1/
 remote_logs_1
 remote_training_logs_1/
 remote_checkpoints_1/
+tensorboard_logs/
+wikitext-103-raw-test.txt
+wikitext-103-raw-train.txt
+wikitext-103-raw-validation.txt
