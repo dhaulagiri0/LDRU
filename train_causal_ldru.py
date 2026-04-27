@@ -3315,6 +3315,12 @@ if __name__ == "__main__":
         default=2,
         help="Number of transformer layers for Transformer models (default: 2)",
     )
+    parser.add_argument(
+        "--tensorboard_log_dir",
+        type=str,
+        default="tensorboard_logs",
+        help="Directory to save TensorBoard logs (default: tensorboard_logs)",
+    )
     args = parser.parse_args()
 
     configure_output(args.print_log_file)
@@ -3453,7 +3459,7 @@ if __name__ == "__main__":
     resume_from_checkpoint = args.resume
 
     # Create checkpoint directory if it doesn't exist
-    LOG_DIR = "seq_seq_logs"
+    LOG_DIR = args.tensorboard_log_dir
     enable_logging = not args.no_logging
     if enable_logging:
         if not os.path.exists(LOG_DIR):
