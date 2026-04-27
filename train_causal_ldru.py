@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import numpy as np
-from typing import Callable, Tuple, Dict, List, Optional
+from typing import Callable, Tuple, Dict, List, Optional, Iterator
 import tqdm
 import re
 import os
@@ -629,6 +629,140 @@ def create_data_loader(sequences, batch_size, rng_key):
         yield shuffled_sequences[start_idx:end_idx]
 
 
+def iter_token_sequences_from_text_file(
+    file_path: str,
+    tokenizer: BaseTokenizer,
+    seq_length: int,
+    stride: int,
+    chunk_line_buffer: int = 4096,
+) -> Iterator[np.ndarray]:
+    """Stream token sequences from a text file without materializing full datasets."""
+    if seq_length <= 0:
+        raise ValueError("seq_length must be > 0")
+    if stride <= 0:
+        raise ValueError("stride must be > 0")
+
+    token_buffer: List[int] = []
+    window_start = 0
+
+    def _flush_available_sequences() -> Iterator[np.ndarray]:
+        nonlocal token_buffer, window_start
+        while window_start + seq_length <= len(token_buffer):
+            yield np.asarray(
+                token_buffer[window_start : window_start + seq_length], dtype=np.int32
+            )
+            window_start += stride
+
+        if window_start >= max(seq_length, stride * 8):
+            token_buffer = token_buffer[window_start:]
+            window_start = 0
+
+    lines: List[str] = []
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            lines.append(line)
+            if len(lines) >= chunk_line_buffer:
+                token_buffer.extend(tokenizer.encode("".join(lines)))
+                lines.clear()
+                yield from _flush_available_sequences()
+
+    if lines:
+        token_buffer.extend(tokenizer.encode("".join(lines)))
+        yield from _flush_available_sequences()
+
+
+def estimate_num_sequences_from_text_file(
+    file_path: str,
+    tokenizer: BaseTokenizer,
+    seq_length: int,
+    stride: int,
+    chunk_line_buffer: int = 4096,
+) -> int:
+    """Count sequence windows produced by streaming tokenization."""
+    if seq_length <= 0:
+        raise ValueError("seq_length must be > 0")
+    if stride <= 0:
+        raise ValueError("stride must be > 0")
+
+    token_buffer: List[int] = []
+    window_start = 0
+    count = 0
+    lines: List[str] = []
+
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            lines.append(line)
+            if len(lines) >= chunk_line_buffer:
+                token_buffer.extend(tokenizer.encode("".join(lines)))
+                lines.clear()
+                while window_start + seq_length <= len(token_buffer):
+                    count += 1
+                    window_start += stride
+                if window_start >= max(seq_length, stride * 8):
+                    token_buffer = token_buffer[window_start:]
+                    window_start = 0
+
+    if lines:
+        token_buffer.extend(tokenizer.encode("".join(lines)))
+        while window_start + seq_length <= len(token_buffer):
+            count += 1
+            window_start += stride
+
+    return count
+
+
+def _pop_random_batch(
+    shuffle_buffer: List[np.ndarray], batch_size: int, rng: np.random.Generator
+) -> np.ndarray:
+    """Pop a random batch from a list-backed shuffle buffer."""
+    picked_indices = np.sort(
+        rng.choice(len(shuffle_buffer), size=batch_size, replace=False)
+    )
+    batch = np.stack([shuffle_buffer[int(idx)] for idx in picked_indices], axis=0)
+
+    for idx in reversed(picked_indices):
+        shuffle_buffer.pop(int(idx))
+
+    return batch
+
+
+def create_streaming_data_loader(
+    file_path: str,
+    tokenizer: BaseTokenizer,
+    seq_length: int,
+    stride: int,
+    batch_size: int,
+    rng_key,
+    shuffle_buffer_size: int = 8192,
+    chunk_line_buffer: int = 4096,
+) -> Iterator[np.ndarray]:
+    """Yield shuffled batches from streamed token windows."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+
+    effective_buffer = max(batch_size, shuffle_buffer_size)
+    seed = int(jax.random.randint(rng_key, shape=(), minval=0, maxval=2**31 - 1))
+    np_rng = np.random.default_rng(seed)
+
+    shuffle_buffer: List[np.ndarray] = []
+    sequence_iter = iter_token_sequences_from_text_file(
+        file_path=file_path,
+        tokenizer=tokenizer,
+        seq_length=seq_length,
+        stride=stride,
+        chunk_line_buffer=chunk_line_buffer,
+    )
+
+    for sequence in sequence_iter:
+        shuffle_buffer.append(sequence)
+
+        while len(shuffle_buffer) >= effective_buffer:
+            yield _pop_random_batch(shuffle_buffer, batch_size, np_rng)
+
+    while len(shuffle_buffer) >= batch_size:
+        yield _pop_random_batch(shuffle_buffer, batch_size, np_rng)
+
+
 def make_train_step(
     model,
     optimizer,
@@ -1027,6 +1161,9 @@ def train_model(
     tokenizer_type: TokenizerType = TokenizerType.SENTENCEPIECE,  # Type of tokenizer to use
     model_prefix: str = "",  # Prefix for model name in checkpoints and logs
     generate_samples: bool = True,  # Whether to generate sample text after training
+    streaming_train: bool = True,
+    streaming_shuffle_buffer_size: int = 8192,
+    streaming_chunk_line_buffer: int = 4096,
 ):
     """Main training function."""
 
@@ -1086,13 +1223,74 @@ def train_model(
     vocab_size = tokenizer.get_piece_size()
     print(f"Tokenizer vocab size: {vocab_size}")
 
-    train_data, val_data, test_data = create_datasets_for_training(
-        text_file_path,
-        validation_text_file_path,
-        test_text_file_path,
-        tokenizer,
-        seq_length,
-    )
+    train_data, val_data, test_data = None, None, None
+    train_stride = max(1, seq_length // 2)
+
+    if streaming_train and validation_text_file_path is None:
+        print(
+            "Streaming training needs an explicit validation file. Falling back to in-memory train split."
+        )
+        streaming_train = False
+
+    if streaming_train:
+        print("Using streaming training dataset loader (low-memory mode).")
+        train_sequence_count = estimate_num_sequences_from_text_file(
+            file_path=text_file_path,
+            tokenizer=tokenizer,
+            seq_length=seq_length,
+            stride=train_stride,
+            chunk_line_buffer=streaming_chunk_line_buffer,
+        )
+        print(f"Estimated training sequences: {train_sequence_count:,}")
+
+        preview_loader = create_streaming_data_loader(
+            file_path=text_file_path,
+            tokenizer=tokenizer,
+            seq_length=seq_length,
+            stride=train_stride,
+            batch_size=batch_size,
+            rng_key=data_key,
+            shuffle_buffer_size=streaming_shuffle_buffer_size,
+            chunk_line_buffer=streaming_chunk_line_buffer,
+        )
+        preview_batch = next(preview_loader, None)
+        if preview_batch is None:
+            raise ValueError(
+                "No training batches could be created. Check seq_length/stride and input file size."
+            )
+        sample_text = tokenizer.decode(preview_batch[0].tolist())
+        print(f"\nSample sequence: '{sample_text[:100]}...'")
+
+        print("Creating validation dataset from text file...")
+        val_data, _ = create_dataset_from_text_file(
+            validation_text_file_path,
+            seq_length=seq_length,
+            stride=train_stride,
+            train_split=1.0,
+            tokenizer=tokenizer,
+        )
+        print(f"Validation sequences: {len(val_data):,}")
+
+        if test_text_file_path:
+            print("Creating test dataset from text file...")
+            test_data, _ = create_dataset_from_text_file(
+                test_text_file_path,
+                seq_length=seq_length,
+                stride=train_stride,
+                train_split=1.0,
+                tokenizer=tokenizer,
+            )
+            print(f"Test sequences: {len(test_data):,}")
+    else:
+        train_data, val_data, test_data = create_datasets_for_training(
+            text_file_path,
+            validation_text_file_path,
+            test_text_file_path,
+            tokenizer,
+            seq_length,
+        )
+        train_sequence_count = len(train_data)
+        preview_batch = np.asarray(train_data[:batch_size])
 
     # Create model
     model = model_creation_fn(config)
@@ -1105,17 +1303,20 @@ def train_model(
     print("Initializing model...")
     if model_creation_fn == create_transformer_model:
         # Transformer expects token IDs directly
-        dummy_batch = train_data[:1]  # [B, L-1] for next token prediction
+        dummy_batch = jnp.asarray(preview_batch[:1])  # [B, L-1] for next token prediction
     elif use_lstm:
-        dummy_batch = train_data[:1, :-1]  # LSTM needs input without last token
+        dummy_batch = jnp.asarray(
+            preview_batch[:1, :-1]
+        )  # LSTM needs input without last token
     else:
-        dummy_batch = train_data[:1]  # LDRU uses full sequence
+        dummy_batch = jnp.asarray(preview_batch[:1])  # LDRU uses full sequence
     params = model.init(init_key, dummy_batch)
 
     # Initialize optimizer with learning rate scheduling
+    train_steps_per_epoch = max(1, train_sequence_count // batch_size)
     learning_rate_schedule = optax.schedules.cosine_decay_schedule(
         init_value=config.initial_learning_rate,
-        decay_steps=num_epochs * (len(train_data) // batch_size),
+        decay_steps=max(1, num_epochs * train_steps_per_epoch),
         alpha=min_learning_rate / config.initial_learning_rate,
     )
     optimizer = optax.chain(
@@ -1190,7 +1391,7 @@ def train_model(
 
     print("Warming up JIT compilation...")
 
-    dummy_batch = train_data[:batch_size]
+    dummy_batch = jnp.asarray(preview_batch)
 
     # warmup train
     params, opt_state, _, _ = compiled_train_step(
@@ -1229,7 +1430,19 @@ def train_model(
 
         # Create data loader for this epoch
         rng_key, epoch_key = jax.random.split(rng_key)
-        data_loader = create_data_loader(train_data, batch_size, epoch_key)
+        if streaming_train:
+            data_loader = create_streaming_data_loader(
+                file_path=text_file_path,
+                tokenizer=tokenizer,
+                seq_length=seq_length,
+                stride=train_stride,
+                batch_size=batch_size,
+                rng_key=epoch_key,
+                shuffle_buffer_size=streaming_shuffle_buffer_size,
+                chunk_line_buffer=streaming_chunk_line_buffer,
+            )
+        else:
+            data_loader = create_data_loader(train_data, batch_size, epoch_key)
 
         epoch_losses = []
         epoch_accuracies = []
@@ -1238,8 +1451,9 @@ def train_model(
 
         # Training batches
         pbar = tqdm.tqdm(data_loader, desc="Training", position=0, leave=True)
-        for batch in pbar:
+        for batch_np in pbar:
             rng_key, step_key = jax.random.split(rng_key)
+            batch = jnp.asarray(batch_np)
 
             # Training step
             params, opt_state, loss, metrics = compiled_train_step(
@@ -3321,6 +3535,24 @@ if __name__ == "__main__":
         default="tensorboard_logs",
         help="Directory to save TensorBoard logs (default: tensorboard_logs)",
     )
+    parser.add_argument(
+        "--no_streaming_train",
+        action="store_true",
+        default=False,
+        help="Disable streaming training loader and materialize full train dataset in memory.",
+    )
+    parser.add_argument(
+        "--streaming_shuffle_buffer_size",
+        type=int,
+        default=8192,
+        help="Shuffle buffer size (in sequences) for streaming training (default: 8192).",
+    )
+    parser.add_argument(
+        "--streaming_chunk_line_buffer",
+        type=int,
+        default=4096,
+        help="How many lines to tokenize per streaming chunk (default: 4096).",
+    )
     args = parser.parse_args()
 
     configure_output(args.print_log_file)
@@ -3505,6 +3737,9 @@ if __name__ == "__main__":
         test_text_file_path=test_text_file_path,
         tokenizer_type=args.tokenizer_type,
         model_prefix=args.model_name_prefix,
+        streaming_train=not args.no_streaming_train,
+        streaming_shuffle_buffer_size=args.streaming_shuffle_buffer_size,
+        streaming_chunk_line_buffer=args.streaming_chunk_line_buffer,
     )
 
     print(f"\\nModel Summary:")
