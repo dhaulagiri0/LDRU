@@ -2,6 +2,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import optax
+from optax.contrib import muon as optax_muon
 import numpy as np
 from typing import Callable, Tuple, Dict, List, Optional, Iterator
 import tqdm
@@ -1164,6 +1165,7 @@ def train_model(
     streaming_train: bool = True,
     streaming_shuffle_buffer_size: int = 8192,
     streaming_chunk_line_buffer: int = 4096,
+    optimizer_name: str = "adamw",
 ):
     """Main training function."""
 
@@ -1319,12 +1321,28 @@ def train_model(
         decay_steps=max(1, num_epochs * train_steps_per_epoch),
         alpha=min_learning_rate / config.initial_learning_rate,
     )
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.amsgrad(
-            learning_rate=learning_rate_schedule
-        ),  # Use AMSGrad for better convergence
-    )
+    optimizer_name = optimizer_name.lower()
+    if optimizer_name == "adamw":
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adamw(learning_rate=learning_rate_schedule),
+        )
+    elif optimizer_name == "amsgrad":
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.amsgrad(
+                learning_rate=learning_rate_schedule
+            ),  # Use AMSGrad for better convergence
+        )
+    elif optimizer_name == "muon":
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax_muon(learning_rate=learning_rate_schedule),
+        )
+    else:
+        raise ValueError(
+            f"Unsupported optimizer '{optimizer_name}'. Expected one of: adamw, amsgrad, muon."
+        )
     opt_state = optimizer.init(params)
 
     # Learning rate tracking variables
@@ -1420,6 +1438,7 @@ def train_model(
     # Count parameters
     param_count = sum(x.size for x in jax.tree.leaves(params))
     print(f"Model has {param_count:,} parameters")
+    print(f"Optimizer: {optimizer_name}")
     print(f"Initial learning rate: {current_learning_rate:.2e}")
 
     # Training loop
@@ -3360,6 +3379,13 @@ if __name__ == "__main__":
         help="Initial learning rate (default: 1e-3)",
     )
     parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw",
+        choices=["adamw", "amsgrad", "muon"],
+        help="Optimizer to use for training (default: adamw).",
+    )
+    parser.add_argument(
         "--blelloch_random",
         action="store_true",
         help="Use Blelloch random scan method for LDRU (default is deterministic)",
@@ -3740,6 +3766,7 @@ if __name__ == "__main__":
         streaming_train=not args.no_streaming_train,
         streaming_shuffle_buffer_size=args.streaming_shuffle_buffer_size,
         streaming_chunk_line_buffer=args.streaming_chunk_line_buffer,
+        optimizer_name=args.optimizer,
     )
 
     print(f"\\nModel Summary:")
