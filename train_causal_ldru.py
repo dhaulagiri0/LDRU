@@ -20,7 +20,8 @@ import shutil
 matplotlib.use("Agg")  # Non-interactive backend for saving plots
 import matplotlib.pyplot as plt
 
-from causal_ldru_v2 import CausalLDRUConfig, create_causal_ldru_model
+from causal_ldru_v2 import CausalLDRUConfig, create_causal_ldru_model, BinaryOperator
+from improved_binary_operator import ConvexGatedBinaryOperator, GRCOperator
 from tensorboardX import SummaryWriter
 
 # Import transformer from supplementary_code
@@ -45,6 +46,34 @@ from enum import Enum
 class TokenizerType(str, Enum):
     SENTENCEPIECE = "sentencepiece"
     TEXT = "text"
+
+
+BINARY_OPERATOR_REGISTRY = {
+    "default": None,
+    "binary": BinaryOperator,
+    "convex_gated": ConvexGatedBinaryOperator,
+    "grc": GRCOperator,
+}
+
+
+def resolve_binary_operator(operator_name: Optional[str]):
+    if operator_name is None:
+        return None
+    if operator_name not in BINARY_OPERATOR_REGISTRY:
+        raise ValueError(
+            f"Unknown binary operator '{operator_name}'. "
+            f"Available: {', '.join(BINARY_OPERATOR_REGISTRY.keys())}"
+        )
+    return BINARY_OPERATOR_REGISTRY[operator_name]
+
+
+def binary_operator_to_name(operator_cls) -> str:
+    if operator_cls is None:
+        return "default"
+    for name, cls in BINARY_OPERATOR_REGISTRY.items():
+        if cls is operator_cls:
+            return name
+    return getattr(operator_cls, "__name__", "custom")
 
 
 @chex.dataclass
@@ -1810,6 +1839,8 @@ def save_checkpoint(
             config_dict = config.__dict__.copy()
         else:
             config_dict = dict(config) if isinstance(config, dict) else {}
+        if "operator" in config_dict:
+            config_dict["operator"] = binary_operator_to_name(config_dict["operator"])
 
         metadata = {
             "step": step,
@@ -1864,7 +1895,10 @@ def load_checkpoint(checkpoint_dir: str, step: int, load_best_only: bool = True)
 
         # Reconstruct config from dict if available
         if "config" in metadata and isinstance(metadata["config"], dict):
-            config = LDRUExperimenstConfig(**metadata["config"])
+            config_dict = metadata["config"].copy()
+            if "operator" in config_dict:
+                config_dict["operator"] = resolve_binary_operator(config_dict["operator"])
+            config = LDRUExperimenstConfig(**config_dict)
 
     tokenizer_type = metadata.get("tokenizer_type")
     tokenizer_path = metadata.get("tokenizer_path")
@@ -3386,6 +3420,13 @@ if __name__ == "__main__":
         help="Optimizer to use for training (default: adamw).",
     )
     parser.add_argument(
+        "--binary_operator",
+        type=str,
+        default="default",
+        choices=list(BINARY_OPERATOR_REGISTRY.keys()),
+        help="Binary operator to use for LDRU composition (default: default).",
+    )
+    parser.add_argument(
         "--blelloch_random",
         action="store_true",
         help="Use Blelloch random scan method for LDRU (default is deterministic)",
@@ -3743,7 +3784,9 @@ if __name__ == "__main__":
         num_epochs=args.num_epochs,
         num_transformer_heads=args.num_transformer_heads,
         num_transformer_layers=args.num_transformer_layers,
+        operator=resolve_binary_operator(args.binary_operator),
     )
+    print(f"Selected binary operator: {binary_operator_to_name(config.operator)}")
 
     # Run training
     params, model, config, tokenizer, _ = train_model(
