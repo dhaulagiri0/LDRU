@@ -8,6 +8,7 @@ from train_causal_ldru import (
     LDRUExperimenstConfig,
     create_lstm_model,
     create_transformer_model,
+    resolve_binary_operator,
     train_model,
 )
 
@@ -51,6 +52,7 @@ def make_objective(
     seq_length=256,
     tokenizer_path=None,
     use_alibi=True,
+    use_grc=False,
 ):
     def objective(trial):
         # Define the hyperparameter search space
@@ -104,6 +106,11 @@ def make_objective(
             / 1000,  # Set a minimum learning rate for the scheduler
             use_positional_encoding=(True if use_transformer else False),
             use_alibi=(use_alibi if use_transformer else False),
+            operator=(
+                resolve_binary_operator("grc")
+                if use_grc
+                else resolve_binary_operator("default")
+            ),
         )
 
         # Call train_model and capture the best validation perplexity
@@ -204,6 +211,12 @@ if __name__ == "__main__":
         default=True,
         help="Whether to use ALiBi positional bias in the transformer model (only applicable if --model_type is transformer)",
     )
+    parser.add_argument(
+        "--use_grc",
+        action="store_true",
+        default=False,
+        help="Whether to use GRC operator in the LDRU model (only applicable if --model_type is causal_ldru)",
+    )
     args = parser.parse_args()
 
     num_trials = args.num_trials
@@ -244,6 +257,7 @@ if __name__ == "__main__":
             seq_length=seq_length,
             tokenizer_path=args.tokenizer_path,
             use_alibi=args.use_alibi,
+            use_grc=args.use_grc,
         ),
         n_trials=num_trials,
     )
