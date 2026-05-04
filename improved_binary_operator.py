@@ -63,10 +63,16 @@ class GRCOperator(hk.Module):
     def __init__(
         self,
         embedding_size: int,
+        mlp_hidden_size: int = None,
+        expansion_factor: int = 4,
         dropout_rate: float = 0.0,
     ):
         super().__init__(name="GRCOperator")
         self.embedding_size = embedding_size
+        self.mlp_hidden_size = (
+            embedding_size if mlp_hidden_size is None else int(mlp_hidden_size)
+        )
+        self.expansion_factor = int(expansion_factor)
         self.activation = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
         self.dropout_rate = dropout_rate
 
@@ -79,6 +85,14 @@ class GRCOperator(hk.Module):
         Tensor of shape (..., E).
         """
         hidden_size = self.embedding_size
+        operator_hidden_size = self.expansion_factor * self.mlp_hidden_size
+        print(
+            "[DEBUG][GRCOperator] "
+            f"xy.shape={xy.shape}, hidden_size={hidden_size}, "
+            f"mlp_hidden_size={self.mlp_hidden_size}, "
+            f"expansion_factor={self.expansion_factor}, "
+            f"operator_hidden_size={operator_hidden_size}"
+        )
         init = hk.initializers.VarianceScaling(1.0, "fan_avg", "truncated_normal")
 
         # vi, hi: (..., E)
@@ -88,9 +102,9 @@ class GRCOperator(hk.Module):
         # Flatten pair dim: (..., 2E) — equivalent to concat([vi, hi], -1)
         pair = jnp.reshape(xy, xy.shape[:-2] + (2 * hidden_size,))
 
-        # MLP: 2H -> 4H -> 4H (no dropout here; add hk.dropout if needed)
+        # MLP: 2E -> (expansion_factor * mlp_hidden_size) -> 4E
         h = hk.dropout(hk.next_rng_key(), self.dropout_rate, pair)
-        h = hk.Linear(4 * hidden_size, w_init=init)(h)
+        h = hk.Linear(operator_hidden_size, w_init=init)(h)
         h = jax.nn.silu(h)
         h = hk.dropout(hk.next_rng_key(), self.dropout_rate, h)
         h = hk.Linear(4 * hidden_size, w_init=init)(h)

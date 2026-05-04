@@ -52,6 +52,7 @@ class CausalLDRUConfig:
 
     # Binary operator
     operator: Optional[Callable] = None
+    binop_expansion_factor: int = 4
 
     # Scan method: 'default' (assoc_scan), or 'simple'
     scan_method: str = "default"
@@ -178,6 +179,7 @@ class CausalLDRULayer(hk.Module):
     def __init__(self, config: CausalLDRUConfig, use_mlp: bool = False):
         super().__init__(name="CausalLDRULayer")
         self.config = config
+        self.state_dim = config.hidden_dim
         self.inner_norm = hk.LayerNorm(
             axis=-1, create_scale=True, create_offset=True, name="inner_norm"
         )
@@ -185,19 +187,33 @@ class CausalLDRULayer(hk.Module):
             axis=-1, create_scale=True, create_offset=True, name="init_norm"
         )
 
-        # Use stable binary operator
+        # Binary operator works in hidden/state space.
         operator_cls = config.operator or BinaryOperator
-        self.binary_operator = operator_cls(config.embedding_dim)
+        try:
+            self.binary_operator = operator_cls(
+                self.state_dim,
+                mlp_hidden_size=config.hidden_dim,
+                expansion_factor=config.binop_expansion_factor,
+                dropout_rate=config.dropout_prob,
+            )
+        except TypeError:
+            self.binary_operator = operator_cls(self.state_dim)
+
+        # Project from embedding space into hidden/state space for scan/operator.
+        self.input_proj = hk.Linear(self.state_dim, name="input_proj")
 
         # Smaller initialization for stability
         init = hk.initializers.VarianceScaling(
             0.02, "fan_avg", "truncated_normal"  # Reduced for stability
         )
         self.fc_0 = hk.Linear(
-            config.embedding_dim * 2, w_init=init  # Reduced widening factor
+            self.state_dim * 2, w_init=init  # Reduced widening factor
         )
-        self.fc_1 = hk.Linear(config.embedding_dim, w_init=init)
+        self.fc_1 = hk.Linear(self.state_dim, w_init=init)
         self.fc = hk.Sequential([self.fc_0, jnn.silu, self.fc_1])
+
+        # Project processed hidden/state back to embedding space.
+        self.output_proj = hk.Linear(config.embedding_dim, name="output_proj")
         self.mlp = self._resnet_feedforward if use_mlp else None
 
     def _make_pure_binary_op(self, dummy_input):
@@ -617,15 +633,15 @@ class CausalLDRULayer(hk.Module):
         # Create causal mask
         causal_mask = self._create_causal_mask(seq_len)
 
-        # Ensure embedding dimension is divisible by number of heads
+        hidden_size = h.shape[-1]
+
+        # Ensure hidden/state dimension is divisible by number of heads
         num_heads = 8
-        head_dim = self.config.embedding_dim // num_heads
-        if self.config.embedding_dim % num_heads != 0:
-            # Adjust number of heads if embedding dim is not divisible
-            num_heads = max(
-                1, self.config.embedding_dim // 64
-            )  # At least 64 dim per head
-            head_dim = self.config.embedding_dim // num_heads
+        head_dim = hidden_size // num_heads
+        if hidden_size % num_heads != 0:
+            # Adjust number of heads if hidden/state dim is not divisible
+            num_heads = max(1, hidden_size // 64)  # At least 64 dim per head
+            head_dim = max(1, hidden_size // num_heads)
 
         # Create attention layer
         attention_layer = MultiHeadDotProductAttention(
@@ -659,9 +675,9 @@ class CausalLDRULayer(hk.Module):
             Output tensor of same shape with feedforward applied
         """
         res = h
-        h = hk.Linear(self.config.embedding_dim)(h)
+        h = hk.Linear(self.state_dim)(h)
         h = jnn.silu(h)
-        h = hk.Linear(self.config.embedding_dim)(h)
+        h = hk.Linear(self.state_dim)(h)
         h = h + res
         h = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(h)
         h = hk.dropout(hk.next_rng_key(), self.config.dropout_prob, h)
@@ -744,7 +760,7 @@ class CausalLDRULayer(hk.Module):
             return x
 
         # Initial processing (like ResNet stem)
-        h = hk.Linear(self.config.embedding_dim, name="stem_conv")(h)
+        h = hk.Linear(self.state_dim, name="stem_conv")(h)
         h = hk.LayerNorm(
             axis=-1, create_scale=True, create_offset=True, name="stem_norm"
         )(h)
@@ -753,19 +769,19 @@ class CausalLDRULayer(hk.Module):
         # Layer 1: 2 basic blocks (like ResNet conv2_x)
         h = residual_block(
             h,
-            self.config.embedding_dim,
+            self.state_dim,
             use_bottleneck=False,
             block_name="layer1_block1",
         )
         h = residual_block(
             h,
-            self.config.embedding_dim,
+            self.state_dim,
             use_bottleneck=False,
             block_name="layer1_block2",
         )
 
         # Layer 2: 2 bottleneck blocks with dimension expansion (like ResNet conv3_x)
-        expanded_dim = self.config.embedding_dim * 2
+        expanded_dim = self.state_dim * 2
         h = residual_block(
             h, expanded_dim, use_bottleneck=True, block_name="layer2_block1"
         )
@@ -781,8 +797,8 @@ class CausalLDRULayer(hk.Module):
             h, expanded_dim, use_bottleneck=True, block_name="layer3_block2"
         )
 
-        # Final projection back to original dimension
-        h = hk.Linear(self.config.embedding_dim, name="final_proj")(h)
+        # Final projection back to hidden/state dimension
+        h = hk.Linear(self.state_dim, name="final_proj")(h)
         h = hk.LayerNorm(
             axis=-1, create_scale=True, create_offset=True, name="final_norm"
         )(h)
@@ -803,10 +819,13 @@ class CausalLDRULayer(hk.Module):
         Returns:
             Output tensor of shape [B, L, E] with causal processing applied
         """
-        B, L, E = h.shape
+        B, L, _ = h.shape
 
         # Apply layer norm first for stability
         h = self.init_norm(h)
+        h = self.input_proj(h)  # [B, L, state_dim]
+        B, L, S = h.shape
+        print(f"[DEBUG][CausalLDRULayer] after input_proj: h.shape={h.shape}")
 
         if self.mlp is not None:
             # Apply feedforward network (can switch between simple and ResNet-inspired)
@@ -814,6 +833,7 @@ class CausalLDRULayer(hk.Module):
             h = self.mlp(h)
             # Add global residual connection (like in ResNet)
             h = h + original_h  # Scale down the residual for stability
+            print(f"[DEBUG][CausalLDRULayer] after mlp+residual: h.shape={h.shape}")
 
         # Apply simplified causal processing
         if L > 1:
@@ -824,11 +844,15 @@ class CausalLDRULayer(hk.Module):
                 h, original_mask = self.expand_to_power_of_2_with_random_zeros(
                     h, expansion_rng
                 )
-                B, L, E = h.shape  # Update L to new expanded length
+                B, L, S = h.shape  # Update dims to expanded hidden-state shape
 
             # Initialize binary operator by calling it once outside the scan
             # This materializes all parameters before entering JAX control flow
-            dummy_input = jnp.zeros((B, 2, 2, E))  # [B, 2, 2, E] - smaller dummy
+            dummy_input = jnp.zeros((B, 2, 2, S))  # [B, 2, 2, state_dim]
+            print(
+                "[DEBUG][CausalLDRULayer] binary operator init input shape: "
+                f"{dummy_input.shape}"
+            )
             _ = self.binary_operator(dummy_input)
 
             # Choose scan method based on configuration
@@ -853,12 +877,15 @@ class CausalLDRULayer(hk.Module):
             # Apply the associative scan
             h = self.assoc_scan_custom(h, self.binary_operator)
             # h = self.assoc_scan(h, self.binary_operator)
+            print(f"[DEBUG][CausalLDRULayer] after associative scan: h.shape={h.shape}")
 
         # Restore original sequence length if expansion was used
         if self.config.expand_to_power_of_2 and original_mask is not None:
             h = self.restore_original_length(h, original_mask, original_length)
 
-        return h  # Return original and processed
+        out = self.output_proj(h)
+        print(f"[DEBUG][CausalLDRULayer] after output_proj: out.shape={out.shape}")
+        return out  # Return processed sequence in embedding space
 
 
 class CausalLDRUEncoder(hk.Module):
