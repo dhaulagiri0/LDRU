@@ -97,6 +97,7 @@ class LDRUExperimenstConfig:
 
     # Binary operator
     operator: Optional[Callable] = None
+    binop_expansion_factor: int = 4
 
     # Scan method: 'default' (assoc_scan), or 'simple'
     scan_method: str = "default"
@@ -958,6 +959,7 @@ def create_ldru_transformer_model(config: LDRUExperimenstConfig):
             max_sequence_length=config.max_sequence_length,
             use_positional_encoding=False,  # Transformer already added positional encodings
             operator=config.operator,
+            binop_expansion_factor=config.binop_expansion_factor,
             scan_method=config.scan_method,
             expand_to_power_of_2=config.expand_to_power_of_2,
             attention_per_scan_step=config.attention_per_scan_step,
@@ -1050,6 +1052,7 @@ def create_transformer_ldru_model(config: LDRUExperimenstConfig):
             max_sequence_length=config.max_sequence_length,
             use_positional_encoding=False,  # Transformer already added positional encodings
             operator=config.operator,
+            binop_expansion_factor=config.binop_expansion_factor,
             scan_method=config.scan_method,
             expand_to_power_of_2=config.expand_to_power_of_2,
             attention_per_scan_step=config.attention_per_scan_step,
@@ -1334,7 +1337,9 @@ def train_model(
     print("Initializing model...")
     if model_creation_fn == create_transformer_model:
         # Transformer expects token IDs directly
-        dummy_batch = jnp.asarray(preview_batch[:1])  # [B, L-1] for next token prediction
+        dummy_batch = jnp.asarray(
+            preview_batch[:1]
+        )  # [B, L-1] for next token prediction
     elif use_lstm:
         dummy_batch = jnp.asarray(
             preview_batch[:1, :-1]
@@ -1897,7 +1902,9 @@ def load_checkpoint(checkpoint_dir: str, step: int, load_best_only: bool = True)
         if "config" in metadata and isinstance(metadata["config"], dict):
             config_dict = metadata["config"].copy()
             if "operator" in config_dict:
-                config_dict["operator"] = resolve_binary_operator(config_dict["operator"])
+                config_dict["operator"] = resolve_binary_operator(
+                    config_dict["operator"]
+                )
             config = LDRUExperimenstConfig(**config_dict)
 
     tokenizer_type = metadata.get("tokenizer_type")
@@ -3427,6 +3434,12 @@ if __name__ == "__main__":
         help="Binary operator to use for LDRU composition (default: default).",
     )
     parser.add_argument(
+        "--binop_expansion_factor",
+        type=int,
+        default=4,
+        help="Hidden expansion factor for compatible binary operators like GRC (default: 4).",
+    )
+    parser.add_argument(
         "--blelloch_random",
         action="store_true",
         help="Use Blelloch random scan method for LDRU (default is deterministic)",
@@ -3754,6 +3767,9 @@ if __name__ == "__main__":
         model_type_name = "LDRU+Transformer"
     seq2seq = not args.last_pos  # Use full sequence unless --last_pos is specified
 
+    if args.binop_expansion_factor <= 0:
+        raise ValueError("--binop_expansion_factor must be > 0.")
+
     checkpoint_dir = args.checkpoint_dir
     resume_from_checkpoint = args.resume
 
@@ -3785,8 +3801,10 @@ if __name__ == "__main__":
         num_transformer_heads=args.num_transformer_heads,
         num_transformer_layers=args.num_transformer_layers,
         operator=resolve_binary_operator(args.binary_operator),
+        binop_expansion_factor=args.binop_expansion_factor,
     )
     print(f"Selected binary operator: {binary_operator_to_name(config.operator)}")
+    print(f"Binary operator expansion factor: {config.binop_expansion_factor}")
 
     # Run training
     params, model, config, tokenizer, _ = train_model(
