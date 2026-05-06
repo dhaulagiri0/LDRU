@@ -825,7 +825,6 @@ class CausalLDRULayer(hk.Module):
         h = self.init_norm(h)
         h = self.input_proj(h)  # [B, L, state_dim]
         B, L, S = h.shape
-        print(f"[DEBUG][CausalLDRULayer] after input_proj: h.shape={h.shape}")
 
         if self.mlp is not None:
             # Apply feedforward network (can switch between simple and ResNet-inspired)
@@ -833,7 +832,6 @@ class CausalLDRULayer(hk.Module):
             h = self.mlp(h)
             # Add global residual connection (like in ResNet)
             h = h + original_h  # Scale down the residual for stability
-            print(f"[DEBUG][CausalLDRULayer] after mlp+residual: h.shape={h.shape}")
 
         # Apply simplified causal processing
         if L > 1:
@@ -849,10 +847,6 @@ class CausalLDRULayer(hk.Module):
             # Initialize binary operator by calling it once outside the scan
             # This materializes all parameters before entering JAX control flow
             dummy_input = jnp.zeros((B, 2, 2, S))  # [B, 2, 2, state_dim]
-            print(
-                "[DEBUG][CausalLDRULayer] binary operator init input shape: "
-                f"{dummy_input.shape}"
-            )
             _ = self.binary_operator(dummy_input)
 
             # Choose scan method based on configuration
@@ -877,14 +871,12 @@ class CausalLDRULayer(hk.Module):
             # Apply the associative scan
             h = self.assoc_scan_custom(h, self.binary_operator)
             # h = self.assoc_scan(h, self.binary_operator)
-            print(f"[DEBUG][CausalLDRULayer] after associative scan: h.shape={h.shape}")
 
         # Restore original sequence length if expansion was used
         if self.config.expand_to_power_of_2 and original_mask is not None:
             h = self.restore_original_length(h, original_mask, original_length)
 
         out = self.output_proj(h)
-        print(f"[DEBUG][CausalLDRULayer] after output_proj: out.shape={out.shape}")
         return out  # Return processed sequence in embedding space
 
 

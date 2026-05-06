@@ -86,13 +86,6 @@ class GRCOperator(hk.Module):
         """
         hidden_size = self.embedding_size
         operator_hidden_size = self.expansion_factor * self.mlp_hidden_size
-        print(
-            "[DEBUG][GRCOperator] "
-            f"xy.shape={xy.shape}, hidden_size={hidden_size}, "
-            f"mlp_hidden_size={self.mlp_hidden_size}, "
-            f"expansion_factor={self.expansion_factor}, "
-            f"operator_hidden_size={operator_hidden_size}"
-        )
         init = hk.initializers.VarianceScaling(1.0, "fan_avg", "truncated_normal")
 
         # vi, hi: (..., E)

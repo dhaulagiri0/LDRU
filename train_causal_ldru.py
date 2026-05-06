@@ -9,6 +9,7 @@ import tqdm
 import re
 import os
 import json
+import math
 from collections import Counter
 import matplotlib
 import os
@@ -1198,6 +1199,7 @@ def train_model(
     streaming_shuffle_buffer_size: int = 8192,
     streaming_chunk_line_buffer: int = 4096,
     optimizer_name: str = "adamw",
+    target_tokens: Optional[int] = None,
 ):
     """Main training function."""
 
@@ -1350,9 +1352,26 @@ def train_model(
 
     # Initialize optimizer with learning rate scheduling
     train_steps_per_epoch = max(1, train_sequence_count // batch_size)
+    tokens_per_step = int(batch_size * seq_length)
+    target_steps = None
+    if target_tokens is not None:
+        if target_tokens <= 0:
+            raise ValueError("--target_tokens must be > 0 when provided.")
+        target_steps = max(1, math.ceil(target_tokens / max(1, tokens_per_step)))
+        print(
+            "Token-budget mode enabled: "
+            f"target_tokens={target_tokens:,}, "
+            f"tokens_per_step={tokens_per_step:,}, "
+            f"target_steps={target_steps:,}"
+        )
+    decay_steps = (
+        max(1, target_steps)
+        if target_steps is not None
+        else max(1, num_epochs * train_steps_per_epoch)
+    )
     learning_rate_schedule = optax.schedules.cosine_decay_schedule(
         init_value=config.initial_learning_rate,
-        decay_steps=max(1, num_epochs * train_steps_per_epoch),
+        decay_steps=decay_steps,
         alpha=min_learning_rate / config.initial_learning_rate,
     )
     optimizer_name = optimizer_name.lower()
@@ -1476,10 +1495,30 @@ def train_model(
     print(f"Initial learning rate: {current_learning_rate:.2e}")
 
     # Training loop
-    print("Starting training...")
+    estimated_total_epochs = (
+        max(1, math.ceil(target_steps / train_steps_per_epoch))
+        if target_steps is not None
+        else num_epochs
+    )
+    if target_steps is not None:
+        estimated_remaining_epochs = max(0, estimated_total_epochs - start_epoch)
+        print(
+            "Estimated epochs to reach token budget: "
+            f"total={estimated_total_epochs}, "
+            f"remaining_from_current={estimated_remaining_epochs}"
+        )
+    epoch_print_total = estimated_total_epochs if target_steps is not None else num_epochs
+    epoch_loop_limit = max(num_epochs, estimated_total_epochs)
 
-    for epoch in range(start_epoch, num_epochs):
-        print(f"\nEpoch {epoch + 1}/{num_epochs}")
+    print("Starting training...")
+    global_step = max(0, start_epoch * train_steps_per_epoch)
+    stop_for_token_budget = False
+
+    for epoch in range(start_epoch, epoch_loop_limit):
+        if target_steps is not None and global_step >= target_steps:
+            stop_for_token_budget = True
+            break
+        print(f"\nEpoch {epoch + 1}/{epoch_print_total}")
 
         # Create data loader for this epoch
         rng_key, epoch_key = jax.random.split(rng_key)
@@ -1512,6 +1551,7 @@ def train_model(
             params, opt_state, loss, metrics = compiled_train_step(
                 params, opt_state, step_key, batch
             )
+            global_step += 1
 
             epoch_losses.append(float(loss))
             epoch_accuracies.append(float(metrics["accuracy"]))
@@ -1526,6 +1566,9 @@ def train_model(
                     "LR": f"{current_learning_rate:.2e}",
                 }
             )
+            if target_steps is not None and global_step >= target_steps:
+                stop_for_token_budget = True
+                break
 
         # Print epoch statistics
         avg_loss = np.mean(epoch_losses)
@@ -1606,7 +1649,7 @@ def train_model(
             print("No validation data provided, skipping validation and checkpointing.")
 
         # check if epoch has no improvement for a certain number of epochs and reduce learning rate if needed
-        if epochs_without_improvement >= 10:
+        if target_steps is None and epochs_without_improvement >= 10:
             # terminate
             print(
                 f"Early stopping triggered after {epochs_without_improvement} epochs without improvement."
@@ -1653,7 +1696,22 @@ def train_model(
                 print(f"Generation failed: {e}")
                 print()
 
+        if stop_for_token_budget:
+            print(
+                f"Reached target step budget ({global_step:,}/{target_steps:,} steps); "
+                "stopping training."
+            )
+            break
+
     print("\nTraining completed")
+    if target_steps is not None:
+        actual_tokens_seen = int(global_step * tokens_per_step)
+        print(
+            "Token-budget summary: "
+            f"steps={global_step:,}, "
+            f"tokens_seen={actual_tokens_seen:,}, "
+            f"target_tokens={target_tokens:,}"
+        )
 
     # Save final checkpoint
     if save_checkpoints:
@@ -3574,6 +3632,15 @@ if __name__ == "__main__":
         help="Number of training epochs (default: 100)",
     )
     parser.add_argument(
+        "--target_tokens",
+        type=int,
+        default=None,
+        help=(
+            "Optional token budget. If set, training stops after approximately this many "
+            "tokens (converted via batch_size * seq_length)."
+        ),
+    )
+    parser.add_argument(
         "--embedding_dim",
         type=int,
         default=300,
@@ -3828,6 +3895,7 @@ if __name__ == "__main__":
         streaming_shuffle_buffer_size=args.streaming_shuffle_buffer_size,
         streaming_chunk_line_buffer=args.streaming_chunk_line_buffer,
         optimizer_name=args.optimizer,
+        target_tokens=args.target_tokens,
     )
 
     print(f"\\nModel Summary:")
