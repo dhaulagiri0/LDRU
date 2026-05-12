@@ -53,6 +53,8 @@ class CausalLDRUConfig:
     # Binary operator
     operator: Optional[Callable] = None
     binop_expansion_factor: int = 4
+    ablation_expansion_mode: str = "grc"
+    ablation_combine_mode: str = "grc"
 
     # Scan method: 'default' (assoc_scan), or 'simple'
     scan_method: str = "default"
@@ -189,15 +191,25 @@ class CausalLDRULayer(hk.Module):
 
         # Binary operator works in hidden/state space.
         operator_cls = config.operator or BinaryOperator
-        try:
+        if getattr(operator_cls, "__name__", "") == "AblationBinaryOperator":
             self.binary_operator = operator_cls(
                 self.state_dim,
                 mlp_hidden_size=config.hidden_dim,
                 expansion_factor=config.binop_expansion_factor,
                 dropout_rate=config.dropout_prob,
+                ablation_expansion_mode=config.ablation_expansion_mode,
+                ablation_combine_mode=config.ablation_combine_mode,
             )
-        except TypeError:
-            self.binary_operator = operator_cls(self.state_dim)
+        else:
+            try:
+                self.binary_operator = operator_cls(
+                    self.state_dim,
+                    mlp_hidden_size=config.hidden_dim,
+                    expansion_factor=config.binop_expansion_factor,
+                    dropout_rate=config.dropout_prob,
+                )
+            except TypeError:
+                self.binary_operator = operator_cls(self.state_dim)
 
         # Project from embedding space into hidden/state space for scan/operator.
         self.input_proj = hk.Linear(self.state_dim, name="input_proj")

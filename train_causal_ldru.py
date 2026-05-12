@@ -22,7 +22,11 @@ matplotlib.use("Agg")  # Non-interactive backend for saving plots
 import matplotlib.pyplot as plt
 
 from causal_ldru_v2 import CausalLDRUConfig, create_causal_ldru_model, BinaryOperator
-from improved_binary_operator import ConvexGatedBinaryOperator, GRCOperator
+from improved_binary_operator import (
+    ConvexGatedBinaryOperator,
+    GRCOperator,
+    AblationBinaryOperator,
+)
 from tensorboardX import SummaryWriter
 
 # Import transformer from supplementary_code
@@ -54,6 +58,7 @@ BINARY_OPERATOR_REGISTRY = {
     "binary": BinaryOperator,
     "convex_gated": ConvexGatedBinaryOperator,
     "grc": GRCOperator,
+    "ablation": AblationBinaryOperator,
 }
 
 
@@ -99,6 +104,8 @@ class LDRUExperimenstConfig:
     # Binary operator
     operator: Optional[Callable] = None
     binop_expansion_factor: int = 4
+    ablation_expansion_mode: str = "grc"
+    ablation_combine_mode: str = "grc"
 
     # Scan method: 'default' (assoc_scan), or 'simple'
     scan_method: str = "default"
@@ -961,6 +968,8 @@ def create_ldru_transformer_model(config: LDRUExperimenstConfig):
             use_positional_encoding=False,  # Transformer already added positional encodings
             operator=config.operator,
             binop_expansion_factor=config.binop_expansion_factor,
+            ablation_expansion_mode=config.ablation_expansion_mode,
+            ablation_combine_mode=config.ablation_combine_mode,
             scan_method=config.scan_method,
             expand_to_power_of_2=config.expand_to_power_of_2,
             attention_per_scan_step=config.attention_per_scan_step,
@@ -1054,6 +1063,8 @@ def create_transformer_ldru_model(config: LDRUExperimenstConfig):
             use_positional_encoding=False,  # Transformer already added positional encodings
             operator=config.operator,
             binop_expansion_factor=config.binop_expansion_factor,
+            ablation_expansion_mode=config.ablation_expansion_mode,
+            ablation_combine_mode=config.ablation_combine_mode,
             scan_method=config.scan_method,
             expand_to_power_of_2=config.expand_to_power_of_2,
             attention_per_scan_step=config.attention_per_scan_step,
@@ -3498,6 +3509,20 @@ if __name__ == "__main__":
         help="Hidden expansion factor for compatible binary operators like GRC (default: 4).",
     )
     parser.add_argument(
+        "--ablation_expansion_mode",
+        type=str,
+        default="grc",
+        choices=["binary", "grc"],
+        help="Expansion stage mode for --binary_operator ablation.",
+    )
+    parser.add_argument(
+        "--ablation_combine_mode",
+        type=str,
+        default="grc",
+        choices=["binary", "grc"],
+        help="Combine stage mode for --binary_operator ablation.",
+    )
+    parser.add_argument(
         "--blelloch_random",
         action="store_true",
         help="Use Blelloch random scan method for LDRU (default is deterministic)",
@@ -3869,9 +3894,14 @@ if __name__ == "__main__":
         num_transformer_layers=args.num_transformer_layers,
         operator=resolve_binary_operator(args.binary_operator),
         binop_expansion_factor=args.binop_expansion_factor,
+        ablation_expansion_mode=args.ablation_expansion_mode,
+        ablation_combine_mode=args.ablation_combine_mode,
     )
     print(f"Selected binary operator: {binary_operator_to_name(config.operator)}")
     print(f"Binary operator expansion factor: {config.binop_expansion_factor}")
+    if args.binary_operator == "ablation":
+        print(f"Ablation expansion mode: {config.ablation_expansion_mode}")
+        print(f"Ablation combine mode: {config.ablation_combine_mode}")
 
     # Run training
     params, model, config, tokenizer, _ = train_model(
