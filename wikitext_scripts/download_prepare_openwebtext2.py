@@ -10,6 +10,7 @@ This script supports two stages:
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tarfile
@@ -225,19 +226,22 @@ def iter_jsonl_zst_docs(path: Path) -> Iterable[dict]:
         ) from exc
 
     dctx = zstd.ZstdDecompressor()
-    with open(path, "rb") as fh:
-        with dctx.stream_reader(fh) as reader:
-            import io
+    try:
+        with open(path, "rb") as fh:
+            with dctx.stream_reader(fh) as reader:
+                import io
 
-            text_stream = io.TextIOWrapper(reader, encoding="utf-8")
-            for line in text_stream:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                text_stream = io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
+                for line in text_stream:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+    except Exception as exc:
+        print(f"[warn] failed reading shard {path}: {exc}. Skipping.")
 
 
 def extract_text(record: dict) -> Optional[str]:
@@ -291,13 +295,80 @@ def iter_hf_docs(
         return msgs
 
     def _looks_like_compressed_jsonl_error(exc: BaseException) -> bool:
-        msg = "\n".join(_iter_chain_messages(exc)).lower()
-        return (
-            ".jsonl.zst" in msg
-            and ("json parse error" in msg or "unicodedecodeerror" in msg)
+        chain_msgs = _iter_chain_messages(exc)
+        msg = "\n".join(chain_msgs).lower()
+        chain_types = {m.split(":", 1)[0].lower() for m in chain_msgs}
+        has_json_decode_signal = (
+            "json parse error" in msg
+            or "arrowinvalid" in msg
+            or "unicodedecodeerror" in msg
+        )
+        # In some datasets versions, the filename context is only logged (not in exception text),
+        # so also treat DatasetGenerationError + decode/parse signals as this failure mode.
+        has_dataset_generation_wrapper = "datasetgenerationerror" in chain_types
+        return (".jsonl.zst" in msg and has_json_decode_signal) or (
+            has_dataset_generation_wrapper and has_json_decode_signal
         )
 
-    def _iter_hf_snapshot_jsonl_zst() -> Iterable[dict]:
+    def _extract_cache_shard_paths_from_exception(exc: BaseException) -> list[Path]:
+        paths: set[Path] = set()
+        chain_msg = "\n".join(_iter_chain_messages(exc))
+        for match in re.findall(r"(/[^'\"\s]+\.jsonl\.zst)", chain_msg):
+            p = Path(match)
+            if p.exists():
+                paths.add(p)
+                parent = p.parent
+                if parent.exists():
+                    for shard_path in parent.glob("*.jsonl.zst"):
+                        if shard_path.exists():
+                            paths.add(shard_path)
+        return sorted(paths)
+
+    def _find_dataset_cache_shards() -> list[Path]:
+        cache_roots: list[Path] = []
+        env_datasets_cache = os.environ.get("HF_DATASETS_CACHE")
+        if env_datasets_cache:
+            cache_roots.append(Path(env_datasets_cache).expanduser())
+        else:
+            hf_home = os.environ.get("HF_HOME")
+            if hf_home:
+                cache_roots.append(Path(hf_home).expanduser() / "datasets")
+            cache_roots.append(Path("~/.cache/huggingface/datasets").expanduser())
+
+        paths: set[Path] = set()
+        for root in cache_roots:
+            extracted_root = root / "downloads" / "extracted"
+            if not extracted_root.exists():
+                continue
+            for child in extracted_root.iterdir():
+                if not child.is_dir():
+                    continue
+                for shard_path in child.glob("*.jsonl.zst"):
+                    if shard_path.exists():
+                        paths.add(shard_path)
+
+        return sorted(paths)
+
+    def _iter_hf_snapshot_jsonl_zst(hint_exc: Optional[BaseException] = None) -> Iterable[dict]:
+        if hint_exc is not None:
+            cache_shards = _extract_cache_shard_paths_from_exception(hint_exc)
+            if cache_shards:
+                print(f"HF fallback using {len(cache_shards)} cached *.jsonl.zst shards.")
+                for shard_idx, shard_path in enumerate(cache_shards, start=1):
+                    print(
+                        f"[hf-fallback-cache {shard_idx}/{len(cache_shards)}] {shard_path.name}"
+                    )
+                    yield from iter_jsonl_zst_docs(shard_path)
+                return
+
+        cache_shards = _find_dataset_cache_shards()
+        if cache_shards:
+            print(f"HF fallback found {len(cache_shards)} *.jsonl.zst shards in datasets cache.")
+            for shard_idx, shard_path in enumerate(cache_shards, start=1):
+                print(f"[hf-fallback-cache-scan {shard_idx}/{len(cache_shards)}] {shard_path.name}")
+                yield from iter_jsonl_zst_docs(shard_path)
+            return
+
         try:
             from huggingface_hub import snapshot_download
         except ImportError as exc:
@@ -364,7 +435,7 @@ def iter_hf_docs(
                     "HF builder cannot parse compressed *.jsonl.zst shards for this dataset; "
                     "falling back to manual shard iteration."
                 )
-                yield from _iter_hf_snapshot_jsonl_zst()
+                yield from _iter_hf_snapshot_jsonl_zst(hint_exc=exc)
                 return
             raise
 
