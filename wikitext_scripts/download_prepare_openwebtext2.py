@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import subprocess
+import tarfile
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -25,6 +26,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to text file with shard URLs (one per line).",
+    )
+    parser.add_argument(
+        "--tar_url",
+        type=str,
+        default="https://mystic.the-eye.eu/public/AI/pile_preliminary_components/openwebtext2.jsonl.zst.tar",
+        help="Single tarball URL containing OpenWebText2 shard files.",
+    )
+    parser.add_argument(
+        "--tar_filename",
+        type=str,
+        default="openwebtext2.jsonl.zst.tar",
+        help="Local filename for downloaded tarball.",
     )
     parser.add_argument(
         "--download_dir",
@@ -84,6 +97,11 @@ def parse_args() -> argparse.Namespace:
         help="Skip downloading and only run preparation on local shards.",
     )
     parser.add_argument(
+        "--skip_extract",
+        action="store_true",
+        help="Skip tar extraction step (only relevant with --tar_url).",
+    )
+    parser.add_argument(
         "--progress_every",
         type=int,
         default=100_000,
@@ -130,6 +148,36 @@ def download_shards(urls: list[str], download_dir: Path):
             url,
         ]
         subprocess.run(cmd, check=True)
+
+
+def download_file(url: str, out_path: Path):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists() and out_path.stat().st_size > 0:
+        print(f"[download] exists, skipping: {out_path}")
+        return
+    print(f"[download] {url}")
+    cmd = [
+        "curl",
+        "-L",
+        "--fail",
+        "--retry",
+        "5",
+        "--retry-delay",
+        "5",
+        "-o",
+        str(out_path),
+        url,
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def extract_tarball(tar_path: Path, dest_dir: Path):
+    if not tar_path.exists():
+        raise FileNotFoundError(f"Tarball not found: {tar_path}")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[extract] {tar_path} -> {dest_dir}")
+    with tarfile.open(tar_path, "r:*") as tf:
+        tf.extractall(path=dest_dir)
 
 
 def iter_jsonl_zst_docs(path: Path) -> Iterable[dict]:
@@ -269,13 +317,22 @@ def prepare_dataset(args: argparse.Namespace):
 
 def main():
     args = parse_args()
+    download_dir = Path(args.download_dir)
 
     if not args.skip_download:
-        if not args.urls_file:
-            raise ValueError("--urls_file is required unless --skip_download is set.")
-        urls = read_urls(Path(args.urls_file))
-        print(f"Downloading {len(urls)} shards...")
-        download_shards(urls, Path(args.download_dir))
+        if args.urls_file:
+            urls = read_urls(Path(args.urls_file))
+            print(f"Downloading {len(urls)} shards from --urls_file...")
+            download_shards(urls, download_dir)
+        elif args.tar_url:
+            tar_path = download_dir / args.tar_filename
+            download_file(args.tar_url, tar_path)
+            if not args.skip_extract:
+                extract_tarball(tar_path, download_dir)
+        else:
+            raise ValueError(
+                "Provide either --urls_file or --tar_url unless --skip_download is set."
+            )
     else:
         print("Skipping download step (--skip_download set).")
 
