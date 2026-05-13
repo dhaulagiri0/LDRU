@@ -22,6 +22,11 @@ matplotlib.use("Agg")  # Non-interactive backend for saving plots
 import matplotlib.pyplot as plt
 
 from causal_ldru_v2 import CausalLDRUConfig, create_causal_ldru_model, BinaryOperator
+from causal_ldru_v2 import (
+    CausalLDRULayer,
+    CausalLDRUEncoder,
+    CausalLDRULanguageModel,
+)
 from improved_binary_operator import (
     ConvexGatedBinaryOperator,
     GRCOperator,
@@ -51,6 +56,12 @@ from enum import Enum
 class TokenizerType(str, Enum):
     SENTENCEPIECE = "sentencepiece"
     TEXT = "text"
+    TIKTOKEN_GPT2 = "tiktoken_gpt2"
+
+
+class ComputeDType(str, Enum):
+    FLOAT32 = "float32"
+    BFLOAT16 = "bfloat16"
 
 
 BINARY_OPERATOR_REGISTRY = {
@@ -60,6 +71,68 @@ BINARY_OPERATOR_REGISTRY = {
     "grc": GRCOperator,
     "ablation": AblationBinaryOperator,
 }
+
+
+def _resolve_compute_dtype(compute_dtype: str) -> jnp.dtype:
+    if isinstance(compute_dtype, ComputeDType):
+        compute_dtype = compute_dtype.value
+    if compute_dtype == ComputeDType.FLOAT32.value:
+        return jnp.float32
+    if compute_dtype == ComputeDType.BFLOAT16.value:
+        return jnp.bfloat16
+    raise ValueError(
+        f"Unsupported compute dtype '{compute_dtype}'. "
+        f"Expected one of: {[d.value for d in ComputeDType]}"
+    )
+
+
+def configure_mixed_precision(compute_dtype: str) -> None:
+    """
+    Configure Haiku module policies.
+
+    Params stay fp32 for optimizer stability. Compute can be fp32/bfloat16.
+    Output remains fp32 for numerically stable loss computation.
+    """
+    import haiku as hk
+
+    resolved_dtype = _resolve_compute_dtype(compute_dtype)
+    policy_ctor = getattr(hk.mixed_precision, "Policy", None)
+    if policy_ctor is not None:
+        policy = policy_ctor(
+            param_dtype=jnp.float32,
+            compute_dtype=resolved_dtype,
+            output_dtype=jnp.float32,
+        )
+    else:
+        # Compatibility path for older Haiku versions.
+        import jmp
+
+        policy = jmp.Policy(
+            param_dtype=jnp.float32,
+            compute_dtype=resolved_dtype,
+            output_dtype=jnp.float32,
+        )
+
+    module_classes = [
+        hk.Linear,
+        hk.Embed,
+        hk.LayerNorm,
+        hk.LSTM,
+        BinaryOperator,
+        ConvexGatedBinaryOperator,
+        GRCOperator,
+        AblationBinaryOperator,
+        CausalLDRULayer,
+        CausalLDRUEncoder,
+        CausalLDRULanguageModel,
+        TransformerEncoder,
+    ]
+    if not hasattr(hk.mixed_precision, "set_policy"):
+        raise AttributeError(
+            "This Haiku version does not expose mixed_precision.set_policy."
+        )
+    for module_cls in module_classes:
+        hk.mixed_precision.set_policy(module_cls, policy)
 
 
 def resolve_binary_operator(operator_name: Optional[str]):
@@ -351,10 +424,53 @@ class TextTokenizer(BaseTokenizer):
     def do_cleaning(cls) -> bool:
         return True
 
+    def get_tokenizer_path(self):
+        return None
+
+    def get_tokenizer_type(self):
+        return self.type
+
+
+class TiktokenGPT2Tokenizer(BaseTokenizer):
+    """Wrapper for tiktoken GPT-2 encoding."""
+
+    def __init__(self, encoding_name: str = "gpt2"):
+        try:
+            import tiktoken
+        except ImportError as exc:
+            raise ImportError(
+                "Missing dependency 'tiktoken'. Install with: pip install tiktoken"
+            ) from exc
+
+        self.encoding_name = encoding_name
+        self.tokenizer = tiktoken.get_encoding(encoding_name)
+        self.type = TokenizerType.TIKTOKEN_GPT2
+
+    def get_piece_size(self) -> int:
+        return int(self.tokenizer.n_vocab)
+
+    def encode(self, text: str) -> List[int]:
+        # Keep parity with existing pipeline expectations: no implicit EOT insertion.
+        return self.tokenizer.encode_ordinary(text)
+
+    def decode(self, token_ids: List[int]) -> str:
+        return self.tokenizer.decode(token_ids)
+
+    @classmethod
+    def do_cleaning(cls) -> bool:
+        return False
+
+    def get_tokenizer_path(self):
+        return self.encoding_name
+
+    def get_tokenizer_type(self):
+        return self.type
+
 
 TOKENIZER_TYPE_TO_CLASS = {
     TokenizerType.SENTENCEPIECE: SPTokenizer,
     TokenizerType.TEXT: TextTokenizer,
+    TokenizerType.TIKTOKEN_GPT2: TiktokenGPT2Tokenizer,
 }
 
 
@@ -1101,6 +1217,10 @@ def prepare_tokenizer(
     if tokenizer_type == TokenizerType.TEXT and tokenizer_path is None:
         print("Using TextTokenizer for word-level tokenization.")
         tokenizer = TextTokenizer(text_file_path, vocab_size=max_vocab_size)
+    elif tokenizer_type == TokenizerType.TIKTOKEN_GPT2:
+        encoding_name = tokenizer_path if tokenizer_path else "gpt2"
+        print(f"Using tiktoken tokenizer with encoding: {encoding_name}")
+        tokenizer = TiktokenGPT2Tokenizer(encoding_name=encoding_name)
     else:
         print("Using SPTokenizer for subword tokenization.")
         model_prefix = f"{tokenizer_folder}/{dataset_name}_tokenizer_vocab{max_vocab_size}_seq{seq_length}_for_{model_name}"
@@ -1211,6 +1331,7 @@ def train_model(
     streaming_chunk_line_buffer: int = 4096,
     optimizer_name: str = "adamw",
     target_tokens: Optional[int] = None,
+    compute_dtype: str = ComputeDType.FLOAT32.value,
 ):
     """Main training function."""
 
@@ -1237,7 +1358,12 @@ def train_model(
     )
     loss_type = "seq2seq" if seq2seq else "lastpos"
     scan_type = "blelloch_random" if config.blelloch_random else "default"
-    model_name = f"{model_prefix}_model_{model_type}_{loss_type}_silu_{scan_type}_{seq_length}_SP"
+    tokenizer_suffix = (
+        "TKGPT2"
+        if tokenizer_type == TokenizerType.TIKTOKEN_GPT2
+        else "TXT" if tokenizer_type == TokenizerType.TEXT else "SP"
+    )
+    model_name = f"{model_prefix}_model_{model_type}_{loss_type}_silu_{scan_type}_{seq_length}_{tokenizer_suffix}"
     checkpoint_path = os.path.join(checkpoint_dir, f"{model_name}")
     if enable_logging:
         if not os.path.exists(f"{log_dir}/{model_name}"):
@@ -1251,6 +1377,9 @@ def train_model(
     assert (
         text_file_path is not None
     ), "Please provide a path to the training text file."
+
+    configure_mixed_precision(compute_dtype)
+    print(f"Compute dtype: {compute_dtype} (params/output kept in float32)")
 
     print("Creating dataset from text file...")
     # Prepare tokenizer
@@ -1269,6 +1398,7 @@ def train_model(
 
     vocab_size = tokenizer.get_piece_size()
     print(f"Tokenizer vocab size: {vocab_size}")
+    config.vocab_size = vocab_size
 
     train_data, val_data, test_data = None, None, None
     train_stride = max(1, seq_length // 2)
@@ -1980,6 +2110,9 @@ def load_checkpoint(checkpoint_dir: str, step: int, load_best_only: bool = True)
     tokenizer_path = metadata.get("tokenizer_path")
     if tokenizer_type == TokenizerType.SENTENCEPIECE:
         tokenizer = SPTokenizer(model_path=tokenizer_path)
+    elif tokenizer_type == TokenizerType.TIKTOKEN_GPT2:
+        encoding_name = tokenizer_path if tokenizer_path else "gpt2"
+        tokenizer = TiktokenGPT2Tokenizer(encoding_name=encoding_name)
     elif tokenizer_type == TokenizerType.TEXT:
         tokenizer = None
         print(
@@ -3657,6 +3790,16 @@ if __name__ == "__main__":
         help="Number of training epochs (default: 100)",
     )
     parser.add_argument(
+        "--compute_dtype",
+        type=str,
+        default=ComputeDType.FLOAT32.value,
+        choices=[d.value for d in ComputeDType],
+        help=(
+            "Compute dtype for model ops. "
+            "Use 'float32' for current behavior or 'bfloat16' for bf16 compute."
+        ),
+    )
+    parser.add_argument(
         "--target_tokens",
         type=int,
         default=None,
@@ -3926,6 +4069,7 @@ if __name__ == "__main__":
         streaming_chunk_line_buffer=args.streaming_chunk_line_buffer,
         optimizer_name=args.optimizer,
         target_tokens=args.target_tokens,
+        compute_dtype=args.compute_dtype,
     )
 
     print(f"\\nModel Summary:")

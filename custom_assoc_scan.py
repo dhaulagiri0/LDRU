@@ -36,7 +36,13 @@ def associative_scan(
         b = tree_unflatten(tree, b_flat)
         c = fn(a, b)
         c_flat, _ = tree_flatten(c)
-        return c_flat
+        # Enforce dtype consistency with scan inputs (critical for mixed precision).
+        aligned = []
+        for c_leaf, a_leaf in zip(c_flat, a_flat):
+            if c_leaf.dtype != a_leaf.dtype:
+                c_leaf = c_leaf.astype(a_leaf.dtype)
+            aligned.append(c_leaf)
+        return aligned
 
     axis = util.canonicalize_axis(axis, elems_flat[0].ndim)
 
@@ -70,7 +76,15 @@ def associative_scan(
             ],
         )
         # Apply inner function after each combine step.
-        reduced_elems = [inner_fn(elem) for elem in reduced_elems]
+        # Keep original dtypes so downstream lax.concatenate/interleave receives
+        # uniform dtypes (important for mixed-precision runs, e.g. bf16 compute).
+        cast_reduced_elems = []
+        for elem in reduced_elems:
+            elem_out = inner_fn(elem)
+            if elem_out.dtype != elem.dtype:
+                elem_out = elem_out.astype(elem.dtype)
+            cast_reduced_elems.append(elem_out)
+        reduced_elems = cast_reduced_elems
 
         # Recursively compute scan for partially reduced tensors.
         odd_elems = _scan(reduced_elems)
@@ -90,9 +104,17 @@ def associative_scan(
         # of the original `elems`.
         even_elems = [
             lax.concatenate(
-                [slicing.slice_in_dim(elem, 0, 1, axis=axis), result], dimension=axis
+                [
+                    slicing.slice_in_dim(elem, 0, 1, axis=axis),
+                    result.astype(elem.dtype) if result.dtype != elem.dtype else result,
+                ],
+                dimension=axis,
             )
             for (elem, result) in zip(elems, even_elems)
+        ]
+        odd_elems = [
+            odd.astype(even.dtype) if odd.dtype != even.dtype else odd
+            for even, odd in zip(even_elems, odd_elems)
         ]
         return list(_map(partial(_interleave, axis=axis), even_elems, odd_elems))
 
