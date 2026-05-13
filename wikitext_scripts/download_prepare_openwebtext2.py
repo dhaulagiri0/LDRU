@@ -92,6 +92,42 @@ def parse_args() -> argparse.Namespace:
         help="Overwrite output split files if they already exist.",
     )
     parser.add_argument(
+        "--source_backend",
+        type=str,
+        default="tar",
+        choices=["tar", "urls", "hf"],
+        help="Data source backend: tar/urls local shards or huggingface dataset stream.",
+    )
+    parser.add_argument(
+        "--hf_dataset",
+        type=str,
+        default="segyges/OpenWebText2",
+        help="Hugging Face dataset name when --source_backend hf.",
+    )
+    parser.add_argument(
+        "--hf_config",
+        type=str,
+        default=None,
+        help="Optional Hugging Face dataset config/subset name.",
+    )
+    parser.add_argument(
+        "--hf_split",
+        type=str,
+        default="train",
+        help="Hugging Face split to read from.",
+    )
+    parser.add_argument(
+        "--hf_text_field",
+        type=str,
+        default="text",
+        help="Text field name in HF dataset records (fallbacks still apply).",
+    )
+    parser.add_argument(
+        "--hf_no_streaming",
+        action="store_true",
+        help="Disable HF streaming and materialize dataset locally.",
+    )
+    parser.add_argument(
         "--skip_download",
         action="store_true",
         help="Skip downloading and only run preparation on local shards.",
@@ -231,7 +267,46 @@ def split_bucket(text: str, val_ratio: float, test_ratio: float) -> str:
     return "train"
 
 
-def prepare_dataset(args: argparse.Namespace):
+def iter_hf_docs(
+    dataset_name: str,
+    dataset_config: Optional[str],
+    split: str,
+    streaming: bool,
+) -> Iterable[dict]:
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise ImportError(
+            "Missing dependency 'datasets'. Install with: pip install datasets"
+        ) from exc
+
+    try:
+        ds = load_dataset(
+            path=dataset_name,
+            name=dataset_config,
+            split=split,
+            streaming=streaming,
+        )
+    except NotImplementedError as exc:
+        # Some HF datasets expose TAR archives where streaming extraction is unsupported.
+        if streaming and "TAR archives" in str(exc):
+            print(
+                "HF streaming for TAR archives is not supported for this dataset; "
+                "retrying with non-streaming mode."
+            )
+            ds = load_dataset(
+                path=dataset_name,
+                name=dataset_config,
+                split=split,
+                streaming=False,
+            )
+        else:
+            raise
+    for rec in ds:
+        yield rec
+
+
+def prepare_dataset_from_records(args: argparse.Namespace, records: Iterable[dict]):
     if args.val_ratio < 0 or args.test_ratio < 0 or args.val_ratio + args.test_ratio >= 1:
         raise ValueError("Require: val_ratio >= 0, test_ratio >= 0, val_ratio + test_ratio < 1")
     if args.min_chars <= 0:
@@ -255,13 +330,6 @@ def prepare_dataset(args: argparse.Namespace):
                 f"Output exists: {p}. Use --overwrite_outputs to replace."
             )
 
-    shard_paths = sorted(download_dir.glob(args.source_glob))
-    if not shard_paths:
-        raise FileNotFoundError(
-            f"No shard files found in {download_dir} matching {args.source_glob}"
-        )
-
-    print(f"Found {len(shard_paths)} shard files.")
     print(f"Writing outputs to: {output_dir}")
 
     counts = {"train": 0, "val": 0, "test": 0, "skipped": 0}
@@ -273,35 +341,37 @@ def prepare_dataset(args: argparse.Namespace):
     ) as val_f, open(test_path, "w", encoding="utf-8") as test_f:
         out = {"train": train_f, "val": val_f, "test": test_f}
 
-        for shard_idx, shard_path in enumerate(shard_paths, start=1):
-            print(f"[prepare {shard_idx}/{len(shard_paths)}] {shard_path.name}")
-            for rec in iter_jsonl_zst_docs(shard_path):
+        for rec in records:
+            text = None
+            if args.hf_text_field and isinstance(rec, dict):
+                field_val = rec.get(args.hf_text_field)
+                if isinstance(field_val, str):
+                    text = field_val
+            if text is None:
                 text = extract_text(rec)
-                if not text:
-                    counts["skipped"] += 1
-                    continue
-                text = clean_text(text)
-                if len(text) < args.min_chars:
-                    counts["skipped"] += 1
-                    continue
+            if not text:
+                counts["skipped"] += 1
+                continue
+            text = clean_text(text)
+            if len(text) < args.min_chars:
+                counts["skipped"] += 1
+                continue
 
-                bucket = split_bucket(text, args.val_ratio, args.test_ratio)
-                out[bucket].write(text + "\n")
-                counts[bucket] += 1
-                chars[bucket] += len(text)
-                processed += 1
+            bucket = split_bucket(text, args.val_ratio, args.test_ratio)
+            out[bucket].write(text + "\n")
+            counts[bucket] += 1
+            chars[bucket] += len(text)
+            processed += 1
 
-                if args.max_docs and processed >= args.max_docs:
-                    print(f"Reached --max_docs={args.max_docs}. Stopping early.")
-                    break
-
-                if processed % args.progress_every == 0:
-                    print(
-                        f"Processed {processed:,} docs "
-                        f"(train={counts['train']:,}, val={counts['val']:,}, test={counts['test']:,}, skipped={counts['skipped']:,})"
-                    )
             if args.max_docs and processed >= args.max_docs:
+                print(f"Reached --max_docs={args.max_docs}. Stopping early.")
                 break
+
+            if processed % args.progress_every == 0:
+                print(
+                    f"Processed {processed:,} docs "
+                    f"(train={counts['train']:,}, val={counts['val']:,}, test={counts['test']:,}, skipped={counts['skipped']:,})"
+                )
 
     print("Preparation complete.")
     print(
@@ -315,24 +385,56 @@ def prepare_dataset(args: argparse.Namespace):
     print(f"Test file:  {test_path}")
 
 
+def prepare_dataset(args: argparse.Namespace):
+    download_dir = Path(args.download_dir)
+    shard_paths = sorted(download_dir.glob(args.source_glob))
+    if not shard_paths:
+        raise FileNotFoundError(
+            f"No shard files found in {download_dir} matching {args.source_glob}"
+        )
+    print(f"Found {len(shard_paths)} shard files.")
+
+    def _records():
+        for shard_idx, shard_path in enumerate(shard_paths, start=1):
+            print(f"[prepare {shard_idx}/{len(shard_paths)}] {shard_path.name}")
+            yield from iter_jsonl_zst_docs(shard_path)
+
+    prepare_dataset_from_records(args, _records())
+
+
 def main():
     args = parse_args()
     download_dir = Path(args.download_dir)
 
+    if args.source_backend == "hf":
+        print(
+            f"Using Hugging Face dataset backend: {args.hf_dataset}"
+            + (f" ({args.hf_config})" if args.hf_config else "")
+            + f", split={args.hf_split}, streaming={not args.hf_no_streaming}"
+        )
+        records = iter_hf_docs(
+            dataset_name=args.hf_dataset,
+            dataset_config=args.hf_config,
+            split=args.hf_split,
+            streaming=not args.hf_no_streaming,
+        )
+        prepare_dataset_from_records(args, records)
+        return
+
     if not args.skip_download:
-        if args.urls_file:
+        if args.source_backend == "urls":
+            if not args.urls_file:
+                raise ValueError("--urls_file is required when --source_backend urls.")
             urls = read_urls(Path(args.urls_file))
             print(f"Downloading {len(urls)} shards from --urls_file...")
             download_shards(urls, download_dir)
-        elif args.tar_url:
+        else:  # tar
+            if not args.tar_url:
+                raise ValueError("--tar_url is required when --source_backend tar.")
             tar_path = download_dir / args.tar_filename
             download_file(args.tar_url, tar_path)
             if not args.skip_extract:
                 extract_tarball(tar_path, download_dir)
-        else:
-            raise ValueError(
-                "Provide either --urls_file or --tar_url unless --skip_download is set."
-            )
     else:
         print("Skipping download step (--skip_download set).")
 
