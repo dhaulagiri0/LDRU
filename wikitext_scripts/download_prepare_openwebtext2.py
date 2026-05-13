@@ -280,30 +280,96 @@ def iter_hf_docs(
             "Missing dependency 'datasets'. Install with: pip install datasets"
         ) from exc
 
-    try:
-        ds = load_dataset(
-            path=dataset_name,
-            name=dataset_config,
-            split=split,
-            streaming=streaming,
+    def _iter_chain_messages(exc: BaseException) -> list[str]:
+        msgs: list[str] = []
+        seen: set[int] = set()
+        cur: Optional[BaseException] = exc
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            msgs.append(f"{type(cur).__name__}: {cur}")
+            cur = cur.__cause__ if cur.__cause__ is not None else cur.__context__
+        return msgs
+
+    def _looks_like_compressed_jsonl_error(exc: BaseException) -> bool:
+        msg = "\n".join(_iter_chain_messages(exc)).lower()
+        return (
+            ".jsonl.zst" in msg
+            and ("json parse error" in msg or "unicodedecodeerror" in msg)
         )
-    except NotImplementedError as exc:
-        # Some HF datasets expose TAR archives where streaming extraction is unsupported.
-        if streaming and "TAR archives" in str(exc):
-            print(
-                "HF streaming for TAR archives is not supported for this dataset; "
-                "retrying with non-streaming mode."
+
+    def _iter_hf_snapshot_jsonl_zst() -> Iterable[dict]:
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as exc:
+            raise ImportError(
+                "Need huggingface_hub for fallback shard download. "
+                "Install with: pip install huggingface_hub"
+            ) from exc
+
+        snapshot_path = Path(
+            snapshot_download(
+                repo_id=dataset_name,
+                repo_type="dataset",
+                allow_patterns=["*.jsonl.zst"],
             )
+        )
+        shard_paths = sorted(snapshot_path.rglob("*.jsonl.zst"))
+        if not shard_paths:
+            raise FileNotFoundError(
+                f"No *.jsonl.zst files found in HF snapshot for {dataset_name}."
+            )
+        if split != "train":
+            print(
+                "HF compressed-shard fallback does not expose named splits; "
+                f"reading all shards (requested split={split})."
+            )
+        print(f"HF fallback found {len(shard_paths)} *.jsonl.zst shards.")
+        for shard_idx, shard_path in enumerate(shard_paths, start=1):
+            print(f"[hf-fallback {shard_idx}/{len(shard_paths)}] {shard_path.name}")
+            yield from iter_jsonl_zst_docs(shard_path)
+
+    attempts = [streaming] + ([] if not streaming else [False])
+    last_exc: Optional[BaseException] = None
+    for mode in attempts:
+        try:
             ds = load_dataset(
                 path=dataset_name,
                 name=dataset_config,
                 split=split,
-                streaming=False,
+                streaming=mode,
             )
-        else:
+            for rec in ds:
+                yield rec
+            return
+        except NotImplementedError as exc:
+            last_exc = exc
+            # Some HF datasets expose TAR archives where streaming extraction is unsupported.
+            if mode and "tar archives" in str(exc).lower():
+                print(
+                    "HF streaming for TAR archives is not supported for this dataset; "
+                    "retrying with non-streaming mode."
+                )
+                continue
             raise
-    for rec in ds:
-        yield rec
+        except Exception as exc:
+            last_exc = exc
+            if mode and _looks_like_compressed_jsonl_error(exc):
+                print(
+                    "HF builder failed to parse compressed JSONL shards in streaming mode; "
+                    "retrying with non-streaming mode."
+                )
+                continue
+            if (not mode) and _looks_like_compressed_jsonl_error(exc):
+                print(
+                    "HF builder cannot parse compressed *.jsonl.zst shards for this dataset; "
+                    "falling back to manual shard iteration."
+                )
+                yield from _iter_hf_snapshot_jsonl_zst()
+                return
+            raise
+
+    if last_exc is not None:
+        raise last_exc
 
 
 def prepare_dataset_from_records(args: argparse.Namespace, records: Iterable[dict]):
