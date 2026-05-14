@@ -773,15 +773,24 @@ def create_data_loader(sequences, batch_size, rng_key):
     num_samples = sequences.shape[0]
     num_batches = num_samples // batch_size
 
-    # Shuffle data
-    indices = jax.random.permutation(rng_key, num_samples)
-    shuffled_sequences = sequences[indices]
+    if num_samples == 0 or num_batches == 0:
+        return
 
-    # Yield batches
+    # For very large datasets, avoid materializing a full permutation.
+    if num_samples > 2_000_000:
+        seed = int(jax.random.randint(rng_key, shape=(), minval=0, maxval=2**31 - 1))
+        np_rng = np.random.default_rng(seed)
+        for _ in range(num_batches):
+            batch_indices = np_rng.integers(0, num_samples, size=batch_size)
+            yield np.asarray(sequences[batch_indices])
+        return
+
+    indices = np.asarray(jax.random.permutation(rng_key, num_samples))
     for i in range(num_batches):
         start_idx = i * batch_size
         end_idx = start_idx + batch_size
-        yield shuffled_sequences[start_idx:end_idx]
+        batch_indices = indices[start_idx:end_idx]
+        yield np.asarray(sequences[batch_indices])
 
 
 def iter_token_sequences_from_text_file(
@@ -885,6 +894,58 @@ def estimate_num_sequences_from_file_size(
     if approx_tokens < seq_length:
         return 0
     return 1 + (approx_tokens - seq_length) // stride
+
+
+def resolve_sequence_bin_dtype(dtype_name: str) -> np.dtype:
+    dtype_map = {
+        "uint16": np.uint16,
+        "uint32": np.uint32,
+        "int32": np.int32,
+    }
+    if dtype_name not in dtype_map:
+        raise ValueError(
+            f"Unsupported --seq_bin_dtype '{dtype_name}'. "
+            f"Expected one of: {list(dtype_map.keys())}"
+        )
+    return dtype_map[dtype_name]
+
+
+def load_pretokenized_sequences(
+    file_path: str, seq_length: int, dtype_name: str
+) -> np.memmap:
+    if seq_length <= 0:
+        raise ValueError("seq_length must be > 0")
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Pretokenized sequence file not found: {file_path}")
+
+    dtype = resolve_sequence_bin_dtype(dtype_name)
+    itemsize = np.dtype(dtype).itemsize
+    file_size = os.path.getsize(file_path)
+
+    if file_size == 0:
+        raise ValueError(f"Pretokenized sequence file is empty: {file_path}")
+    if file_size % itemsize != 0:
+        raise ValueError(
+            f"File size ({file_size}) is not divisible by dtype itemsize ({itemsize}) "
+            f"for {file_path}."
+        )
+
+    total_tokens = file_size // itemsize
+    if total_tokens % seq_length != 0:
+        raise ValueError(
+            f"Token count ({total_tokens}) in {file_path} is not divisible by "
+            f"seq_length ({seq_length})."
+        )
+
+    num_sequences = total_tokens // seq_length
+    if num_sequences == 0:
+        raise ValueError(
+            f"No full sequences of length {seq_length} available in {file_path}."
+        )
+
+    return np.memmap(
+        file_path, dtype=dtype, mode="r", shape=(num_sequences, seq_length)
+    )
 
 
 def _pop_random_batch(
@@ -1356,6 +1417,12 @@ def train_model(
     streaming_chunk_line_buffer: int = 4096,
     streaming_exact_sequence_estimate: bool = False,
     streaming_estimate_bytes_per_token: float = 4.0,
+    train_seq_bin_path: str = None,
+    val_seq_bin_path: str = None,
+    test_seq_bin_path: str = None,
+    seq_bin_dtype: str = "uint16",
+    seq_bin_length: Optional[int] = None,
+    seq_meta_json: str = None,
     optimizer_name: str = "adamw",
     target_tokens: Optional[int] = None,
     compute_dtype: str = ComputeDType.FLOAT32.value,
@@ -1401,34 +1468,86 @@ def train_model(
     rng_key = jax.random.PRNGKey(42)
     rng_key, init_key, data_key = jax.random.split(rng_key, 3)
 
-    assert (
-        text_file_path is not None
-    ), "Please provide a path to the training text file."
+    use_pretokenized_bins = train_seq_bin_path is not None
+    if not use_pretokenized_bins:
+        assert (
+            text_file_path is not None
+        ), "Please provide a path to the training text file."
 
     configure_mixed_precision(compute_dtype)
     print(f"Compute dtype: {compute_dtype} (params/output kept in float32)")
 
-    print("Creating dataset from text file...")
-    # Prepare tokenizer
-    tokenizer = prepare_tokenizer(
-        tokenizer_type,
-        text_file_path,
-        tokenizer_path,
-        max_vocab_size,
-        seq_length,
-        model_name,
-        tokenizer_folder=DEFAULT_TOKENIZER_FOLDER,
-        dataset_name=text_file_path.split("/")[-1].split(".")[
-            0
-        ],  # Use filename as dataset name
-    )
+    tokenizer = None
+    if use_pretokenized_bins:
+        print("Using pretokenized sequence binaries for training data.")
+        if seq_meta_json:
+            if not os.path.exists(seq_meta_json):
+                raise FileNotFoundError(f"--seq_meta_json not found: {seq_meta_json}")
+            with open(seq_meta_json, "r", encoding="utf-8") as f:
+                seq_meta = json.load(f)
+            meta_seq_len = seq_meta.get("sequence_config", {}).get("seq_length")
+            if seq_bin_length is None and meta_seq_len is not None:
+                seq_bin_length = int(meta_seq_len)
+            meta_tok = seq_meta.get("tokenizer", {})
+            if tokenizer_path is None and meta_tok.get("name_or_path"):
+                tokenizer_path = meta_tok.get("name_or_path")
+            if (
+                tokenizer_type == TokenizerType.SENTENCEPIECE
+                and meta_tok.get("type") == "tiktoken_gpt2"
+            ):
+                tokenizer_type = TokenizerType.TIKTOKEN_GPT2
+            meta_vocab = meta_tok.get("vocab_size")
+            if meta_vocab is not None:
+                config.vocab_size = int(meta_vocab)
 
-    vocab_size = tokenizer.get_piece_size()
-    print(f"Tokenizer vocab size: {vocab_size}")
-    config.vocab_size = vocab_size
+        seq_bin_length = seq_bin_length if seq_bin_length is not None else seq_length
+        if seq_bin_length != seq_length:
+            raise ValueError(
+                f"--seq_bin_length ({seq_bin_length}) must match training seq_length "
+                f"({seq_length})."
+            )
+
+        if tokenizer_type == TokenizerType.TIKTOKEN_GPT2:
+            encoding_name = tokenizer_path if tokenizer_path else "gpt2"
+            tokenizer = TiktokenGPT2Tokenizer(encoding_name=encoding_name)
+        elif tokenizer_type == TokenizerType.SENTENCEPIECE and tokenizer_path:
+            tokenizer = SPTokenizer(model_path=tokenizer_path)
+        elif tokenizer_type == TokenizerType.TEXT:
+            tokenizer = None
+
+        if tokenizer is not None:
+            vocab_size = tokenizer.get_piece_size()
+            print(f"Tokenizer vocab size: {vocab_size}")
+            config.vocab_size = vocab_size
+    else:
+        print("Creating dataset from text file...")
+        # Prepare tokenizer
+        tokenizer = prepare_tokenizer(
+            tokenizer_type,
+            text_file_path,
+            tokenizer_path,
+            max_vocab_size,
+            seq_length,
+            model_name,
+            tokenizer_folder=DEFAULT_TOKENIZER_FOLDER,
+            dataset_name=text_file_path.split("/")[-1].split(".")[
+                0
+            ],  # Use filename as dataset name
+        )
+
+        vocab_size = tokenizer.get_piece_size()
+        print(f"Tokenizer vocab size: {vocab_size}")
+        config.vocab_size = vocab_size
 
     train_data, val_data, test_data = None, None, None
     train_stride = max(1, seq_length // 2)
+
+    if use_pretokenized_bins and streaming_train:
+        print(
+            "Pretokenized binary mode does not use text streaming. "
+            "Ignoring streaming_train and using indexed batch sampling."
+        )
+        streaming_train = False
 
     if streaming_train and validation_text_file_path is None:
         print(
@@ -1436,7 +1555,35 @@ def train_model(
         )
         streaming_train = False
 
-    if streaming_train:
+    if use_pretokenized_bins:
+        train_data = load_pretokenized_sequences(
+            train_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
+        )
+        train_sequence_count = len(train_data)
+        print(f"Loaded train sequences: {train_sequence_count:,} from {train_seq_bin_path}")
+
+        if val_seq_bin_path:
+            val_data = load_pretokenized_sequences(
+                val_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
+            )
+            print(f"Loaded val sequences: {len(val_data):,} from {val_seq_bin_path}")
+
+        if test_seq_bin_path:
+            test_data = load_pretokenized_sequences(
+                test_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
+            )
+            print(f"Loaded test sequences: {len(test_data):,} from {test_seq_bin_path}")
+
+        preview_batch = np.asarray(train_data[:batch_size])
+        if preview_batch.shape[0] == 0:
+            raise ValueError(
+                "No training batches could be created from pretokenized binaries."
+            )
+        if tokenizer is not None:
+            sample_text = tokenizer.decode(preview_batch[0].tolist())
+            print(f"\nSample sequence: '{sample_text[:100]}...'")
+
+    elif streaming_train:
         print("Using streaming training dataset loader (low-memory mode).")
         if streaming_exact_sequence_estimate:
             train_sequence_count = estimate_num_sequences_from_text_file(
@@ -3756,6 +3903,43 @@ if __name__ == "__main__":
         help="Path to text file to use as prompt for testing a saved model (used with --test_model)",
     )
     parser.add_argument(
+        "--train_seq_bin",
+        type=str,
+        default=None,
+        help="Optional path to pretokenized train sequence binary file.",
+    )
+    parser.add_argument(
+        "--val_seq_bin",
+        type=str,
+        default=None,
+        help="Optional path to pretokenized validation sequence binary file.",
+    )
+    parser.add_argument(
+        "--test_seq_bin",
+        type=str,
+        default=None,
+        help="Optional path to pretokenized test sequence binary file.",
+    )
+    parser.add_argument(
+        "--seq_bin_dtype",
+        type=str,
+        default="uint16",
+        choices=["uint16", "uint32", "int32"],
+        help="Dtype used in pretokenized sequence binaries.",
+    )
+    parser.add_argument(
+        "--seq_bin_length",
+        type=int,
+        default=None,
+        help="Sequence length stored in pretokenized binaries (must match --max_seq_len).",
+    )
+    parser.add_argument(
+        "--seq_meta_json",
+        type=str,
+        default=None,
+        help="Optional metadata JSON from pretokenization step.",
+    )
+    parser.add_argument(
         "--max_vocab_size",
         type=int,
         default=1500,
@@ -3961,21 +4145,24 @@ if __name__ == "__main__":
         )
         exit(0)
 
+    use_seq_bins = args.train_seq_bin is not None
+
     # check tokenizer path
     if args.tokenizer_path:
         tokenizer_path = args.tokenizer_path
         print(f"Using tokenizer from: {tokenizer_path}")
     else:
         tokenizer_path = None
-        print(
-            "No tokenizer path provided, training will create a new tokenizer from the training text"
-        )
-        print(
-            "Usage: python train_causal_ldru.py --tokenizer_path <path_to_tokenizer_file>"
-        )
-        print(
-            "Example: python train_causal_ldru.py --tokenizer_path /path/to/your/tokenizer.model"
-        )
+        if not use_seq_bins:
+            print(
+                "No tokenizer path provided, training will create a new tokenizer from the training text"
+            )
+            print(
+                "Usage: python train_causal_ldru.py --tokenizer_path <path_to_tokenizer_file>"
+            )
+            print(
+                "Example: python train_causal_ldru.py --tokenizer_path /path/to/your/tokenizer.model"
+            )
 
     # Evaluate mode - load checkpoint and evaluate on a text file
     if args.evaluate:
@@ -4001,38 +4188,48 @@ if __name__ == "__main__":
         load_and_test_model(args.test_model, args.test_text)
         exit(0)
 
-    # Check if text file path is provided
-    if args.text_file:
-        text_file_path = args.text_file
-        print(f"Training with text file: {text_file_path}")
-    else:
+    if use_seq_bins:
         text_file_path = None
-        print(
-            "No training text file provided. Please provide a text file for training using --text_file."
-        )
-        exit(1)
-
-    # check if validation text file is provided
-    if args.val_text_file:
-        val_text_file_path = args.val_text_file
-        print(f"Using validation text file: {val_text_file_path}")
-    else:
         val_text_file_path = None
-        print(
-            "No validation text file provided, splitting 10 percent of training data for validation"
-        )
-        print(
-            "Usage: python train_causal_ldru.py --val_text_file <path_to_validation_text_file>"
-        )
-        print(
-            "Example: python train_causal_ldru.py --val_text_file /path/to/your/val.txt"
-        )
-
-    if args.test_text_file:
-        test_text_file_path = args.test_text_file
-        print(f"Using test text file for model testing: {test_text_file_path}")
-    else:
         test_text_file_path = None
+        print(f"Training with pretokenized train bin: {args.train_seq_bin}")
+        if args.val_seq_bin:
+            print(f"Using pretokenized val bin: {args.val_seq_bin}")
+        if args.test_seq_bin:
+            print(f"Using pretokenized test bin: {args.test_seq_bin}")
+    else:
+        # Check if text file path is provided
+        if args.text_file:
+            text_file_path = args.text_file
+            print(f"Training with text file: {text_file_path}")
+        else:
+            text_file_path = None
+            print(
+                "No training text file provided. Please provide a text file for training using --text_file."
+            )
+            exit(1)
+
+        # check if validation text file is provided
+        if args.val_text_file:
+            val_text_file_path = args.val_text_file
+            print(f"Using validation text file: {val_text_file_path}")
+        else:
+            val_text_file_path = None
+            print(
+                "No validation text file provided, splitting 10 percent of training data for validation"
+            )
+            print(
+                "Usage: python train_causal_ldru.py --val_text_file <path_to_validation_text_file>"
+            )
+            print(
+                "Example: python train_causal_ldru.py --val_text_file /path/to/your/val.txt"
+            )
+
+        if args.test_text_file:
+            test_text_file_path = args.test_text_file
+            print(f"Using test text file for model testing: {test_text_file_path}")
+        else:
+            test_text_file_path = None
 
     # Set model creation function
     model_creation_fn = create_causal_ldru_model
@@ -4127,6 +4324,12 @@ if __name__ == "__main__":
         streaming_chunk_line_buffer=args.streaming_chunk_line_buffer,
         streaming_exact_sequence_estimate=args.streaming_exact_sequence_estimate,
         streaming_estimate_bytes_per_token=args.streaming_estimate_bytes_per_token,
+        train_seq_bin_path=args.train_seq_bin,
+        val_seq_bin_path=args.val_seq_bin,
+        test_seq_bin_path=args.test_seq_bin,
+        seq_bin_dtype=args.seq_bin_dtype,
+        seq_bin_length=args.seq_bin_length,
+        seq_meta_json=args.seq_meta_json,
         optimizer_name=args.optimizer,
         target_tokens=args.target_tokens,
         compute_dtype=args.compute_dtype,

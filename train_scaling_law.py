@@ -33,7 +33,7 @@ def parse_args() -> tuple[argparse.Namespace, List[str]]:
         "--binary_operator",
         type=str,
         default="default",
-        choices=["default", "binary", "convex_gated", "grc"],
+        choices=["default", "binary", "convex_gated", "grc", "ablation"],
         help="Binary operator for LDRU composition.",
     )
     parser.add_argument(
@@ -41,6 +41,20 @@ def parse_args() -> tuple[argparse.Namespace, List[str]]:
         type=int,
         default=4,
         help="Expansion factor for compatible binary operators.",
+    )
+    parser.add_argument(
+        "--ablation_expansion_mode",
+        type=str,
+        default="grc",
+        choices=["binary", "grc"],
+        help="Expansion stage mode when binary_operator=ablation.",
+    )
+    parser.add_argument(
+        "--ablation_combine_mode",
+        type=str,
+        default="grc",
+        choices=["binary", "grc"],
+        help="Combine stage mode when binary_operator=ablation.",
     )
     parser.add_argument(
         "--token_scale_factor",
@@ -101,6 +115,8 @@ def compute_total_params(
     max_seq_len: int,
     binary_operator: str,
     binop_expansion_factor: int,
+    ablation_expansion_mode: str,
+    ablation_combine_mode: str,
     seed: int,
 ) -> int:
     config = LDRUExperimenstConfig(
@@ -112,6 +128,8 @@ def compute_total_params(
         max_sequence_length=max(3072, max_seq_len),
         operator=resolve_binary_operator(binary_operator),
         binop_expansion_factor=binop_expansion_factor,
+        ablation_expansion_mode=ablation_expansion_mode,
+        ablation_combine_mode=ablation_combine_mode,
     )
     model = create_causal_ldru_model(config)
     dummy_batch = jnp.zeros((1, max_seq_len), dtype=jnp.int32)
@@ -152,6 +170,8 @@ def main():
         max_seq_len=args.max_seq_len,
         binary_operator=args.binary_operator,
         binop_expansion_factor=args.binop_expansion_factor,
+        ablation_expansion_mode=args.ablation_expansion_mode,
+        ablation_combine_mode=args.ablation_combine_mode,
         seed=args.seed,
     )
 
@@ -184,6 +204,10 @@ def main():
         args.binary_operator,
         "--binop_expansion_factor",
         str(args.binop_expansion_factor),
+        "--ablation_expansion_mode",
+        args.ablation_expansion_mode,
+        "--ablation_combine_mode",
+        args.ablation_combine_mode,
         "--target_tokens",
         str(target_tokens),
         *passthrough,
@@ -197,6 +221,8 @@ def main():
         "max_seq_len": args.max_seq_len,
         "binary_operator": args.binary_operator,
         "binop_expansion_factor": args.binop_expansion_factor,
+        "ablation_expansion_mode": args.ablation_expansion_mode,
+        "ablation_combine_mode": args.ablation_combine_mode,
         "token_scale_factor": args.token_scale_factor,
         "token_scale_exponent": args.token_scale_exponent,
         "param_count_basis": args.param_count_basis,
