@@ -929,10 +929,14 @@ def create_streaming_data_loader(
         chunk_line_buffer=chunk_line_buffer,
     )
 
+    target_watermark = effective_buffer + batch_size
+
     for sequence in sequence_iter:
         shuffle_buffer.append(sequence)
 
-        while len(shuffle_buffer) >= effective_buffer:
+        # Keep a high-watermark buffer for randomness, but avoid draining it in
+        # a burst (which causes long apparent stalls while refilling).
+        while len(shuffle_buffer) >= target_watermark:
             yield _pop_random_batch(shuffle_buffer, batch_size, np_rng)
 
     while len(shuffle_buffer) >= batch_size:
