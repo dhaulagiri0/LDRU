@@ -866,6 +866,27 @@ def estimate_num_sequences_from_text_file(
     return count
 
 
+def estimate_num_sequences_from_file_size(
+    file_path: str,
+    seq_length: int,
+    stride: int,
+    bytes_per_token: float = 4.0,
+) -> int:
+    """Fast rough estimate of sequence count from file size."""
+    if seq_length <= 0:
+        raise ValueError("seq_length must be > 0")
+    if stride <= 0:
+        raise ValueError("stride must be > 0")
+    if bytes_per_token <= 0:
+        raise ValueError("bytes_per_token must be > 0")
+
+    total_bytes = os.path.getsize(file_path)
+    approx_tokens = max(0, int(total_bytes / bytes_per_token))
+    if approx_tokens < seq_length:
+        return 0
+    return 1 + (approx_tokens - seq_length) // stride
+
+
 def _pop_random_batch(
     shuffle_buffer: List[np.ndarray], batch_size: int, rng: np.random.Generator
 ) -> np.ndarray:
@@ -1329,6 +1350,8 @@ def train_model(
     streaming_train: bool = True,
     streaming_shuffle_buffer_size: int = 8192,
     streaming_chunk_line_buffer: int = 4096,
+    streaming_exact_sequence_estimate: bool = False,
+    streaming_estimate_bytes_per_token: float = 4.0,
     optimizer_name: str = "adamw",
     target_tokens: Optional[int] = None,
     compute_dtype: str = ComputeDType.FLOAT32.value,
@@ -1411,14 +1434,27 @@ def train_model(
 
     if streaming_train:
         print("Using streaming training dataset loader (low-memory mode).")
-        train_sequence_count = estimate_num_sequences_from_text_file(
-            file_path=text_file_path,
-            tokenizer=tokenizer,
-            seq_length=seq_length,
-            stride=train_stride,
-            chunk_line_buffer=streaming_chunk_line_buffer,
-        )
-        print(f"Estimated training sequences: {train_sequence_count:,}")
+        if streaming_exact_sequence_estimate:
+            train_sequence_count = estimate_num_sequences_from_text_file(
+                file_path=text_file_path,
+                tokenizer=tokenizer,
+                seq_length=seq_length,
+                stride=train_stride,
+                chunk_line_buffer=streaming_chunk_line_buffer,
+            )
+            print(f"Estimated training sequences (exact pre-scan): {train_sequence_count:,}")
+        else:
+            train_sequence_count = estimate_num_sequences_from_file_size(
+                file_path=text_file_path,
+                seq_length=seq_length,
+                stride=train_stride,
+                bytes_per_token=streaming_estimate_bytes_per_token,
+            )
+            print(
+                "Estimated training sequences (fast, size-based): "
+                f"{train_sequence_count:,} "
+                f"(bytes_per_token={streaming_estimate_bytes_per_token:.2f})"
+            )
 
         preview_loader = create_streaming_data_loader(
             file_path=text_file_path,
@@ -3868,6 +3904,24 @@ if __name__ == "__main__":
         default=4096,
         help="How many lines to tokenize per streaming chunk (default: 4096).",
     )
+    parser.add_argument(
+        "--streaming_exact_sequence_estimate",
+        action="store_true",
+        default=False,
+        help=(
+            "Do an exact pre-scan to count streaming train windows. "
+            "Disabled by default to avoid long startup on very large corpora."
+        ),
+    )
+    parser.add_argument(
+        "--streaming_estimate_bytes_per_token",
+        type=float,
+        default=4.0,
+        help=(
+            "Bytes/token used by the fast size-based streaming sequence estimator "
+            "(default: 4.0)."
+        ),
+    )
     args = parser.parse_args()
 
     configure_output(args.print_log_file)
@@ -4067,6 +4121,8 @@ if __name__ == "__main__":
         streaming_train=not args.no_streaming_train,
         streaming_shuffle_buffer_size=args.streaming_shuffle_buffer_size,
         streaming_chunk_line_buffer=args.streaming_chunk_line_buffer,
+        streaming_exact_sequence_estimate=args.streaming_exact_sequence_estimate,
+        streaming_estimate_bytes_per_token=args.streaming_estimate_bytes_per_token,
         optimizer_name=args.optimizer,
         target_tokens=args.target_tokens,
         compute_dtype=args.compute_dtype,
