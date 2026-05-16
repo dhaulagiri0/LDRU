@@ -1425,6 +1425,7 @@ def train_model(
     seq_meta_json: str = None,
     optimizer_name: str = "adamw",
     target_tokens: Optional[int] = None,
+    train_steps_per_epoch: Optional[int] = None,
     compute_dtype: str = ComputeDType.FLOAT32.value,
 ):
     """Main training function."""
@@ -1679,7 +1680,19 @@ def train_model(
     params = model.init(init_key, dummy_batch)
 
     # Initialize optimizer with learning rate scheduling
-    train_steps_per_epoch = max(1, train_sequence_count // batch_size)
+    natural_train_steps_per_epoch = max(1, train_sequence_count // batch_size)
+    requested_train_steps_per_epoch = train_steps_per_epoch
+    if requested_train_steps_per_epoch is not None:
+        if requested_train_steps_per_epoch <= 0:
+            raise ValueError("--train_steps_per_epoch must be > 0 when provided.")
+        train_steps_per_epoch = requested_train_steps_per_epoch
+        print(
+            "Using configured train steps per epoch: "
+            f"{train_steps_per_epoch:,} "
+            f"(natural estimate: {natural_train_steps_per_epoch:,})"
+        )
+    else:
+        train_steps_per_epoch = natural_train_steps_per_epoch
     tokens_per_step = int(batch_size * seq_length)
     target_steps = None
     if target_tokens is not None:
@@ -1868,6 +1881,7 @@ def train_model(
         epoch_accuracies = []
         epoch_perplexities = []
         new_best = False
+        epoch_step_count = 0
 
         # Training batches
         pbar = tqdm.tqdm(data_loader, desc="Training", position=0, leave=True)
@@ -1880,6 +1894,7 @@ def train_model(
                 params, opt_state, step_key, batch
             )
             global_step += 1
+            epoch_step_count += 1
 
             epoch_losses.append(float(loss))
             epoch_accuracies.append(float(metrics["accuracy"]))
@@ -1897,6 +1912,26 @@ def train_model(
             if target_steps is not None and global_step >= target_steps:
                 stop_for_token_budget = True
                 break
+            if (
+                requested_train_steps_per_epoch is not None
+                and epoch_step_count >= requested_train_steps_per_epoch
+            ):
+                break
+
+        if len(epoch_losses) == 0:
+            raise ValueError(
+                "No training batches were produced for this epoch. "
+                "Check batch_size, dataset size, and data loader settings."
+            )
+        if (
+            requested_train_steps_per_epoch is not None
+            and epoch_step_count < requested_train_steps_per_epoch
+            and not stop_for_token_budget
+        ):
+            print(
+                "Warning: Data loader ended before configured steps-per-epoch were reached "
+                f"({epoch_step_count:,}/{requested_train_steps_per_epoch:,})."
+            )
 
         # Print epoch statistics
         avg_loss = np.mean(epoch_losses)
@@ -4014,6 +4049,16 @@ if __name__ == "__main__":
         help="Number of training epochs (default: 100)",
     )
     parser.add_argument(
+        "--train_steps_per_epoch",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on training steps per epoch. "
+            "If provided, each epoch stops after this many train steps "
+            "(or earlier if the data loader is exhausted)."
+        ),
+    )
+    parser.add_argument(
         "--compute_dtype",
         type=str,
         default=ComputeDType.FLOAT32.value,
@@ -4332,6 +4377,7 @@ if __name__ == "__main__":
         seq_meta_json=args.seq_meta_json,
         optimizer_name=args.optimizer,
         target_tokens=args.target_tokens,
+        train_steps_per_epoch=args.train_steps_per_epoch,
         compute_dtype=args.compute_dtype,
     )
 
