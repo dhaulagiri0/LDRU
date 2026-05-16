@@ -1426,6 +1426,8 @@ def train_model(
     optimizer_name: str = "adamw",
     target_tokens: Optional[int] = None,
     train_steps_per_epoch: Optional[int] = None,
+    validation_steps_per_epoch: Optional[int] = None,
+    test_steps_per_epoch: Optional[int] = None,
     compute_dtype: str = ComputeDType.FLOAT32.value,
 ):
     """Main training function."""
@@ -1693,6 +1695,10 @@ def train_model(
         )
     else:
         train_steps_per_epoch = natural_train_steps_per_epoch
+    if validation_steps_per_epoch is not None and validation_steps_per_epoch <= 0:
+        raise ValueError("--validation_steps_per_epoch must be > 0 when provided.")
+    if test_steps_per_epoch is not None and test_steps_per_epoch <= 0:
+        raise ValueError("--test_steps_per_epoch must be > 0 when provided.")
     tokens_per_step = int(batch_size * seq_length)
     target_steps = None
     if target_tokens is not None:
@@ -1965,6 +1971,7 @@ def train_model(
                 dataset_name="Validation",
                 writer=writer if enable_logging else None,
                 compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
+                max_eval_steps=validation_steps_per_epoch,
             )
 
             # Check for improvement and update learning rate if stagnant
@@ -2036,6 +2043,7 @@ def train_model(
                 dataset_name="Test",
                 writer=writer if enable_logging else None,
                 compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
+                max_eval_steps=test_steps_per_epoch,
             )
 
         # Generate text after each epoch to monitor progress
@@ -2114,6 +2122,7 @@ def evaluate_model_on_dataset(
     dataset_name="Validation",
     writer: SummaryWriter = None,
     compiled_eval_step=None,
+    max_eval_steps: Optional[int] = None,
 ):
     rng_key, dataset_key = jax.random.split(rng_key)
     dataset_loss, dataset_metrics = evaluate_model(
@@ -2128,6 +2137,7 @@ def evaluate_model_on_dataset(
         seq2seq=seq2seq,
         eval_model=eval_model,  # Use dropout-free model for evaluation
         compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
+        max_eval_steps=max_eval_steps,
     )
     print(f"{dataset_name} loss: {dataset_loss:.4f}")
     print(f"{dataset_name} accuracy: {dataset_metrics['accuracy']:.4f}")
@@ -2480,6 +2490,7 @@ def evaluate_model(
     seq2seq=True,
     eval_model=None,  # Optional evaluation model with dropout disabled
     compiled_eval_step=None,  # Optional pre-compiled evaluation step for efficiency
+    max_eval_steps: Optional[int] = None,
 ):
     """Evaluate model on validation data."""
     val_loader = create_data_loader(val_data, batch_size, rng_key)
@@ -2511,6 +2522,7 @@ def evaluate_model(
 
     # Wrap validation iterator with tqdm for progress reporting
     pbar = tqdm.tqdm(val_loader, desc="Validation", leave=False)
+    eval_step_count = 0
 
     for batch in pbar:
         rng_key, step_key = jax.random.split(rng_key)
@@ -2535,6 +2547,15 @@ def evaluate_model(
                 "Acc": f"{np.mean(accuracies):.4f}",
                 "PPL": f"{np.mean(perplexities):.1f}",
             }
+        )
+        eval_step_count += 1
+        if max_eval_steps is not None and eval_step_count >= max_eval_steps:
+            break
+
+    if len(losses) == 0:
+        raise ValueError(
+            "No evaluation batches were produced. "
+            "Check evaluation dataset size, batch_size, and step limits."
         )
 
     avg_loss = np.mean(losses)
@@ -4059,6 +4080,23 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--validation_steps_per_epoch",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on validation steps per epoch. "
+            "If provided, validation averages are computed over at most this many batches."
+        ),
+    )
+    parser.add_argument(
+        "--test_steps_per_epoch",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on test-evaluation steps per epoch (when test is run on new best)."
+        ),
+    )
+    parser.add_argument(
         "--compute_dtype",
         type=str,
         default=ComputeDType.FLOAT32.value,
@@ -4378,6 +4416,8 @@ if __name__ == "__main__":
         optimizer_name=args.optimizer,
         target_tokens=args.target_tokens,
         train_steps_per_epoch=args.train_steps_per_epoch,
+        validation_steps_per_epoch=args.validation_steps_per_epoch,
+        test_steps_per_epoch=args.test_steps_per_epoch,
         compute_dtype=args.compute_dtype,
     )
 
