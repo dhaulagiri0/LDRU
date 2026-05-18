@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Pre-tokenize text corpora into fixed-length sequence binary files.
+Pre-tokenize text corpora into contiguous token-stream binary files.
 
 Outputs:
-- <out_dir>/<basename>_<split>_seq.bin     (flat binary rows of length seq_length)
-- <out_dir>/<basename>_meta.json           (shape/dtype/tokenizer metadata)
+- <out_dir>/<basename>_<split>.bin         (flat token stream)
+- <out_dir>/<basename>_meta.json           (dtype/tokenizer/split metadata)
+
+Sequence windowing is intentionally deferred to the training script.
 
 Supported tokenizers:
 - tiktoken (GPT-2 by default)
@@ -18,6 +20,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from argparse import SUPPRESS
 from typing import Optional
 
 import numpy as np
@@ -89,7 +92,7 @@ class _SentencePieceTokenizer(_BaseTokenizer):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Pre-tokenize text files into fixed-length sequence binaries."
+        description="Pre-tokenize text files into contiguous token-stream binaries."
     )
     parser.add_argument("--train_text", type=str, required=True, help="Train text path.")
     parser.add_argument("--val_text", type=str, default=None, help="Val text path.")
@@ -128,22 +131,13 @@ def parse_args() -> argparse.Namespace:
         help="SentencePiece model prefix when training.",
     )
     parser.add_argument(
-        "--seq_length",
-        type=int,
-        required=True,
-        help="Sequence length to write per training example.",
-    )
-    parser.add_argument(
-        "--stride",
-        type=int,
-        default=None,
-        help="Sliding stride between sequences (default: seq_length//2).",
-    )
-    parser.add_argument(
         "--append_eos",
         action="store_true",
-        help="Append EOS/EOT token after each line/document if available.",
+        help="Append EOS/EOT token after each input line/document if available.",
     )
+    # Deprecated flags kept for backward compatibility with older launch scripts.
+    parser.add_argument("--seq_length", type=int, default=None, help=SUPPRESS)
+    parser.add_argument("--stride", type=int, default=None, help=SUPPRESS)
     parser.add_argument(
         "--dtype",
         type=str,
@@ -244,12 +238,10 @@ def _build_tokenizer(args: argparse.Namespace, out_dir: Path) -> tuple[_BaseToke
     return tok, info
 
 
-def _write_split_sequences(
+def _write_split_token_stream(
     text_path: Path,
     out_bin: Path,
     tokenizer: _BaseTokenizer,
-    seq_length: int,
-    stride: int,
     out_dtype: np.dtype,
     append_eos: bool,
     eos_token_id: Optional[int],
@@ -260,29 +252,9 @@ def _write_split_sequences(
         raise FileNotFoundError(f"Missing input text file: {text_path}")
 
     out_bin.parent.mkdir(parents=True, exist_ok=True)
-    count_sequences = 0
+    count_lines = 0
     count_tokens = 0
     max_token_id = -1
-
-    token_buffer: list[int] = []
-    window_start = 0
-
-    def _flush_windows(writer):
-        nonlocal window_start, token_buffer, count_sequences, max_token_id
-        while window_start + seq_length <= len(token_buffer):
-            window = token_buffer[window_start : window_start + seq_length]
-            arr = np.asarray(window, dtype=out_dtype)
-            arr.tofile(writer)
-            count_sequences += 1
-            if window:
-                m = max(window)
-                if m > max_token_id:
-                    max_token_id = m
-            window_start += stride
-
-        if window_start >= max(seq_length, stride * 8):
-            token_buffer = token_buffer[window_start:]
-            window_start = 0
 
     with open(text_path, "r", encoding="utf-8", errors="replace") as f_in, open(
         out_bin, "wb"
@@ -293,38 +265,40 @@ def _write_split_sequences(
             ids = tokenizer.encode(line)
             if append_eos and eos_token_id is not None:
                 ids.append(eos_token_id)
-            token_buffer.extend(ids)
+            if ids:
+                arr = np.asarray(ids, dtype=out_dtype)
+                arr.tofile(f_out)
+                local_max = int(np.max(arr))
+                if local_max > max_token_id:
+                    max_token_id = local_max
             count_tokens += len(ids)
-            _flush_windows(f_out)
+            count_lines += 1
             if progress_every > 0 and (i % progress_every == 0):
                 print(
-                    f"  lines={i:,} tokens={count_tokens:,} sequences={count_sequences:,}",
+                    f"  lines={i:,} tokens={count_tokens:,}",
                     flush=True,
                 )
 
-    if count_sequences == 0:
-        print(f"[warn] no sequences written for split file: {text_path}")
+    if count_tokens == 0:
+        print(f"[warn] no tokens written for split file: {text_path}")
 
     return {
         "source_text": str(text_path),
         "out_bin": str(out_bin),
-        "num_sequences": int(count_sequences),
-        "seq_length": int(seq_length),
-        "stride": int(stride),
+        "num_lines": int(count_lines),
+        "num_tokens": int(count_tokens),
         "dtype": np.dtype(out_dtype).name,
-        "total_tokens_streamed": int(count_tokens),
         "max_token_id_seen": int(max_token_id),
     }
 
 
 def main():
     args = parse_args()
-    if args.seq_length <= 1:
-        raise ValueError("--seq_length must be > 1")
-    stride = args.stride if args.stride is not None else max(1, args.seq_length // 2)
-    if stride <= 0:
-        raise ValueError("--stride must be > 0")
-
+    if args.seq_length is not None or args.stride is not None:
+        print(
+            "[warn] --seq_length/--stride are ignored: this script now writes "
+            "flat token streams and defers sequence windowing to training."
+        )
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -342,14 +316,12 @@ def main():
     for split_name, split_path in splits.items():
         if not split_path:
             continue
-        out_bin = out_dir / f"{args.basename}_{split_name}_seq.bin"
-        print(f"[{split_name}] writing sequences -> {out_bin}")
-        split_meta[split_name] = _write_split_sequences(
+        out_bin = out_dir / f"{args.basename}_{split_name}.bin"
+        print(f"[{split_name}] writing token stream -> {out_bin}")
+        split_meta[split_name] = _write_split_token_stream(
             text_path=Path(split_path),
             out_bin=out_bin,
             tokenizer=tokenizer,
-            seq_length=args.seq_length,
-            stride=stride,
             out_dtype=out_dtype,
             append_eos=args.append_eos,
             eos_token_id=tok_info.eos_token_id,
@@ -357,11 +329,12 @@ def main():
             progress_every=args.progress_every,
         )
         print(
-            f"[{split_name}] sequences={split_meta[split_name]['num_sequences']:,} "
+            f"[{split_name}] tokens={split_meta[split_name]['num_tokens']:,} "
             f"dtype={split_meta[split_name]['dtype']}"
         )
 
     meta = {
+        "format": "token_stream",
         "tokenizer": {
             "type": tok_info.tokenizer_type,
             "name_or_path": tok_info.tokenizer_name_or_path,
@@ -369,10 +342,9 @@ def main():
             "eos_token_id": tok_info.eos_token_id,
             "append_eos": bool(args.append_eos),
         },
-        "sequence_config": {
-            "seq_length": int(args.seq_length),
-            "stride": int(stride),
+        "token_stream_config": {
             "dtype": np.dtype(out_dtype).name,
+            "append_eos_per_line": bool(args.append_eos),
         },
         "splits": split_meta,
     }

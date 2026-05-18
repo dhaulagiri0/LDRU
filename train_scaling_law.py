@@ -100,6 +100,50 @@ def parse_args() -> tuple[argparse.Namespace, List[str]]:
         help="Optional JSON path to save scaling metadata for this run.",
     )
     parser.add_argument(
+        "--train_seq_bin",
+        type=str,
+        default=None,
+        help="Optional pretokenized train sequence binary path.",
+    )
+    parser.add_argument(
+        "--val_seq_bin",
+        type=str,
+        default=None,
+        help="Optional pretokenized validation sequence binary path.",
+    )
+    parser.add_argument(
+        "--test_seq_bin",
+        type=str,
+        default=None,
+        help="Optional pretokenized test sequence binary path.",
+    )
+    parser.add_argument(
+        "--seq_bin_dtype",
+        type=str,
+        default="uint16",
+        choices=["uint16", "uint32", "int32"],
+        help="Dtype for pretokenized sequence binaries.",
+    )
+    parser.add_argument(
+        "--seq_bin_length",
+        type=int,
+        default=None,
+        help="Sequence length stored in pretokenized binaries.",
+    )
+    parser.add_argument(
+        "--seq_bin_format",
+        type=str,
+        default="auto",
+        choices=["auto", "sequence", "token_stream"],
+        help="Format for pretokenized binaries.",
+    )
+    parser.add_argument(
+        "--seq_meta_json",
+        type=str,
+        default=None,
+        help="Optional metadata JSON generated during pretokenization.",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Print computed command and exit without launching training.",
@@ -157,6 +201,12 @@ def main():
         raise ValueError("--token_scale_factor must be > 0")
     if args.embedding_count_multiplier <= 0:
         raise ValueError("--embedding_count_multiplier must be > 0")
+    if (args.val_seq_bin or args.test_seq_bin) and not args.train_seq_bin:
+        raise ValueError(
+            "--val_seq_bin/--test_seq_bin require --train_seq_bin."
+        )
+    if args.seq_bin_length is not None and args.seq_bin_length <= 1:
+        raise ValueError("--seq_bin_length must be > 1 when provided.")
 
     train_script_path = Path(args.train_script)
     if not train_script_path.exists():
@@ -210,8 +260,22 @@ def main():
         args.ablation_combine_mode,
         "--target_tokens",
         str(target_tokens),
-        *passthrough,
     ]
+    if args.train_seq_bin is not None:
+        cmd.extend(["--train_seq_bin", args.train_seq_bin])
+    if args.val_seq_bin is not None:
+        cmd.extend(["--val_seq_bin", args.val_seq_bin])
+    if args.test_seq_bin is not None:
+        cmd.extend(["--test_seq_bin", args.test_seq_bin])
+    if args.seq_bin_dtype is not None:
+        cmd.extend(["--seq_bin_dtype", args.seq_bin_dtype])
+    if args.seq_bin_length is not None:
+        cmd.extend(["--seq_bin_length", str(args.seq_bin_length)])
+    if args.seq_bin_format is not None:
+        cmd.extend(["--seq_bin_format", args.seq_bin_format])
+    if args.seq_meta_json is not None:
+        cmd.extend(["--seq_meta_json", args.seq_meta_json])
+    cmd.extend(passthrough)
 
     metadata = {
         "hidden_dim": args.hidden_dim,
@@ -232,6 +296,13 @@ def main():
         "non_embedding_params_estimate": non_embedding_params,
         "basis_params": basis_params,
         "target_tokens": target_tokens,
+        "train_seq_bin": args.train_seq_bin,
+        "val_seq_bin": args.val_seq_bin,
+        "test_seq_bin": args.test_seq_bin,
+        "seq_bin_dtype": args.seq_bin_dtype,
+        "seq_bin_length": args.seq_bin_length,
+        "seq_bin_format": args.seq_bin_format,
+        "seq_meta_json": args.seq_meta_json,
         "trainer_command": cmd,
     }
 

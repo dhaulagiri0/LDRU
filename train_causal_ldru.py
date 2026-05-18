@@ -948,6 +948,58 @@ def load_pretokenized_sequences(
     )
 
 
+def load_pretokenized_token_stream(file_path: str, dtype_name: str) -> np.memmap:
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Pretokenized token file not found: {file_path}")
+
+    dtype = resolve_sequence_bin_dtype(dtype_name)
+    itemsize = np.dtype(dtype).itemsize
+    file_size = os.path.getsize(file_path)
+
+    if file_size == 0:
+        raise ValueError(f"Pretokenized token file is empty: {file_path}")
+    if file_size % itemsize != 0:
+        raise ValueError(
+            f"File size ({file_size}) is not divisible by dtype itemsize ({itemsize}) "
+            f"for {file_path}."
+        )
+
+    total_tokens = file_size // itemsize
+    if total_tokens == 0:
+        raise ValueError(f"No tokens found in {file_path}.")
+
+    return np.memmap(file_path, dtype=dtype, mode="r", shape=(total_tokens,))
+
+
+def token_stream_to_sequence_view(
+    token_stream: np.ndarray, seq_length: int, stride: int
+) -> np.ndarray:
+    if seq_length <= 0:
+        raise ValueError("seq_length must be > 0")
+    if stride <= 0:
+        raise ValueError("stride must be > 0")
+
+    total_tokens = int(token_stream.shape[0])
+    if total_tokens < seq_length:
+        raise ValueError(
+            f"Token stream has only {total_tokens} tokens, fewer than seq_length={seq_length}."
+        )
+
+    num_sequences = 1 + (total_tokens - seq_length) // stride
+    if num_sequences <= 0:
+        raise ValueError(
+            f"No full windows can be formed with seq_length={seq_length}, stride={stride}."
+        )
+
+    itemsize = token_stream.dtype.itemsize
+    return np.lib.stride_tricks.as_strided(
+        token_stream,
+        shape=(num_sequences, seq_length),
+        strides=(stride * itemsize, itemsize),
+        writeable=False,
+    )
+
+
 def _pop_random_batch(
     shuffle_buffer: List[np.ndarray], batch_size: int, rng: np.random.Generator
 ) -> np.ndarray:
@@ -1422,6 +1474,7 @@ def train_model(
     test_seq_bin_path: str = None,
     seq_bin_dtype: str = "uint16",
     seq_bin_length: Optional[int] = None,
+    seq_bin_format: str = "auto",
     seq_meta_json: str = None,
     optimizer_name: str = "adamw",
     target_tokens: Optional[int] = None,
@@ -1482,14 +1535,25 @@ def train_model(
 
     tokenizer = None
     if use_pretokenized_bins:
-        print("Using pretokenized sequence binaries for training data.")
+        print("Using pretokenized binary files for training data.")
+        selected_seq_bin_format = seq_bin_format
         if seq_meta_json:
             if not os.path.exists(seq_meta_json):
                 raise FileNotFoundError(f"--seq_meta_json not found: {seq_meta_json}")
             with open(seq_meta_json, "r", encoding="utf-8") as f:
                 seq_meta = json.load(f)
+            meta_format = seq_meta.get("format")
+            if selected_seq_bin_format == "auto" and meta_format in (
+                "sequence",
+                "token_stream",
+            ):
+                selected_seq_bin_format = meta_format
             meta_seq_len = seq_meta.get("sequence_config", {}).get("seq_length")
-            if seq_bin_length is None and meta_seq_len is not None:
+            if (
+                selected_seq_bin_format in ("auto", "sequence")
+                and seq_bin_length is None
+                and meta_seq_len is not None
+            ):
                 seq_bin_length = int(meta_seq_len)
             meta_tok = seq_meta.get("tokenizer", {})
             if tokenizer_path is None and meta_tok.get("name_or_path"):
@@ -1503,11 +1567,25 @@ def train_model(
             if meta_vocab is not None:
                 config.vocab_size = int(meta_vocab)
 
-        seq_bin_length = seq_bin_length if seq_bin_length is not None else seq_length
-        if seq_bin_length != seq_length:
+        if selected_seq_bin_format == "auto":
+            selected_seq_bin_format = "sequence"
+        if selected_seq_bin_format not in ("sequence", "token_stream"):
             raise ValueError(
-                f"--seq_bin_length ({seq_bin_length}) must match training seq_length "
-                f"({seq_length})."
+                f"Unsupported --seq_bin_format '{selected_seq_bin_format}'. "
+                "Expected one of: auto, sequence, token_stream."
+            )
+
+        if selected_seq_bin_format == "sequence":
+            seq_bin_length = seq_bin_length if seq_bin_length is not None else seq_length
+            if seq_bin_length != seq_length:
+                raise ValueError(
+                    f"--seq_bin_length ({seq_bin_length}) must match training seq_length "
+                    f"({seq_length})."
+                )
+        elif seq_bin_length is not None:
+            print(
+                "Ignoring --seq_bin_length because --seq_bin_format token_stream "
+                "builds windows at runtime."
             )
 
         if tokenizer_type == TokenizerType.TIKTOKEN_GPT2:
@@ -1559,23 +1637,60 @@ def train_model(
         streaming_train = False
 
     if use_pretokenized_bins:
-        train_data = load_pretokenized_sequences(
-            train_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
-        )
+        if selected_seq_bin_format == "token_stream":
+            train_tokens = load_pretokenized_token_stream(
+                train_seq_bin_path, dtype_name=seq_bin_dtype
+            )
+            train_data = token_stream_to_sequence_view(
+                train_tokens, seq_length=seq_length, stride=train_stride
+            )
+            print(
+                f"Loaded train token stream: {len(train_tokens):,} tokens "
+                f"-> {len(train_data):,} windows (len={seq_length}, stride={train_stride}) "
+                f"from {train_seq_bin_path}"
+            )
+        else:
+            train_data = load_pretokenized_sequences(
+                train_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
+            )
+            print(f"Loaded train sequences: {len(train_data):,} from {train_seq_bin_path}")
         train_sequence_count = len(train_data)
-        print(f"Loaded train sequences: {train_sequence_count:,} from {train_seq_bin_path}")
 
         if val_seq_bin_path:
-            val_data = load_pretokenized_sequences(
-                val_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
-            )
-            print(f"Loaded val sequences: {len(val_data):,} from {val_seq_bin_path}")
+            if selected_seq_bin_format == "token_stream":
+                val_tokens = load_pretokenized_token_stream(
+                    val_seq_bin_path, dtype_name=seq_bin_dtype
+                )
+                val_data = token_stream_to_sequence_view(
+                    val_tokens, seq_length=seq_length, stride=train_stride
+                )
+                print(
+                    f"Loaded val token stream: {len(val_tokens):,} tokens "
+                    f"-> {len(val_data):,} windows from {val_seq_bin_path}"
+                )
+            else:
+                val_data = load_pretokenized_sequences(
+                    val_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
+                )
+                print(f"Loaded val sequences: {len(val_data):,} from {val_seq_bin_path}")
 
         if test_seq_bin_path:
-            test_data = load_pretokenized_sequences(
-                test_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
-            )
-            print(f"Loaded test sequences: {len(test_data):,} from {test_seq_bin_path}")
+            if selected_seq_bin_format == "token_stream":
+                test_tokens = load_pretokenized_token_stream(
+                    test_seq_bin_path, dtype_name=seq_bin_dtype
+                )
+                test_data = token_stream_to_sequence_view(
+                    test_tokens, seq_length=seq_length, stride=train_stride
+                )
+                print(
+                    f"Loaded test token stream: {len(test_tokens):,} tokens "
+                    f"-> {len(test_data):,} windows from {test_seq_bin_path}"
+                )
+            else:
+                test_data = load_pretokenized_sequences(
+                    test_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
+                )
+                print(f"Loaded test sequences: {len(test_data):,} from {test_seq_bin_path}")
 
         preview_batch = np.asarray(train_data[:batch_size])
         if preview_batch.shape[0] == 0:
@@ -3990,6 +4105,18 @@ if __name__ == "__main__":
         help="Sequence length stored in pretokenized binaries (must match --max_seq_len).",
     )
     parser.add_argument(
+        "--seq_bin_format",
+        type=str,
+        default="auto",
+        choices=["auto", "sequence", "token_stream"],
+        help=(
+            "Binary format for --train_seq_bin/--val_seq_bin/--test_seq_bin. "
+            "'sequence' expects pre-windowed rows; "
+            "'token_stream' expects a flat token stream and windows it at runtime; "
+            "'auto' infers from --seq_meta_json format when available."
+        ),
+    )
+    parser.add_argument(
         "--seq_meta_json",
         type=str,
         default=None,
@@ -4412,6 +4539,7 @@ if __name__ == "__main__":
         test_seq_bin_path=args.test_seq_bin,
         seq_bin_dtype=args.seq_bin_dtype,
         seq_bin_length=args.seq_bin_length,
+        seq_bin_format=args.seq_bin_format,
         seq_meta_json=args.seq_meta_json,
         optimizer_name=args.optimizer,
         target_tokens=args.target_tokens,
