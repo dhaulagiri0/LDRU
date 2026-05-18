@@ -1379,15 +1379,20 @@ def create_datasets_for_training(
     test_text_file_path: str = None,
     tokenizer: BaseTokenizer = None,
     seq_length: int = 128,
+    stride: Optional[int] = None,
 ):
     train_data, val_data, test_data = None, None, None
+    if stride is None:
+        stride = max(1, seq_length // 2)
+    if stride <= 0:
+        raise ValueError("stride must be > 0")
     # Create dataset
     print("Creating training dataset from text file...")
 
     train_data, val_data = create_dataset_from_text_file(
         training_text_file_path,
         seq_length=seq_length,
-        stride=seq_length // 2,  # sliding window
+        stride=stride,
         train_split=1.0 if validation_text_file_path else 0.9,
         tokenizer=tokenizer,
     )
@@ -1402,7 +1407,7 @@ def create_datasets_for_training(
         val_data, _ = create_dataset_from_text_file(
             validation_text_file_path,
             seq_length=seq_length,
-            stride=seq_length // 2,  # sliding window
+            stride=stride,
             train_split=1.0,  # Use all data for validation
             tokenizer=tokenizer,  # Use same tokenizer to ensure consistent vocab
         )
@@ -1413,7 +1418,7 @@ def create_datasets_for_training(
         test_data, _ = create_dataset_from_text_file(
             test_text_file_path,
             seq_length=seq_length,
-            stride=seq_length // 2,  # sliding window
+            stride=stride,
             train_split=1.0,  # Use all data for testing
             tokenizer=tokenizer,  # Use same tokenizer to ensure consistent vocab
         )
@@ -1477,6 +1482,7 @@ def train_model(
     seq_meta_json: str = None,
     optimizer_name: str = "adamw",
     target_tokens: Optional[int] = None,
+    train_stride: Optional[int] = None,
     train_steps_per_epoch: Optional[int] = None,
     validation_steps_per_epoch: Optional[int] = None,
     test_steps_per_epoch: Optional[int] = None,
@@ -1620,7 +1626,10 @@ def train_model(
         config.vocab_size = vocab_size
 
     train_data, val_data, test_data = None, None, None
-    train_stride = max(1, seq_length // 2)
+    train_stride = max(1, seq_length // 2) if train_stride is None else train_stride
+    if train_stride <= 0:
+        raise ValueError("--train_stride must be > 0 when provided.")
+    print(f"Training stride: {train_stride}")
 
     if use_pretokenized_bins and streaming_train:
         print(
@@ -1769,6 +1778,7 @@ def train_model(
             test_text_file_path,
             tokenizer,
             seq_length,
+            train_stride,
         )
         train_sequence_count = len(train_data)
         preview_batch = np.asarray(train_data[:batch_size])
@@ -2256,6 +2266,8 @@ def evaluate_model_on_dataset(
     print(f"{dataset_name} loss: {dataset_loss:.4f}")
     print(f"{dataset_name} accuracy: {dataset_metrics['accuracy']:.4f}")
     print(f"{dataset_name} perplexity: {dataset_metrics['perplexity']:.4f}")
+    if "last_token_perplexity" in dataset_metrics:
+        print(f"{dataset_name} last-token perplexity: {dataset_metrics['last_token_perplexity']:.4f}")
 
     # Report per-position perplexity for seq2seq models
     if seq2seq and "per_position_perplexity" in dataset_metrics:
@@ -2284,6 +2296,12 @@ def evaluate_model_on_dataset(
             dataset_metrics["perplexity"],
             epoch + 1,
         )
+        if "last_token_perplexity" in dataset_metrics:
+            writer.add_scalar(
+                "Perplexity/{}_LastToken".format(dataset_name),
+                dataset_metrics["last_token_perplexity"],
+                epoch + 1,
+            )
 
         # Log per-position metrics if available
         if seq2seq and "per_position_perplexity" in dataset_metrics:
@@ -2683,6 +2701,8 @@ def evaluate_model(
 
         avg_metrics["per_position_perplexity"] = avg_per_position_perplexity
         avg_metrics["per_position_loss"] = avg_per_position_loss
+        avg_metrics["last_token_perplexity"] = float(avg_per_position_perplexity[-1])
+        avg_metrics["last_token_loss"] = float(avg_per_position_loss[-1])
 
         # Additional summary statistics
         avg_metrics["min_position_perplexity"] = np.min(avg_per_position_perplexity)
@@ -4302,6 +4322,15 @@ if __name__ == "__main__":
         help="How many lines to tokenize per streaming chunk (default: 4096).",
     )
     parser.add_argument(
+        "--train_stride",
+        type=int,
+        default=None,
+        help=(
+            "Stride for training/eval sequence windows. "
+            "Default uses half-overlap: max_seq_len//2."
+        ),
+    )
+    parser.add_argument(
         "--streaming_exact_sequence_estimate",
         action="store_true",
         default=False,
@@ -4542,6 +4571,7 @@ if __name__ == "__main__":
         seq_meta_json=args.seq_meta_json,
         optimizer_name=args.optimizer,
         target_tokens=args.target_tokens,
+        train_stride=args.train_stride,
         train_steps_per_epoch=args.train_steps_per_epoch,
         validation_steps_per_epoch=args.validation_steps_per_epoch,
         test_steps_per_epoch=args.test_steps_per_epoch,
