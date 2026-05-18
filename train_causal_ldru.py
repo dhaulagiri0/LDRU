@@ -197,7 +197,6 @@ class LDRUExperimenstConfig:
     use_embeddings: bool = True
     share_embeddings: bool = False
     chunk_size: Optional[int] = None  # Use full attention
-    widening_factor: int = 16
     causal_masking: bool = True  # Critical for causal language modeling
 
     # General training hyperparameters
