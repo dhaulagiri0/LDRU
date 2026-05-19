@@ -700,55 +700,58 @@ def lstm_last_position_loss(params, model, rng_key, token_ids):
 
 def ldru_seq2seq_loss(params, model, rng_key, token_ids, lambda_l2=0.0):
     """
-    Sequence-to-sequence loss for LDRU with causal masking.
-    Now that LDRU outputs at all positions, we can predict next tokens
-    at every position while respecting causal constraints.
-    The loss ignores the first position since it has no previous context, and focuses on predicting
+    Sequence-to-sequence autoregressive LM loss for LDRU.
+    This mirrors the standard nanoGPT-style objective (no clipping/fallback shaping).
     """
-    # Standard autoregressive setup
-    input_token_ids = token_ids[:, :-1]  # [B, L-1] - input context
-    targets = token_ids[:, 1:]  # [B, L-1] - targets (next tokens)
+    input_token_ids = token_ids[:, :-1]  # [B, L-1]
+    targets = token_ids[:, 1:]  # [B, L-1]
 
-    # Forward pass - your model returns [B, L-1, vocab_size]
     logits = model.apply(params, rng_key, input_token_ids)  # [B, L-1, V]
-
-    # Apply stability improvements
-    logits = jnp.clip(logits, -10, 10)  # Clip extreme logits
-
-    # Compute cross-entropy loss across all positions except the first one (which has no context)
-    log_probs = jax.nn.log_softmax(logits, axis=-1)  # [B, L-1, V]
-
-    # Get target probabilities for each position
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
     target_log_probs = jnp.take_along_axis(
         log_probs, targets[..., None], axis=-1
-    ).squeeze(
-        -1
-    )  # [B, L-1]
+    ).squeeze(-1)  # [B, L-1]
 
-    # Clip target log probs to prevent numerical issues
-    target_log_probs = jnp.clip(target_log_probs, -10, 0)
-
-    # Mean loss over all positions and batch
     loss = -jnp.mean(target_log_probs)
     loss += lambda_l2 * compute_l2_loss(params)
 
-    # Apply loss clipping for stability
-    loss = jnp.where(jnp.isnan(loss), jnp.array(10.0), loss)
-    loss = jnp.clip(loss, 0, 20)
-
-    # Compute accuracy
     predictions = jnp.argmax(logits, axis=-1)
     accuracy = jnp.mean(predictions == targets)
 
-    # Compute per-position perplexity for seq2seq models
-    per_position_loss = -jnp.mean(
-        target_log_probs, axis=0
-    )  # [L-1] - average over batch
-    per_position_perplexity = jnp.exp(jnp.clip(per_position_loss, 0, 10))  # [L-1]
+    per_position_loss = -jnp.mean(target_log_probs, axis=0)
+    per_position_perplexity = jnp.exp(per_position_loss)
 
     return loss, {
         "accuracy": accuracy,
-        "perplexity": jnp.exp(jnp.clip(loss, 0, 10)),
+        "perplexity": jnp.exp(loss),
+        "per_position_perplexity": per_position_perplexity,
+        "per_position_loss": per_position_loss,
+    }
+
+
+def transformer_seq2seq_loss(params, model, rng_key, token_ids, lambda_l2=0.0):
+    """Standard autoregressive seq2seq LM loss (nanoGPT-style, no clipping)."""
+    input_token_ids = token_ids[:, :-1]  # [B, L-1]
+    targets = token_ids[:, 1:]  # [B, L-1]
+
+    logits = model.apply(params, rng_key, input_token_ids)  # [B, L-1, V]
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    target_log_probs = jnp.take_along_axis(
+        log_probs, targets[..., None], axis=-1
+    ).squeeze(-1)  # [B, L-1]
+
+    loss = -jnp.mean(target_log_probs)
+    loss += lambda_l2 * compute_l2_loss(params)
+
+    predictions = jnp.argmax(logits, axis=-1)
+    accuracy = jnp.mean(predictions == targets)
+
+    per_position_loss = -jnp.mean(target_log_probs, axis=0)
+    per_position_perplexity = jnp.exp(per_position_loss)
+
+    return loss, {
+        "accuracy": accuracy,
+        "perplexity": jnp.exp(loss),
         "per_position_perplexity": per_position_perplexity,
         "per_position_loss": per_position_loss,
     }
@@ -1006,6 +1009,39 @@ def token_stream_to_sequence_view(
     )
 
 
+def create_nanogpt_token_stream_loader(
+    token_stream: np.ndarray,
+    seq_length: int,
+    batch_size: int,
+    rng_key,
+    num_batches: int,
+) -> Iterator[np.ndarray]:
+    """nanoGPT-style random contiguous token batches sampled with replacement."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+    if seq_length <= 0:
+        raise ValueError("seq_length must be > 0")
+    if num_batches <= 0:
+        raise ValueError("num_batches must be > 0")
+
+    total_tokens = int(token_stream.shape[0])
+    max_start = total_tokens - seq_length
+    if max_start <= 0:
+        raise ValueError(
+            f"Token stream has {total_tokens} tokens, cannot sample seq_length={seq_length}."
+        )
+
+    seed = int(jax.random.randint(rng_key, shape=(), minval=0, maxval=2**31 - 1))
+    np_rng = np.random.default_rng(seed)
+    for _ in range(num_batches):
+        starts = np_rng.integers(0, max_start, size=batch_size)
+        batch = np.stack(
+            [np.asarray(token_stream[s : s + seq_length], dtype=np.int32) for s in starts],
+            axis=0,
+        )
+        yield batch
+
+
 def _pop_random_batch(
     shuffle_buffer: List[np.ndarray], batch_size: int, rng: np.random.Generator
 ) -> np.ndarray:
@@ -1080,7 +1116,7 @@ def make_train_step(
         if use_transformer:
             # Use dedicated transformer loss function for proper autoregressive LM
             if seq2seq:
-                loss_fn = lambda p: ldru_seq2seq_loss(
+                loss_fn = lambda p: transformer_seq2seq_loss(
                     p, model, rng_key, batch, lambda_l2
                 )
             else:
@@ -1088,7 +1124,7 @@ def make_train_step(
         elif use_transformer_ldru:
             # Transformer+LDRU hybrid: use LDRU loss functions since LDRU provides causal modeling
             if seq2seq:
-                loss_fn = lambda p: ldru_seq2seq_loss(
+                loss_fn = lambda p: transformer_seq2seq_loss(
                     p, model, rng_key, batch, lambda_l2
                 )
             else:
@@ -1096,7 +1132,7 @@ def make_train_step(
         elif use_ldru_transformer:
             # LDRU+Transformer hybrid: use transformer loss functions since transformer provides final output
             if seq2seq:
-                loss_fn = lambda p: ldru_seq2seq_loss(
+                loss_fn = lambda p: transformer_seq2seq_loss(
                     p, model, rng_key, batch, lambda_l2
                 )
             else:
@@ -1185,6 +1221,7 @@ def create_transformer_model(config: LDRUExperimenstConfig):
         ),
         widening_factor=config.widening_factor,
         causal_masking=config.causal_masking,
+        share_weight=False,
         pre_norm_gelu_block=config.transformer_prenorm_gelu_block,
     )
     # Print config
@@ -1201,6 +1238,8 @@ def create_transformer_model(config: LDRUExperimenstConfig):
                 init=emb_init,
             )
             embedded_inputs = jnp.take(token_embedding, token_ids, axis=0)
+            # Match TransformerEncoder embedding path scale when use_embeddings=True.
+            embedded_inputs = embedded_inputs * jnp.sqrt(config.embedding_dim)
             encoded_output = transformer_encoder(embedded_inputs)  # [B, L, emb]
         else:
             # Convert token_ids to one-hot encoding as expected by the transformer
@@ -1272,6 +1311,7 @@ def create_ldru_transformer_model(config: LDRUExperimenstConfig):
             ),
             widening_factor=4,
             causal_masking=True,  # Critical for causal language modeling
+            share_weight=False,
             pre_norm_gelu_block=config.transformer_prenorm_gelu_block,
         )
 
@@ -1309,6 +1349,7 @@ def create_transformer_ldru_model(config: LDRUExperimenstConfig):
             ),
             widening_factor=4,  # Reduced widening factor
             causal_masking=True,  # Enable causal masking for proper language modeling
+            share_weight=False,
             pre_norm_gelu_block=config.transformer_prenorm_gelu_block,
         )
 
@@ -1463,7 +1504,7 @@ def make_eval_step(
     seq2seq=True,
 ):
     if use_transformer or use_transformer_ldru or use_ldru_transformer:
-        loss_fn = ldru_seq2seq_loss if seq2seq else next_token_loss
+        loss_fn = transformer_seq2seq_loss if seq2seq else next_token_loss
     elif use_lstm:
         loss_fn = lstm_next_token_loss if seq2seq else lstm_last_position_loss
     else:
@@ -1510,7 +1551,9 @@ def train_model(
     optimizer_name: str = "adamw",
     target_tokens: Optional[int] = None,
     train_stride: Optional[int] = None,
+    nanogpt_batching: bool = False,
     nanogpt_ppl_metric: bool = False,
+    warmup_steps: int = 0,
     train_steps_per_epoch: Optional[int] = None,
     validation_steps_per_epoch: Optional[int] = None,
     test_steps_per_epoch: Optional[int] = None,
@@ -1666,6 +1709,14 @@ def train_model(
         )
         streaming_train = False
 
+    if nanogpt_batching and not (
+        use_pretokenized_bins and selected_seq_bin_format == "token_stream"
+    ):
+        raise ValueError(
+            "--nanogpt_batching currently requires token-stream pretokenized input "
+            "(--train_seq_bin with --seq_bin_format token_stream)."
+        )
+
     if streaming_train and validation_text_file_path is None:
         print(
             "Streaming training needs an explicit validation file. Falling back to in-memory train split."
@@ -1677,33 +1728,50 @@ def train_model(
             train_tokens = load_pretokenized_token_stream(
                 train_seq_bin_path, dtype_name=seq_bin_dtype
             )
-            train_data = token_stream_to_sequence_view(
-                train_tokens, seq_length=seq_length, stride=train_stride
-            )
-            print(
-                f"Loaded train token stream: {len(train_tokens):,} tokens "
-                f"-> {len(train_data):,} windows (len={seq_length}, stride={train_stride}) "
-                f"from {train_seq_bin_path}"
-            )
+            if nanogpt_batching:
+                train_data = train_tokens
+                train_sequence_count = max(1, len(train_tokens) - seq_length)
+                print(
+                    f"Loaded train token stream: {len(train_tokens):,} tokens "
+                    f"(nanoGPT-style random-offset batching, len={seq_length}) "
+                    f"from {train_seq_bin_path}"
+                )
+            else:
+                train_data = token_stream_to_sequence_view(
+                    train_tokens, seq_length=seq_length, stride=train_stride
+                )
+                train_sequence_count = len(train_data)
+                print(
+                    f"Loaded train token stream: {len(train_tokens):,} tokens "
+                    f"-> {len(train_data):,} windows (len={seq_length}, stride={train_stride}) "
+                    f"from {train_seq_bin_path}"
+                )
         else:
             train_data = load_pretokenized_sequences(
                 train_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
             )
+            train_sequence_count = len(train_data)
             print(f"Loaded train sequences: {len(train_data):,} from {train_seq_bin_path}")
-        train_sequence_count = len(train_data)
 
         if val_seq_bin_path:
             if selected_seq_bin_format == "token_stream":
                 val_tokens = load_pretokenized_token_stream(
                     val_seq_bin_path, dtype_name=seq_bin_dtype
                 )
-                val_data = token_stream_to_sequence_view(
-                    val_tokens, seq_length=seq_length, stride=train_stride
-                )
-                print(
-                    f"Loaded val token stream: {len(val_tokens):,} tokens "
-                    f"-> {len(val_data):,} windows from {val_seq_bin_path}"
-                )
+                if nanogpt_batching:
+                    val_data = val_tokens
+                    print(
+                        f"Loaded val token stream: {len(val_tokens):,} tokens "
+                        f"(nanoGPT-style random-offset batching) from {val_seq_bin_path}"
+                    )
+                else:
+                    val_data = token_stream_to_sequence_view(
+                        val_tokens, seq_length=seq_length, stride=train_stride
+                    )
+                    print(
+                        f"Loaded val token stream: {len(val_tokens):,} tokens "
+                        f"-> {len(val_data):,} windows from {val_seq_bin_path}"
+                    )
             else:
                 val_data = load_pretokenized_sequences(
                     val_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
@@ -1715,20 +1783,37 @@ def train_model(
                 test_tokens = load_pretokenized_token_stream(
                     test_seq_bin_path, dtype_name=seq_bin_dtype
                 )
-                test_data = token_stream_to_sequence_view(
-                    test_tokens, seq_length=seq_length, stride=train_stride
-                )
-                print(
-                    f"Loaded test token stream: {len(test_tokens):,} tokens "
-                    f"-> {len(test_data):,} windows from {test_seq_bin_path}"
-                )
+                if nanogpt_batching:
+                    test_data = test_tokens
+                    print(
+                        f"Loaded test token stream: {len(test_tokens):,} tokens "
+                        f"(nanoGPT-style random-offset batching) from {test_seq_bin_path}"
+                    )
+                else:
+                    test_data = token_stream_to_sequence_view(
+                        test_tokens, seq_length=seq_length, stride=train_stride
+                    )
+                    print(
+                        f"Loaded test token stream: {len(test_tokens):,} tokens "
+                        f"-> {len(test_data):,} windows from {test_seq_bin_path}"
+                    )
             else:
                 test_data = load_pretokenized_sequences(
                     test_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
                 )
                 print(f"Loaded test sequences: {len(test_data):,} from {test_seq_bin_path}")
 
-        preview_batch = np.asarray(train_data[:batch_size])
+        if nanogpt_batching:
+            preview_loader = create_nanogpt_token_stream_loader(
+                train_data,
+                seq_length=seq_length,
+                batch_size=batch_size,
+                rng_key=data_key,
+                num_batches=1,
+            )
+            preview_batch = next(preview_loader, None)
+        else:
+            preview_batch = np.asarray(train_data[:batch_size])
         if preview_batch.shape[0] == 0:
             raise ValueError(
                 "No training batches could be created from pretokenized binaries."
@@ -1851,6 +1936,8 @@ def train_model(
         raise ValueError("--validation_steps_per_epoch must be > 0 when provided.")
     if test_steps_per_epoch is not None and test_steps_per_epoch <= 0:
         raise ValueError("--test_steps_per_epoch must be > 0 when provided.")
+    if warmup_steps < 0:
+        raise ValueError("--warmup_steps must be >= 0.")
     tokens_per_step = int(batch_size * seq_length)
     target_steps = None
     if target_tokens is not None:
@@ -1868,10 +1955,32 @@ def train_model(
         if target_steps is not None
         else max(1, num_epochs * train_steps_per_epoch)
     )
-    learning_rate_schedule = optax.schedules.cosine_decay_schedule(
-        init_value=config.initial_learning_rate,
-        decay_steps=decay_steps,
-        alpha=min_learning_rate / config.initial_learning_rate,
+    warmup_steps_effective = min(int(warmup_steps), max(0, decay_steps - 1))
+    if warmup_steps_effective > 0:
+        warmup_schedule = optax.linear_schedule(
+            init_value=0.0,
+            end_value=config.initial_learning_rate,
+            transition_steps=warmup_steps_effective,
+        )
+        cosine_schedule = optax.schedules.cosine_decay_schedule(
+            init_value=config.initial_learning_rate,
+            decay_steps=max(1, decay_steps - warmup_steps_effective),
+            alpha=min_learning_rate / config.initial_learning_rate,
+        )
+        learning_rate_schedule = optax.join_schedules(
+            schedules=[warmup_schedule, cosine_schedule],
+            boundaries=[warmup_steps_effective],
+        )
+    else:
+        learning_rate_schedule = optax.schedules.cosine_decay_schedule(
+            init_value=config.initial_learning_rate,
+            decay_steps=decay_steps,
+            alpha=min_learning_rate / config.initial_learning_rate,
+        )
+    print(
+        "LR schedule: "
+        f"decay_steps={decay_steps:,}, "
+        f"warmup_steps={warmup_steps_effective:,}"
     )
     optimizer_name = optimizer_name.lower()
     if optimizer_name == "adamw":
@@ -2032,6 +2141,14 @@ def train_model(
                 shuffle_buffer_size=streaming_shuffle_buffer_size,
                 chunk_line_buffer=streaming_chunk_line_buffer,
             )
+        elif nanogpt_batching:
+            data_loader = create_nanogpt_token_stream_loader(
+                train_data,
+                seq_length=seq_length,
+                batch_size=batch_size,
+                rng_key=epoch_key,
+                num_batches=train_steps_per_epoch,
+            )
         else:
             data_loader = create_data_loader(train_data, batch_size, epoch_key)
 
@@ -2127,6 +2244,8 @@ def train_model(
                 writer=writer if enable_logging else None,
                 compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
                 max_eval_steps=validation_steps_per_epoch,
+                nanogpt_batching=nanogpt_batching,
+                seq_length=seq_length,
                 nanogpt_ppl_metric=nanogpt_ppl_metric,
             )
 
@@ -2200,6 +2319,8 @@ def train_model(
                 writer=writer if enable_logging else None,
                 compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
                 max_eval_steps=test_steps_per_epoch,
+                nanogpt_batching=nanogpt_batching,
+                seq_length=seq_length,
                 nanogpt_ppl_metric=nanogpt_ppl_metric,
             )
 
@@ -2280,6 +2401,8 @@ def evaluate_model_on_dataset(
     writer: SummaryWriter = None,
     compiled_eval_step=None,
     max_eval_steps: Optional[int] = None,
+    nanogpt_batching: bool = False,
+    seq_length: Optional[int] = None,
     nanogpt_ppl_metric: bool = False,
 ):
     rng_key, dataset_key = jax.random.split(rng_key)
@@ -2296,6 +2419,8 @@ def evaluate_model_on_dataset(
         eval_model=eval_model,  # Use dropout-free model for evaluation
         compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
         max_eval_steps=max_eval_steps,
+        nanogpt_batching=nanogpt_batching,
+        seq_length=seq_length,
         nanogpt_ppl_metric=nanogpt_ppl_metric,
     )
     print(f"{dataset_name} loss: {dataset_loss:.4f}")
@@ -2680,10 +2805,38 @@ def evaluate_model(
     eval_model=None,  # Optional evaluation model with dropout disabled
     compiled_eval_step=None,  # Optional pre-compiled evaluation step for efficiency
     max_eval_steps: Optional[int] = None,
+    nanogpt_batching: bool = False,
+    seq_length: Optional[int] = None,
     nanogpt_ppl_metric: bool = False,
 ):
     """Evaluate model on validation data."""
-    val_loader = create_data_loader(val_data, batch_size, rng_key)
+    if nanogpt_batching:
+        if seq_length is None:
+            raise ValueError("seq_length is required when nanogpt_batching=True.")
+        if not hasattr(val_data, "shape") or len(val_data.shape) != 1:
+            raise ValueError(
+                "nanogpt_batching expects 1D token-stream validation data."
+            )
+        total_possible = int(val_data.shape[0]) - int(seq_length)
+        if total_possible <= 0:
+            raise ValueError(
+                f"Validation token stream too short ({int(val_data.shape[0])} tokens) "
+                f"for seq_length={seq_length}."
+            )
+        eval_batches = (
+            max_eval_steps
+            if max_eval_steps is not None
+            else max(1, total_possible // max(1, batch_size))
+        )
+        val_loader = create_nanogpt_token_stream_loader(
+            val_data,
+            seq_length=seq_length,
+            batch_size=batch_size,
+            rng_key=rng_key,
+            num_batches=eval_batches,
+        )
+    else:
+        val_loader = create_data_loader(val_data, batch_size, rng_key)
 
     # Use evaluation model if provided (should have dropout disabled)
     model_for_eval = eval_model if eval_model is not None else model
@@ -4326,6 +4479,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=0,
+        help=(
+            "Linear warmup steps before cosine decay. "
+            "Set 0 to disable warmup (default)."
+        ),
+    )
+    parser.add_argument(
         "--embedding_dim",
         type=int,
         default=300,
@@ -4390,6 +4552,15 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Also report perplexity as exp(mean loss) like nanoGPT.",
+    )
+    parser.add_argument(
+        "--nanogpt_batching",
+        action="store_true",
+        default=False,
+        help=(
+            "Use nanoGPT-style random offset batching from token-stream bins "
+            "(requires --seq_bin_format token_stream)."
+        ),
     )
     parser.add_argument(
         "--tensorboard_log_dir",
@@ -4641,7 +4812,8 @@ if __name__ == "__main__":
         f"tie_embeddings_ldru={args.tie_embeddings_ldru}, "
         f"transformer_prenorm_gelu_block={args.transformer_prenorm_gelu_block}, "
         f"ldru_prenorm_gelu_block={args.ldru_prenorm_gelu_block}, "
-        f"nanogpt_ppl_metric={args.nanogpt_ppl_metric}"
+        f"nanogpt_ppl_metric={args.nanogpt_ppl_metric}, "
+        f"nanogpt_batching={args.nanogpt_batching}"
     )
     if args.binary_operator == "ablation":
         print(f"Ablation expansion mode: {config.ablation_expansion_mode}")
@@ -4680,7 +4852,9 @@ if __name__ == "__main__":
         optimizer_name=args.optimizer,
         target_tokens=args.target_tokens,
         train_stride=args.train_stride,
+        nanogpt_batching=args.nanogpt_batching,
         nanogpt_ppl_metric=args.nanogpt_ppl_metric,
+        warmup_steps=args.warmup_steps,
         train_steps_per_epoch=args.train_steps_per_epoch,
         validation_steps_per_epoch=args.validation_steps_per_epoch,
         test_steps_per_epoch=args.test_steps_per_epoch,

@@ -169,6 +169,11 @@ def parse_args() -> tuple[argparse.Namespace, List[str]]:
         help="Also report nanoGPT-style perplexity (exp(mean loss)).",
     )
     parser.add_argument(
+        "--nanogpt_batching",
+        action="store_true",
+        help="Use nanoGPT-style random offset batching (token-stream bins only).",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Print computed command and exit without launching training.",
@@ -310,6 +315,8 @@ def main():
         cmd.append("--ldru_prenorm_gelu_block")
     if args.nanogpt_ppl_metric:
         cmd.append("--nanogpt_ppl_metric")
+    if args.nanogpt_batching:
+        cmd.append("--nanogpt_batching")
     cmd.extend(passthrough)
 
     metadata = {
@@ -343,6 +350,7 @@ def main():
         "transformer_prenorm_gelu_block": args.transformer_prenorm_gelu_block,
         "ldru_prenorm_gelu_block": args.ldru_prenorm_gelu_block,
         "nanogpt_ppl_metric": args.nanogpt_ppl_metric,
+        "nanogpt_batching": args.nanogpt_batching,
         "trainer_command": cmd,
     }
 
