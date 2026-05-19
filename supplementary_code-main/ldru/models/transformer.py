@@ -63,6 +63,9 @@ class TransformerConfig:
     share_weight: bool = True
     # Use our special front rear shared positional embeddings
     use_front_rear_pos: bool = False
+    # Optional nanoGPT-like transformer block variant.
+    # When enabled, uses pre-norm residual blocks and GELU FFN activation.
+    pre_norm_gelu_block: bool = False
 
     def __post_init__(self) -> None:
         """Sets `num_hiddens_per_head` if it is `None`."""
@@ -155,6 +158,36 @@ class TransformerLayer(hk.Module):
                 )
                 h = h.at[:, i :: self._config.chunk_size].add(pos_vec)
         sequence_length = h.shape[1]
+        if self._config.pre_norm_gelu_block:
+            # nanoGPT-style pre-norm residual block with GELU FFN.
+            attn_input = layer_norm(h)
+            attention = MultiHeadDotProductAttention(
+                num_heads=self._config.num_heads,
+                num_hiddens_per_head=self._config.num_hiddens_per_head,
+                positional_encodings=self._config.positional_encodings,
+                positional_encodings_params=self._pos_enc_params,
+                chunk_size=self._config.chunk_size,
+            )(
+                inputs_q=attn_input,
+                inputs_kv=attn_input,
+                mask=causal_mask,
+                causal=self._config.causal_masking,
+            )
+            attention = hk.dropout(
+                hk.next_rng_key(), self._config.dropout_prob, attention
+            )
+            h = h + attention
+
+            ff_input = layer_norm(h)
+            ff = hk.Linear(self._config.embedding_dim * self._config.widening_factor)(
+                ff_input
+            )
+            ff = jnn.gelu(ff)
+            ff = hk.Linear(self._config.embedding_dim)(ff)
+            ff = hk.dropout(hk.next_rng_key(), self._config.dropout_prob, ff)
+            h = h + ff
+            return h
+
         attention = MultiHeadDotProductAttention(
             num_heads=self._config.num_heads,
             num_hiddens_per_head=self._config.num_hiddens_per_head,
@@ -175,12 +208,6 @@ class TransformerLayer(hk.Module):
             attention
         )
         h = jnn.relu(h)
-        """
-      snake_a = hk.get_parameter('snake_a', (1,), init=jnp.ones)
-      #snake_a = np.pi/2.5
-      snake_a_coeff = 1 / (2*snake_a)
-      h = h - snake_a_coeff*jnp.cos(2*snake_a*h) + snake_a_coeff
-      """
         h = hk.Linear(self._config.embedding_dim)(h)
 
         h = hk.dropout(hk.next_rng_key(), self._config.dropout_prob, h)

@@ -67,6 +67,10 @@ class CausalLDRUConfig:
 
     # specifies transformer encoding type
     use_alibi: bool = False  # defaults to sin cos
+    # Optional nanoGPT-like FFN block inside each LDRU layer.
+    prenorm_gelu_block: bool = False
+    # Optional weight tying between token embedding and LM head.
+    tie_embeddings: bool = False
 
 
 class BinaryOperator(hk.Module):
@@ -223,6 +227,11 @@ class CausalLDRULayer(hk.Module):
         )
         self.fc_1 = hk.Linear(self.state_dim, w_init=init)
         self.fc = hk.Sequential([self.fc_0, jnn.silu, self.fc_1])
+        self.prenorm_ff_ln = hk.LayerNorm(
+            axis=-1, create_scale=True, create_offset=True, name="prenorm_ff_ln"
+        )
+        self.prenorm_ff_up = hk.Linear(self.state_dim * 4, name="prenorm_ff_up")
+        self.prenorm_ff_down = hk.Linear(self.state_dim, name="prenorm_ff_down")
 
         # Project processed hidden/state back to embedding space.
         self.output_proj = hk.Linear(config.embedding_dim, name="output_proj")
@@ -838,6 +847,14 @@ class CausalLDRULayer(hk.Module):
         h = self.input_proj(h)  # [B, L, state_dim]
         B, L, S = h.shape
 
+        if self.config.prenorm_gelu_block:
+            ff = self.prenorm_ff_ln(h)
+            ff = self.prenorm_ff_up(ff)
+            ff = jnn.gelu(ff)
+            ff = self.prenorm_ff_down(ff)
+            ff = hk.dropout(hk.next_rng_key(), self.config.dropout_prob, ff)
+            h = h + ff
+
         if self.mlp is not None:
             # Apply feedforward network (can switch between simple and ResNet-inspired)
             original_h = h  # Store for global residual connection
@@ -947,10 +964,13 @@ class CausalLDRULanguageModel(hk.Module):
         self.encoder = CausalLDRUEncoder(config)
 
         # Output projection to vocabulary
-        self.lm_head = hk.Linear(
-            config.vocab_size,
-            w_init=hk.initializers.TruncatedNormal(stddev=config.emb_init_scale),
-        )
+        if not config.tie_embeddings:
+            self.lm_head = hk.Linear(
+                config.vocab_size,
+                w_init=hk.initializers.TruncatedNormal(stddev=config.emb_init_scale),
+            )
+        else:
+            self.lm_head = None
 
     def __call__(self, token_ids: jnp.ndarray, is_training: bool = True) -> jnp.ndarray:
         """
@@ -989,7 +1009,11 @@ class CausalLDRULanguageModel(hk.Module):
         )
 
         # Project to vocabulary
-        logits = self.lm_head(hidden_states)
+        if self.config.tie_embeddings:
+            embedding_matrix = self.token_embedding.embeddings  # [vocab, emb]
+            logits = jnp.einsum("ble,ve->blv", hidden_states, embedding_matrix)
+        else:
+            logits = self.lm_head(hidden_states)
 
         return logits
 

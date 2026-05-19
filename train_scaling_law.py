@@ -144,6 +144,31 @@ def parse_args() -> tuple[argparse.Namespace, List[str]]:
         help="Optional metadata JSON generated during pretokenization.",
     )
     parser.add_argument(
+        "--tie_embeddings_transformer",
+        action="store_true",
+        help="Enable transformer embedding/output weight tying.",
+    )
+    parser.add_argument(
+        "--tie_embeddings_ldru",
+        action="store_true",
+        help="Enable LDRU embedding/output weight tying.",
+    )
+    parser.add_argument(
+        "--transformer_prenorm_gelu_block",
+        action="store_true",
+        help="Use pre-norm + GELU transformer blocks.",
+    )
+    parser.add_argument(
+        "--ldru_prenorm_gelu_block",
+        action="store_true",
+        help="Enable optional pre-norm + GELU block in LDRU layers.",
+    )
+    parser.add_argument(
+        "--nanogpt_ppl_metric",
+        action="store_true",
+        help="Also report nanoGPT-style perplexity (exp(mean loss)).",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Print computed command and exit without launching training.",
@@ -275,6 +300,16 @@ def main():
         cmd.extend(["--seq_bin_format", args.seq_bin_format])
     if args.seq_meta_json is not None:
         cmd.extend(["--seq_meta_json", args.seq_meta_json])
+    if args.tie_embeddings_transformer:
+        cmd.append("--tie_embeddings_transformer")
+    if args.tie_embeddings_ldru:
+        cmd.append("--tie_embeddings_ldru")
+    if args.transformer_prenorm_gelu_block:
+        cmd.append("--transformer_prenorm_gelu_block")
+    if args.ldru_prenorm_gelu_block:
+        cmd.append("--ldru_prenorm_gelu_block")
+    if args.nanogpt_ppl_metric:
+        cmd.append("--nanogpt_ppl_metric")
     cmd.extend(passthrough)
 
     metadata = {
@@ -303,6 +338,11 @@ def main():
         "seq_bin_length": args.seq_bin_length,
         "seq_bin_format": args.seq_bin_format,
         "seq_meta_json": args.seq_meta_json,
+        "tie_embeddings_transformer": args.tie_embeddings_transformer,
+        "tie_embeddings_ldru": args.tie_embeddings_ldru,
+        "transformer_prenorm_gelu_block": args.transformer_prenorm_gelu_block,
+        "ldru_prenorm_gelu_block": args.ldru_prenorm_gelu_block,
+        "nanogpt_ppl_metric": args.nanogpt_ppl_metric,
         "trainer_command": cmd,
     }
 

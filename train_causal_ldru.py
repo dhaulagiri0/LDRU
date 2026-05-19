@@ -198,6 +198,13 @@ class LDRUExperimenstConfig:
     share_embeddings: bool = False
     chunk_size: Optional[int] = None  # Use full attention
     causal_masking: bool = True  # Critical for causal language modeling
+    tie_embeddings_transformer: bool = False
+    tie_embeddings_ldru: bool = False
+    transformer_prenorm_gelu_block: bool = False
+    ldru_prenorm_gelu_block: bool = False
+    # Aliases consumed directly by causal_ldru_v2 components.
+    tie_embeddings: bool = False
+    prenorm_gelu_block: bool = False
 
     # General training hyperparameters
     initial_learning_rate: float = (1e-3,)
@@ -1165,7 +1172,9 @@ def create_transformer_model(config: LDRUExperimenstConfig):
         num_heads=config.num_transformer_heads,
         dropout_prob=config.dropout_prob,
         emb_init_scale=config.emb_init_scale,
-        use_embeddings=config.use_embeddings,
+        use_embeddings=(
+            False if config.tie_embeddings_transformer else config.use_embeddings
+        ),
         share_embeddings=config.share_embeddings,
         chunk_size=config.chunk_size,
         positional_encodings=pos_encs,
@@ -1176,24 +1185,36 @@ def create_transformer_model(config: LDRUExperimenstConfig):
         ),
         widening_factor=config.widening_factor,
         causal_masking=config.causal_masking,
+        pre_norm_gelu_block=config.transformer_prenorm_gelu_block,
     )
     # Print config
     print("Transformer Config:")
     print(transformer_config)
 
     def transformer_forward(token_ids):
-        # Convert token_ids to one-hot encoding as expected by the transformer
-        one_hot_inputs = jax.nn.one_hot(token_ids, config.vocab_size)
-
-        # Use transformer encoder in decoder-only mode with causal masking
-        # This is appropriate for autoregressive language modeling
         transformer_encoder = TransformerEncoder(transformer_config)
-        encoded_output = transformer_encoder(one_hot_inputs)  # [B, L, embedding_dim]
+        if config.tie_embeddings_transformer:
+            emb_init = hk.initializers.TruncatedNormal(stddev=config.emb_init_scale)
+            token_embedding = hk.get_parameter(
+                "transformer_tied_token_embedding",
+                shape=(config.vocab_size, config.embedding_dim),
+                init=emb_init,
+            )
+            embedded_inputs = jnp.take(token_embedding, token_ids, axis=0)
+            encoded_output = transformer_encoder(embedded_inputs)  # [B, L, emb]
+        else:
+            # Convert token_ids to one-hot encoding as expected by the transformer
+            one_hot_inputs = jax.nn.one_hot(token_ids, config.vocab_size)
+            # Use transformer encoder in decoder-only mode with causal masking.
+            encoded_output = transformer_encoder(one_hot_inputs)  # [B, L, emb]
 
         # Project to vocabulary size for next-token prediction
         # Return all positions for sequence-to-sequence loss
-        output_projection = hk.Linear(config.vocab_size)
-        logits = output_projection(encoded_output)  # [B, L, vocab_size]
+        if config.tie_embeddings_transformer:
+            logits = jnp.einsum("ble,ve->blv", encoded_output, token_embedding)
+        else:
+            output_projection = hk.Linear(config.vocab_size)
+            logits = output_projection(encoded_output)  # [B, L, vocab_size]
 
         return logits
 
@@ -1226,6 +1247,8 @@ def create_ldru_transformer_model(config: LDRUExperimenstConfig):
             scan_method=config.scan_method,
             expand_to_power_of_2=config.expand_to_power_of_2,
             attention_per_scan_step=config.attention_per_scan_step,
+            prenorm_gelu_block=config.ldru_prenorm_gelu_block,
+            tie_embeddings=False,
         )
 
         ldru_encoder = CausalLDRUEncoder(ldru_config)
@@ -1249,6 +1272,7 @@ def create_ldru_transformer_model(config: LDRUExperimenstConfig):
             ),
             widening_factor=4,
             causal_masking=True,  # Critical for causal language modeling
+            pre_norm_gelu_block=config.transformer_prenorm_gelu_block,
         )
 
         transformer_encoder = TransformerEncoder(transformer_config)
@@ -1285,6 +1309,7 @@ def create_transformer_ldru_model(config: LDRUExperimenstConfig):
             ),
             widening_factor=4,  # Reduced widening factor
             causal_masking=True,  # Enable causal masking for proper language modeling
+            pre_norm_gelu_block=config.transformer_prenorm_gelu_block,
         )
 
         # Convert token_ids to one-hot encoding as expected by the transformer
@@ -1321,6 +1346,8 @@ def create_transformer_ldru_model(config: LDRUExperimenstConfig):
             scan_method=config.scan_method,
             expand_to_power_of_2=config.expand_to_power_of_2,
             attention_per_scan_step=config.attention_per_scan_step,
+            prenorm_gelu_block=config.ldru_prenorm_gelu_block,
+            tie_embeddings=False,
         )
 
         # Pass encoded transformer output through LDRU encoder
@@ -1483,6 +1510,7 @@ def train_model(
     optimizer_name: str = "adamw",
     target_tokens: Optional[int] = None,
     train_stride: Optional[int] = None,
+    nanogpt_ppl_metric: bool = False,
     train_steps_per_epoch: Optional[int] = None,
     validation_steps_per_epoch: Optional[int] = None,
     test_steps_per_epoch: Optional[int] = None,
@@ -2071,6 +2099,9 @@ def train_model(
         print(f"Average loss: {avg_loss:.4f}")
         print(f"Average accuracy: {avg_accuracy:.4f}")
         print(f"Average perplexity: {avg_perplexity:.4f}")
+        if nanogpt_ppl_metric:
+            nanogpt_train_ppl = float(np.exp(avg_loss))
+            print(f"Average perplexity (nanoGPT-style): {nanogpt_train_ppl:.4f}")
         print(f"Current learning rate: {current_learning_rate:.2e}")
 
         if enable_logging:
@@ -2096,6 +2127,7 @@ def train_model(
                 writer=writer if enable_logging else None,
                 compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
                 max_eval_steps=validation_steps_per_epoch,
+                nanogpt_ppl_metric=nanogpt_ppl_metric,
             )
 
             # Check for improvement and update learning rate if stagnant
@@ -2168,6 +2200,7 @@ def train_model(
                 writer=writer if enable_logging else None,
                 compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
                 max_eval_steps=test_steps_per_epoch,
+                nanogpt_ppl_metric=nanogpt_ppl_metric,
             )
 
         # Generate text after each epoch to monitor progress
@@ -2247,6 +2280,7 @@ def evaluate_model_on_dataset(
     writer: SummaryWriter = None,
     compiled_eval_step=None,
     max_eval_steps: Optional[int] = None,
+    nanogpt_ppl_metric: bool = False,
 ):
     rng_key, dataset_key = jax.random.split(rng_key)
     dataset_loss, dataset_metrics = evaluate_model(
@@ -2262,12 +2296,23 @@ def evaluate_model_on_dataset(
         eval_model=eval_model,  # Use dropout-free model for evaluation
         compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
         max_eval_steps=max_eval_steps,
+        nanogpt_ppl_metric=nanogpt_ppl_metric,
     )
     print(f"{dataset_name} loss: {dataset_loss:.4f}")
     print(f"{dataset_name} accuracy: {dataset_metrics['accuracy']:.4f}")
     print(f"{dataset_name} perplexity: {dataset_metrics['perplexity']:.4f}")
+    if "nanogpt_perplexity" in dataset_metrics:
+        print(
+            f"{dataset_name} perplexity (nanoGPT-style): "
+            f"{dataset_metrics['nanogpt_perplexity']:.4f}"
+        )
     if "last_token_perplexity" in dataset_metrics:
         print(f"{dataset_name} last-token perplexity: {dataset_metrics['last_token_perplexity']:.4f}")
+    if "last_token_perplexity_nanogpt" in dataset_metrics:
+        print(
+            f"{dataset_name} last-token perplexity (nanoGPT-style): "
+            f"{dataset_metrics['last_token_perplexity_nanogpt']:.4f}"
+        )
 
     # Report per-position perplexity for seq2seq models
     if seq2seq and "per_position_perplexity" in dataset_metrics:
@@ -2296,10 +2341,22 @@ def evaluate_model_on_dataset(
             dataset_metrics["perplexity"],
             epoch + 1,
         )
+        if "nanogpt_perplexity" in dataset_metrics:
+            writer.add_scalar(
+                "Perplexity/{}_NanoGPTStyle".format(dataset_name),
+                dataset_metrics["nanogpt_perplexity"],
+                epoch + 1,
+            )
         if "last_token_perplexity" in dataset_metrics:
             writer.add_scalar(
                 "Perplexity/{}_LastToken".format(dataset_name),
                 dataset_metrics["last_token_perplexity"],
+                epoch + 1,
+            )
+        if "last_token_perplexity_nanogpt" in dataset_metrics:
+            writer.add_scalar(
+                "Perplexity/{}_LastToken_NanoGPTStyle".format(dataset_name),
+                dataset_metrics["last_token_perplexity_nanogpt"],
                 epoch + 1,
             )
 
@@ -2623,6 +2680,7 @@ def evaluate_model(
     eval_model=None,  # Optional evaluation model with dropout disabled
     compiled_eval_step=None,  # Optional pre-compiled evaluation step for efficiency
     max_eval_steps: Optional[int] = None,
+    nanogpt_ppl_metric: bool = False,
 ):
     """Evaluate model on validation data."""
     val_loader = create_data_loader(val_data, batch_size, rng_key)
@@ -2692,6 +2750,8 @@ def evaluate_model(
 
     avg_loss = np.mean(losses)
     avg_metrics = {"accuracy": np.mean(accuracies), "perplexity": np.mean(perplexities)}
+    if nanogpt_ppl_metric:
+        avg_metrics["nanogpt_perplexity"] = float(np.exp(avg_loss))
 
     # Add per-position metrics for seq2seq models
     if seq2seq and len(per_position_perplexities) > 0:
@@ -2703,6 +2763,10 @@ def evaluate_model(
         avg_metrics["per_position_loss"] = avg_per_position_loss
         avg_metrics["last_token_perplexity"] = float(avg_per_position_perplexity[-1])
         avg_metrics["last_token_loss"] = float(avg_per_position_loss[-1])
+        if nanogpt_ppl_metric:
+            avg_metrics["last_token_perplexity_nanogpt"] = float(
+                np.exp(avg_per_position_loss[-1])
+            )
 
         # Additional summary statistics
         avg_metrics["min_position_perplexity"] = np.min(avg_per_position_perplexity)
@@ -4298,6 +4362,36 @@ if __name__ == "__main__":
         help="Number of transformer layers for Transformer models (default: 2)",
     )
     parser.add_argument(
+        "--tie_embeddings_transformer",
+        action="store_true",
+        default=False,
+        help="Tie transformer token-embedding and output-projection weights.",
+    )
+    parser.add_argument(
+        "--tie_embeddings_ldru",
+        action="store_true",
+        default=False,
+        help="Tie LDRU token-embedding and output-projection weights.",
+    )
+    parser.add_argument(
+        "--transformer_prenorm_gelu_block",
+        action="store_true",
+        default=False,
+        help="Use pre-norm + GELU transformer blocks (nanoGPT-style).",
+    )
+    parser.add_argument(
+        "--ldru_prenorm_gelu_block",
+        action="store_true",
+        default=False,
+        help="Enable an optional pre-norm + GELU FFN block inside each LDRU layer.",
+    )
+    parser.add_argument(
+        "--nanogpt_ppl_metric",
+        action="store_true",
+        default=False,
+        help="Also report perplexity as exp(mean loss) like nanoGPT.",
+    )
+    parser.add_argument(
         "--tensorboard_log_dir",
         type=str,
         default="tensorboard_logs",
@@ -4528,6 +4622,12 @@ if __name__ == "__main__":
         num_epochs=args.num_epochs,
         num_transformer_heads=args.num_transformer_heads,
         num_transformer_layers=args.num_transformer_layers,
+        tie_embeddings_transformer=args.tie_embeddings_transformer,
+        tie_embeddings_ldru=args.tie_embeddings_ldru,
+        transformer_prenorm_gelu_block=args.transformer_prenorm_gelu_block,
+        ldru_prenorm_gelu_block=args.ldru_prenorm_gelu_block,
+        tie_embeddings=args.tie_embeddings_ldru,
+        prenorm_gelu_block=args.ldru_prenorm_gelu_block,
         operator=resolve_binary_operator(args.binary_operator),
         binop_expansion_factor=args.binop_expansion_factor,
         ablation_expansion_mode=args.ablation_expansion_mode,
@@ -4535,6 +4635,14 @@ if __name__ == "__main__":
     )
     print(f"Selected binary operator: {binary_operator_to_name(config.operator)}")
     print(f"Binary operator expansion factor: {config.binop_expansion_factor}")
+    print(
+        "Feature toggles: "
+        f"tie_embeddings_transformer={args.tie_embeddings_transformer}, "
+        f"tie_embeddings_ldru={args.tie_embeddings_ldru}, "
+        f"transformer_prenorm_gelu_block={args.transformer_prenorm_gelu_block}, "
+        f"ldru_prenorm_gelu_block={args.ldru_prenorm_gelu_block}, "
+        f"nanogpt_ppl_metric={args.nanogpt_ppl_metric}"
+    )
     if args.binary_operator == "ablation":
         print(f"Ablation expansion mode: {config.ablation_expansion_mode}")
         print(f"Ablation combine mode: {config.ablation_combine_mode}")
@@ -4572,6 +4680,7 @@ if __name__ == "__main__":
         optimizer_name=args.optimizer,
         target_tokens=args.target_tokens,
         train_stride=args.train_stride,
+        nanogpt_ppl_metric=args.nanogpt_ppl_metric,
         train_steps_per_epoch=args.train_steps_per_epoch,
         validation_steps_per_epoch=args.validation_steps_per_epoch,
         test_steps_per_epoch=args.test_steps_per_epoch,
