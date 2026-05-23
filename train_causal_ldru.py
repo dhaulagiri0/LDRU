@@ -1161,6 +1161,58 @@ def make_train_step(
     return jax.jit(_train_step)
 
 
+def make_grad_step(
+    model,
+    use_lstm=False,
+    use_transformer=False,
+    use_transformer_ldru=False,
+    use_ldru_transformer=False,
+    seq2seq=True,
+    lambda_l2=0.0,
+):
+    """Create a JIT-compiled gradient step that returns grads without updating."""
+
+    def _grad_step(params, rng_key, batch):
+        if use_transformer:
+            if seq2seq:
+                loss_fn = lambda p: transformer_seq2seq_loss(
+                    p, model, rng_key, batch, lambda_l2
+                )
+            else:
+                loss_fn = lambda p: next_token_loss(p, model, rng_key, batch)
+        elif use_transformer_ldru:
+            if seq2seq:
+                loss_fn = lambda p: transformer_seq2seq_loss(
+                    p, model, rng_key, batch, lambda_l2
+                )
+            else:
+                loss_fn = lambda p: next_token_loss(p, model, rng_key, batch)
+        elif use_ldru_transformer:
+            if seq2seq:
+                loss_fn = lambda p: transformer_seq2seq_loss(
+                    p, model, rng_key, batch, lambda_l2
+                )
+            else:
+                loss_fn = lambda p: next_token_loss(p, model, rng_key, batch)
+        elif use_lstm:
+            if seq2seq:
+                loss_fn = lambda p: lstm_next_token_loss(p, model, rng_key, batch)
+            else:
+                loss_fn = lambda p: lstm_last_position_loss(p, model, rng_key, batch)
+        else:
+            if seq2seq:
+                loss_fn = lambda p: ldru_seq2seq_loss(
+                    p, model, rng_key, batch, lambda_l2
+                )
+            else:
+                loss_fn = lambda p: next_token_loss(p, model, rng_key, batch)
+
+        (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        return loss, metrics, grads
+
+    return jax.jit(_grad_step)
+
+
 def create_lstm_model(config: LDRUExperimenstConfig):
     """Create a simple LSTM model for comparison."""
     import haiku as hk
@@ -1519,6 +1571,7 @@ def make_eval_step(
 def train_model(
     log_dir: str,
     config: LDRUExperimenstConfig,
+    rng_seed: int = 42,
     enable_logging: bool = True,
     text_file_path: str = None,
     validation_text_file_path: str = None,
@@ -1583,7 +1636,9 @@ def train_model(
         )
     )
     loss_type = "seq2seq" if seq2seq else "lastpos"
-    scan_type = "blelloch_random" if config.blelloch_random else "default"
+    scan_type = config.scan_method
+    if config.blelloch_random:
+        scan_type = f"{scan_type}_blelloch_random"
     tokenizer_suffix = (
         "TKGPT2"
         if tokenizer_type == TokenizerType.TIKTOKEN_GPT2
@@ -1597,7 +1652,7 @@ def train_model(
         writer = SummaryWriter(logdir=f"{log_dir}/{model_name}")
 
     # Initialize RNG
-    rng_key = jax.random.PRNGKey(42)
+    rng_key = jax.random.PRNGKey(rng_seed)
     rng_key, init_key, data_key = jax.random.split(rng_key, 3)
 
     use_pretokenized_bins = train_seq_bin_path is not None
@@ -4223,6 +4278,12 @@ if __name__ == "__main__":
         help="Optimizer to use for training (default: adamw).",
     )
     parser.add_argument(
+        "--rng_seed",
+        type=int,
+        default=42,
+        help="Random seed for JAX PRNG (default: 42).",
+    )
+    parser.add_argument(
         "--binary_operator",
         type=str,
         default="default",
@@ -4253,6 +4314,16 @@ if __name__ == "__main__":
         "--blelloch_random",
         action="store_true",
         help="Use Blelloch random scan method for LDRU (default is deterministic)",
+    )
+    parser.add_argument(
+        "--scan_method",
+        type=str,
+        default="default",
+        choices=["default", "assoc", "sequential", "simple"],
+        help=(
+            "LDRU scan method: 'default'/'assoc' for associative tree scan, "
+            "'sequential'/'simple' for naive left-to-right scan."
+        ),
     )
     parser.add_argument(
         "--no_logging",
@@ -4799,12 +4870,14 @@ if __name__ == "__main__":
         ldru_prenorm_gelu_block=args.ldru_prenorm_gelu_block,
         tie_embeddings=args.tie_embeddings_ldru,
         prenorm_gelu_block=args.ldru_prenorm_gelu_block,
+        scan_method=args.scan_method,
         operator=resolve_binary_operator(args.binary_operator),
         binop_expansion_factor=args.binop_expansion_factor,
         ablation_expansion_mode=args.ablation_expansion_mode,
         ablation_combine_mode=args.ablation_combine_mode,
     )
     print(f"Selected binary operator: {binary_operator_to_name(config.operator)}")
+    print(f"Selected scan method: {config.scan_method}")
     print(f"Binary operator expansion factor: {config.binop_expansion_factor}")
     print(
         "Feature toggles: "
@@ -4823,6 +4896,7 @@ if __name__ == "__main__":
     params, model, config, tokenizer, _ = train_model(
         log_dir=LOG_DIR,
         config=config,
+        rng_seed=args.rng_seed,
         enable_logging=enable_logging,
         text_file_path=text_file_path,
         model_creation_fn=model_creation_fn,

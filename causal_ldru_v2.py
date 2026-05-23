@@ -56,7 +56,8 @@ class CausalLDRUConfig:
     ablation_expansion_mode: str = "grc"
     ablation_combine_mode: str = "grc"
 
-    # Scan method: 'default' (assoc_scan), or 'simple'
+    # Scan method: 'default'/'assoc' (tree-style associative scan)
+    # or 'simple'/'sequential' (naive left-to-right scan).
     scan_method: str = "default"
 
     # Whether to expand sequence to power of 2 with random zero insertion
@@ -260,34 +261,22 @@ class CausalLDRULayer(hk.Module):
 
     def simple_causal_scan(self, h: jnp.ndarray, binary_operator) -> jnp.ndarray:
         """
-        Simplified causal scan that's more numerically stable.
-        Instead of complex Blelloch scan, use a simple left-to-right accumulation.
+        Naive sequential (left-to-right) causal scan.
+        Returns exclusive prefix states so position t cannot use token t.
         """
-        B, L, E = h.shape
+        B, _, E = h.shape
+        carry0 = jnp.zeros((B, E), dtype=h.dtype)
+        xs = jnp.swapaxes(h, 0, 1)  # [L, B, E]
 
-        # Initialize output
-        output = jnp.zeros_like(h)
+        def _step(carry, x_t):
+            pair = jnp.stack([carry, x_t], axis=-2)  # [B, 2, E]
+            new_carry = binary_operator(pair)  # [B, E]
+            if new_carry.dtype != carry.dtype:
+                new_carry = new_carry.astype(carry.dtype)
+            return new_carry, carry
 
-        # First position is just the input
-        output = output.at[:, 0, :].set(h[:, 0, :])
-
-        # For each subsequent position, combine with previous
-        for i in range(1, L):
-            # Take current element and previous accumulated result
-            current = h[:, i : i + 1, :]  # [B, 1, E]
-            prev = output[:, i - 1 : i, :]  # [B, 1, E]
-
-            # Stack for binary operator
-            pair = jnp.concatenate([prev, current], axis=2)  # [B, 1, 2E]
-            pair = jnp.reshape(pair, (B, 1, 2, E))  # [B, 1, 2, E]
-
-            # Apply binary operator
-            combined = binary_operator(pair)  # [B, 1, E]
-
-            # Store result
-            output = output.at[:, i, :].set(combined.squeeze(1))
-
-        return output
+        _, ys = hk.scan(_step, carry0, xs)  # ys: [L, B, E]
+        return jnp.swapaxes(ys, 0, 1)  # [B, L, E]
 
     def adaptive_scan_up(
         self,
@@ -864,9 +853,18 @@ class CausalLDRULayer(hk.Module):
 
         # Apply simplified causal processing
         if L > 1:
+            scan_method = (self.config.scan_method or "default").lower()
+            use_sequential_scan = scan_method in ("simple", "sequential")
+            use_assoc_scan = scan_method in ("default", "assoc", "associative")
+            if not (use_sequential_scan or use_assoc_scan):
+                raise ValueError(
+                    f"Unsupported scan_method '{self.config.scan_method}'. "
+                    "Expected one of: default, assoc, sequential, simple."
+                )
+
             original_length = L
             original_mask = None
-            if self.config.expand_to_power_of_2:
+            if self.config.expand_to_power_of_2 and use_assoc_scan:
                 expansion_rng = hk.next_rng_key()
                 h, original_mask = self.expand_to_power_of_2_with_random_zeros(
                     h, expansion_rng
@@ -877,12 +875,6 @@ class CausalLDRULayer(hk.Module):
             # This materializes all parameters before entering JAX control flow
             dummy_input = jnp.zeros((B, 2, 2, S))  # [B, 2, 2, state_dim]
             _ = self.binary_operator(dummy_input)
-
-            # Choose scan method based on configuration
-            # if self.config.scan_method == "simple":
-            #     # Use simple sequential scan
-            #     h = self.simple_causal_scan(h, self.binary_operator)
-            # else:  # default
 
             h_attended = h
             if self.config.attention_per_scan_step:
@@ -897,9 +889,10 @@ class CausalLDRULayer(hk.Module):
             )
             h = h + h_attended  # Small residual weight for stability
 
-            # Apply the associative scan
-            h = self.assoc_scan_custom(h, self.binary_operator)
-            # h = self.assoc_scan(h, self.binary_operator)
+            if use_sequential_scan:
+                h = self.simple_causal_scan(h, self.binary_operator)
+            else:
+                h = self.assoc_scan_custom(h, self.binary_operator)
 
         # Restore original sequence length if expansion was used
         if self.config.expand_to_power_of_2 and original_mask is not None:
