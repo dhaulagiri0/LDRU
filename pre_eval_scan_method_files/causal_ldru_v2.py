@@ -57,24 +57,15 @@ class CausalLDRUConfig:
     ablation_combine_mode: str = "grc"
 
     # Scan method: 'default'/'assoc' (tree-style associative scan),
-    # 'assoc_rev'/'blelloch_rev' (tree-style scan with reversed operand order),
     # 'simple'/'sequential' (naive left-to-right scan),
-    # 'pairwise' (balanced tree scan on power-of-two lengths),
-    # or 'sequential_pairwise_final' (sequential prefixes + pairwise final state).
+    # or 'pairwise' (non-overlapping pair reductions + sequential scan).
     scan_method: str = "default"
 
-    # Whether to expand sequence to power of 2 before scanning.
-    # Default expansion is deterministic right-padding with zeros.
+    # Whether to expand sequence to power of 2 with random zero insertion
     expand_to_power_of_2: bool = False
-    # If True, power-of-2 expansion uses random zero insertion instead of right-padding.
-    pow_2_expansion_random: bool = False
 
     # Whether to apply attention at each scan step in custom associative scan
     attention_per_scan_step: bool = False
-    # Whether to apply the scan post-merge MLP (compatibility toggle for old checkpoints).
-    scan_post_merge_mlp: bool = True
-    # Whether to project into/out of the scan state dimension.
-    use_input_output_proj: bool = True
 
     # specifies transformer encoding type
     use_alibi: bool = False  # defaults to sin cos
@@ -227,12 +218,7 @@ class CausalLDRULayer(hk.Module):
                 self.binary_operator = operator_cls(self.state_dim)
 
         # Project from embedding space into hidden/state space for scan/operator.
-        self.use_input_output_proj = getattr(self.config, "use_input_output_proj", True)
-        self.input_proj = (
-            hk.Linear(self.state_dim, name="input_proj")
-            if self.use_input_output_proj
-            else None
-        )
+        self.input_proj = hk.Linear(self.state_dim, name="input_proj")
 
         # Smaller initialization for stability
         init = hk.initializers.VarianceScaling(
@@ -250,11 +236,7 @@ class CausalLDRULayer(hk.Module):
         self.prenorm_ff_down = hk.Linear(self.state_dim, name="prenorm_ff_down")
 
         # Project processed hidden/state back to embedding space.
-        self.output_proj = (
-            hk.Linear(config.embedding_dim, name="output_proj")
-            if self.use_input_output_proj
-            else None
-        )
+        self.output_proj = hk.Linear(config.embedding_dim, name="output_proj")
         self.mlp = self._resnet_feedforward if use_mlp else None
 
     def _make_pure_binary_op(self, dummy_input):
@@ -278,37 +260,7 @@ class CausalLDRULayer(hk.Module):
 
         return pure_op
 
-    def _post_merge_3d(self, red: jnp.ndarray) -> jnp.ndarray:
-        """Shared post-composition MLP for scan reductions (expects [B, L, E])."""
-        if self.config.attention_per_scan_step:
-            red_attended = self._apply_causal_attention(red)
-            red_attended = hk.LayerNorm(
-                axis=-1, create_scale=True, create_offset=True
-            )(red_attended)
-            red = red + red_attended
-
-        h_out = self.fc(red) + red
-        h_out = self.inner_norm(h_out)
-        h_out = hk.dropout(hk.next_rng_key(), self.config.dropout_prob, h_out)
-        if h_out.dtype != red.dtype:
-            h_out = h_out.astype(red.dtype)
-        return h_out
-
-    def _post_merge_tree(self, red: jnp.ndarray) -> jnp.ndarray:
-        """Post-merge for tree scans (expects [L, E])."""
-        red_ex = jnp.expand_dims(red, axis=0)  # [1, L, E]
-        red_ex = self._post_merge_3d(red_ex)
-        return red_ex[0]
-
-    def _post_merge_seq(self, red: jnp.ndarray) -> jnp.ndarray:
-        """Post-merge for sequential scan steps (expects [B, E])."""
-        red_ex = red[:, None, :]  # [B, 1, E]
-        red_ex = self._post_merge_3d(red_ex)
-        return red_ex[:, 0, :]
-
-    def simple_causal_scan(
-        self, h: jnp.ndarray, binary_operator, post_merge_fn=None
-    ) -> jnp.ndarray:
+    def simple_causal_scan(self, h: jnp.ndarray, binary_operator) -> jnp.ndarray:
         """
         Naive sequential (left-to-right) causal scan.
         Returns exclusive prefix states so position t cannot use token t.
@@ -322,21 +274,15 @@ class CausalLDRULayer(hk.Module):
             new_carry = binary_operator(pair)  # [B, E]
             if new_carry.dtype != carry.dtype:
                 new_carry = new_carry.astype(carry.dtype)
-            if post_merge_fn is not None:
-                new_carry = post_merge_fn(new_carry)
-                if new_carry.dtype != carry.dtype:
-                    new_carry = new_carry.astype(carry.dtype)
             return new_carry, carry
 
         _, ys = hk.scan(_step, carry0, xs)  # ys: [L, B, E]
         return jnp.swapaxes(ys, 0, 1)  # [B, L, E]
 
-    def pairwise_causal_scan(
-        self, h: jnp.ndarray, binary_operator, post_merge_fn=None
-    ) -> jnp.ndarray:
+    def pairwise_causal_scan(self, h: jnp.ndarray, binary_operator) -> jnp.ndarray:
         """
         Pairwise tree scan for power-of-two sequence lengths.
-        Uses the balanced associative reduction order as assoc_scan_custom
+        Uses the same balanced associative reduction order as assoc_scan_custom
         while returning exclusive prefixes for next-token prediction.
         """
         B, L, E = h.shape
@@ -347,53 +293,32 @@ class CausalLDRULayer(hk.Module):
 
         from custom_assoc_scan import associative_scan
 
-        if post_merge_fn is None:
-            post_merge_fn = lambda x: x
+        def _post_merge(red: jnp.ndarray) -> jnp.ndarray:
+            if self.config.attention_per_scan_step:
+                red_ex = jnp.expand_dims(red, axis=0)  # [1, L, E]
+                red_attended = self._apply_causal_attention(red_ex)[0]
+                red_attended = hk.LayerNorm(
+                    axis=-1, create_scale=True, create_offset=True
+                )(red_attended)
+                red = red + red_attended
+            h_out = self.fc(red) + red
+            h_out = self.inner_norm(h_out)
+            h_out = hk.dropout(hk.next_rng_key(), self.config.dropout_prob, h_out)
+            if h_out.dtype != red.dtype:
+                h_out = h_out.astype(red.dtype)
+            return h_out
 
         def combine(a, b):
             return binary_operator(jnp.stack([a, b], axis=-2))
 
         def scan_one(x):  # x: [L, E]
-            return associative_scan(combine, x, inner_fn=post_merge_fn)
+            return associative_scan(combine, x, inner_fn=_post_merge)
 
         incl = jax.vmap(scan_one)(h)  # [B, L, E]
 
         # shift right by one slot and include identity at start
         identity = jnp.zeros((B, 1, E), dtype=h.dtype)
         return jnp.concatenate((identity, incl[:, 1:, :]), axis=1)
-
-    def sequential_pairwise_final_scan(
-        self,
-        h: jnp.ndarray,
-        binary_operator,
-        post_merge_seq_fn=None,
-        post_merge_tree_fn=None,
-    ) -> jnp.ndarray:
-        """
-        Hybrid scan:
-        - positions [0..L-2]: sequential exclusive prefixes
-        - position [L-1]: final inclusive state from pairwise tree reduction
-        """
-        seq_out = self.simple_causal_scan(h, binary_operator, post_merge_seq_fn)
-        if h.shape[1] == 0:
-            return seq_out
-
-        from custom_assoc_scan import associative_scan
-
-        if post_merge_tree_fn is None:
-            post_merge_tree_fn = lambda x: x
-
-        def combine(a, b):
-            return binary_operator(jnp.stack([a, b], axis=-2))
-
-        def final_state_one(x):  # x: [L, E]
-            incl = associative_scan(combine, x, inner_fn=post_merge_tree_fn)
-            return incl[-1]
-
-        final_state = jax.vmap(final_state_one)(h)  # [B, E]
-        if final_state.dtype != seq_out.dtype:
-            final_state = final_state.astype(seq_out.dtype)
-        return seq_out.at[:, -1, :].set(final_state)
 
     def adaptive_scan_up(
         self,
@@ -588,25 +513,42 @@ class CausalLDRULayer(hk.Module):
         identity = jnp.zeros((h.shape[0], 1, h.shape[2]), dtype=h.dtype)  # [B, 1, E]
         return jnp.concatenate((identity, incl[:, 1:, :]), axis=1)
 
-    def assoc_scan_custom(
-        self, h, binary_operator, post_merge_fn=None, reverse_op: bool = False
-    ):
+    def assoc_scan_custom(self, h, binary_operator):
         # This function uses the custom associative scan with inner function
         # Can optionally include attention before each scan operation
         from custom_assoc_scan import associative_scan
-        if post_merge_fn is None:
-            post_merge_fn = lambda x: x
+
+        def inner_fn_with_attention(red):
+            """Inner function that applies attention before the feedforward processing."""
+            # Apply causal attention to the reduced values if configured
+            if self.config.attention_per_scan_step:
+                # Expand red dim by 1
+                red_ex = jnp.expand_dims(red, axis=0)  # [1, L, E]
+                red_attended = self._apply_causal_attention(red_ex)
+                red_attended = red_attended[0]  # Remove extra dim
+
+                # Apply layer norm to the attention output
+                red_attended = hk.LayerNorm(
+                    axis=-1, create_scale=True, create_offset=True
+                )(red_attended)
+
+                # Combine with residual connection
+                red = red + red_attended
+
+            # Apply the original feedforward processing
+            h = self.fc(red) + red
+            h = self.inner_norm(h)
+            h = hk.dropout(hk.next_rng_key(), self.config.dropout_prob, h)
+            return h
 
         def combine(a, b):
-            if reverse_op:
-                return binary_operator(jnp.stack([b, a], axis=-2))
             return binary_operator(jnp.stack([a, b], axis=-2))
 
         def scan_one(x):  # x: [L, E]
             h = associative_scan(
                 combine,
                 x,
-                inner_fn=post_merge_fn,  # Use shared post-merge function
+                inner_fn=inner_fn_with_attention,  # Use the attention-enhanced inner function
             )
             return h
 
@@ -933,8 +875,7 @@ class CausalLDRULayer(hk.Module):
 
         # Apply layer norm first for stability
         h = self.init_norm(h)
-        if self.input_proj is not None:
-            h = self.input_proj(h)  # [B, L, state_dim]
+        h = self.input_proj(h)  # [B, L, state_dim]
         B, L, S = h.shape
 
         if self.config.prenorm_gelu_block:
@@ -953,74 +894,38 @@ class CausalLDRULayer(hk.Module):
             h = h + original_h  # Scale down the residual for stability
 
         # Apply simplified causal processing
-        original_length = L
-        original_mask = None
         if L > 1:
             scan_method = (self.config.scan_method or "default").lower()
             use_sequential_scan = scan_method in ("simple", "sequential")
             use_pairwise_scan = scan_method in ("pairwise", "paired")
             use_assoc_scan = scan_method in ("default", "assoc", "associative")
-            use_assoc_rev_scan = scan_method in (
-                "assoc_rev",
-                "assoc-rev",
-                "reverse_assoc",
-                "reverse-assoc",
-                "blelloch_rev",
-                "blelloch-rev",
-            )
-            use_sequential_pairwise_final_scan = scan_method in (
-                "sequential_pairwise_final",
-                "seq_pairwise_final",
-                "hybrid_pairwise_final",
-            )
-            if not (
-                use_sequential_scan
-                or use_pairwise_scan
-                or use_assoc_scan
-                or use_assoc_rev_scan
-                or use_sequential_pairwise_final_scan
-            ):
+            if not (use_sequential_scan or use_pairwise_scan or use_assoc_scan):
                 raise ValueError(
                     f"Unsupported scan_method '{self.config.scan_method}'. "
-                    "Expected one of: default, assoc, assoc_rev, blelloch_rev, "
-                    "sequential, simple, pairwise, sequential_pairwise_final."
+                    "Expected one of: default, assoc, sequential, simple, pairwise."
                 )
 
-            need_pow2_expansion = bool(getattr(self.config, "expand_to_power_of_2", False))
+            original_length = L
+            original_mask = None
             if use_pairwise_scan and (L & (L - 1)) != 0:
-                # Pairwise scan fundamentally requires power-of-two length.
-                need_pow2_expansion = True
-
-            if need_pow2_expansion and (L & (L - 1)) != 0:
                 def _next_pow2(n: int) -> int:
                     return 1 << (n - 1).bit_length()
 
-                use_random_expansion = bool(
-                    getattr(self.config, "pow_2_expansion_random", False)
-                )
-                if use_random_expansion:
-                    expansion_rng = hk.next_rng_key()
-                    h, original_mask = self.expand_to_power_of_2_with_random_zeros(
-                        h, expansion_rng
-                    )
-                else:
-                    L_pow2 = _next_pow2(L)
-                    pad = L_pow2 - L
-                    h = jnp.pad(h, ((0, 0), (0, pad), (0, 0)))
+                L_pow2 = _next_pow2(L)
+                pad = L_pow2 - L
+                h = jnp.pad(h, ((0, 0), (0, pad), (0, 0)))
                 B, L, S = h.shape  # Update dims to padded shape
+            if self.config.expand_to_power_of_2 and use_assoc_scan:
+                expansion_rng = hk.next_rng_key()
+                h, original_mask = self.expand_to_power_of_2_with_random_zeros(
+                    h, expansion_rng
+                )
+                B, L, S = h.shape  # Update dims to expanded hidden-state shape
 
             # Initialize binary operator by calling it once outside the scan
             # This materializes all parameters before entering JAX control flow
             dummy_input = jnp.zeros((B, 2, 2, S))  # [B, 2, 2, state_dim]
             _ = self.binary_operator(dummy_input)
-
-            use_scan_post_merge_mlp = getattr(self.config, "scan_post_merge_mlp", True)
-            if use_scan_post_merge_mlp:
-                post_merge_tree = self._post_merge_tree
-                post_merge_seq = self._post_merge_seq
-            else:
-                post_merge_tree = lambda x: x
-                post_merge_seq = lambda x: x
 
             h_attended = h
             if self.config.attention_per_scan_step:
@@ -1036,31 +941,19 @@ class CausalLDRULayer(hk.Module):
             h = h + h_attended  # Small residual weight for stability
 
             if use_sequential_scan:
-                h = self.simple_causal_scan(h, self.binary_operator, post_merge_seq)
+                h = self.simple_causal_scan(h, self.binary_operator)
             elif use_pairwise_scan:
-                h = self.pairwise_causal_scan(h, self.binary_operator, post_merge_tree)
-            elif use_sequential_pairwise_final_scan:
-                h = self.sequential_pairwise_final_scan(
-                    h,
-                    self.binary_operator,
-                    post_merge_seq_fn=post_merge_seq,
-                    post_merge_tree_fn=post_merge_tree,
-                )
-            elif use_assoc_rev_scan:
-                h = self.assoc_scan_custom(
-                    h, self.binary_operator, post_merge_tree, reverse_op=True
-                )
+                h = self.pairwise_causal_scan(h, self.binary_operator)
             else:
-                h = self.assoc_scan_custom(h, self.binary_operator, post_merge_tree)
+                h = self.assoc_scan_custom(h, self.binary_operator)
 
         # Restore original sequence length if expansion was used
-        if h.shape[1] != original_length:
-            if original_mask is not None:
-                h = self.restore_original_length(h, original_mask, original_length)
-            else:
-                h = h[:, :original_length, :]
+        if self.config.expand_to_power_of_2 and original_mask is not None:
+            h = self.restore_original_length(h, original_mask, original_length)
+        elif use_pairwise_scan and h.shape[1] != original_length:
+            h = h[:, :original_length, :]
 
-        out = self.output_proj(h) if self.output_proj is not None else h
+        out = self.output_proj(h)
         return out  # Return processed sequence in embedding space
 
 

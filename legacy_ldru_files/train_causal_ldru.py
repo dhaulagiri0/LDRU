@@ -9,6 +9,7 @@ import tqdm
 import re
 import os
 import json
+import math
 from collections import Counter
 import matplotlib
 import os
@@ -16,19 +17,21 @@ import json
 import orbax.checkpoint as ocp
 import datetime
 import shutil
-from collections.abc import Mapping
-
-from improved_binary_operator import AblationBinaryOperator
 
 matplotlib.use("Agg")  # Non-interactive backend for saving plots
 import matplotlib.pyplot as plt
 
-from causal_ldru_v2_old import (
-    CausalLDRUConfig,
-    create_causal_ldru_model,
-    BinaryOperator,
+from causal_ldru_v2 import CausalLDRUConfig, create_causal_ldru_model, BinaryOperator
+from causal_ldru_v2 import (
+    CausalLDRULayer,
+    CausalLDRUEncoder,
+    CausalLDRULanguageModel,
 )
-from improved_binary_operator_old import ConvexGatedBinaryOperator, GRCOperator
+from improved_binary_operator import (
+    ConvexGatedBinaryOperator,
+    GRCOperator,
+    AblationBinaryOperator,
+)
 from tensorboardX import SummaryWriter
 
 # Import transformer from supplementary_code
@@ -53,6 +56,12 @@ from enum import Enum
 class TokenizerType(str, Enum):
     SENTENCEPIECE = "sentencepiece"
     TEXT = "text"
+    TIKTOKEN_GPT2 = "tiktoken_gpt2"
+
+
+class ComputeDType(str, Enum):
+    FLOAT32 = "float32"
+    BFLOAT16 = "bfloat16"
 
 
 BINARY_OPERATOR_REGISTRY = {
@@ -62,6 +71,68 @@ BINARY_OPERATOR_REGISTRY = {
     "grc": GRCOperator,
     "ablation": AblationBinaryOperator,
 }
+
+
+def _resolve_compute_dtype(compute_dtype: str) -> jnp.dtype:
+    if isinstance(compute_dtype, ComputeDType):
+        compute_dtype = compute_dtype.value
+    if compute_dtype == ComputeDType.FLOAT32.value:
+        return jnp.float32
+    if compute_dtype == ComputeDType.BFLOAT16.value:
+        return jnp.bfloat16
+    raise ValueError(
+        f"Unsupported compute dtype '{compute_dtype}'. "
+        f"Expected one of: {[d.value for d in ComputeDType]}"
+    )
+
+
+def configure_mixed_precision(compute_dtype: str) -> None:
+    """
+    Configure Haiku module policies.
+
+    Params stay fp32 for optimizer stability. Compute can be fp32/bfloat16.
+    Output remains fp32 for numerically stable loss computation.
+    """
+    import haiku as hk
+
+    resolved_dtype = _resolve_compute_dtype(compute_dtype)
+    policy_ctor = getattr(hk.mixed_precision, "Policy", None)
+    if policy_ctor is not None:
+        policy = policy_ctor(
+            param_dtype=jnp.float32,
+            compute_dtype=resolved_dtype,
+            output_dtype=jnp.float32,
+        )
+    else:
+        # Compatibility path for older Haiku versions.
+        import jmp
+
+        policy = jmp.Policy(
+            param_dtype=jnp.float32,
+            compute_dtype=resolved_dtype,
+            output_dtype=jnp.float32,
+        )
+
+    module_classes = [
+        hk.Linear,
+        hk.Embed,
+        hk.LayerNorm,
+        hk.LSTM,
+        BinaryOperator,
+        ConvexGatedBinaryOperator,
+        GRCOperator,
+        AblationBinaryOperator,
+        CausalLDRULayer,
+        CausalLDRUEncoder,
+        CausalLDRULanguageModel,
+        TransformerEncoder,
+    ]
+    if not hasattr(hk.mixed_precision, "set_policy"):
+        raise AttributeError(
+            "This Haiku version does not expose mixed_precision.set_policy."
+        )
+    for module_cls in module_classes:
+        hk.mixed_precision.set_policy(module_cls, policy)
 
 
 def resolve_binary_operator(operator_name: Optional[str]):
@@ -105,6 +176,9 @@ class LDRUExperimenstConfig:
 
     # Binary operator
     operator: Optional[Callable] = None
+    binop_expansion_factor: int = 4
+    ablation_expansion_mode: str = "grc"
+    ablation_combine_mode: str = "grc"
 
     # Scan method: 'default' (assoc_scan), or 'simple'
     scan_method: str = "default"
@@ -114,6 +188,8 @@ class LDRUExperimenstConfig:
 
     # Whether to apply attention at each scan step in custom associative scan
     attention_per_scan_step: bool = False
+    # Whether to project into/out of the scan state dimension.
+    use_input_output_proj: bool = True
 
     # specifies transformer encoding type
     use_alibi: bool = False  # defaults to sin cos
@@ -123,8 +199,14 @@ class LDRUExperimenstConfig:
     use_embeddings: bool = True
     share_embeddings: bool = False
     chunk_size: Optional[int] = None  # Use full attention
-    widening_factor: int = 16
     causal_masking: bool = True  # Critical for causal language modeling
+    tie_embeddings_transformer: bool = False
+    tie_embeddings_ldru: bool = False
+    transformer_prenorm_gelu_block: bool = False
+    ldru_prenorm_gelu_block: bool = False
+    # Aliases consumed directly by causal_ldru_v2 components.
+    tie_embeddings: bool = False
+    prenorm_gelu_block: bool = False
 
     # General training hyperparameters
     initial_learning_rate: float = (1e-3,)
@@ -350,10 +432,53 @@ class TextTokenizer(BaseTokenizer):
     def do_cleaning(cls) -> bool:
         return True
 
+    def get_tokenizer_path(self):
+        return None
+
+    def get_tokenizer_type(self):
+        return self.type
+
+
+class TiktokenGPT2Tokenizer(BaseTokenizer):
+    """Wrapper for tiktoken GPT-2 encoding."""
+
+    def __init__(self, encoding_name: str = "gpt2"):
+        try:
+            import tiktoken
+        except ImportError as exc:
+            raise ImportError(
+                "Missing dependency 'tiktoken'. Install with: pip install tiktoken"
+            ) from exc
+
+        self.encoding_name = encoding_name
+        self.tokenizer = tiktoken.get_encoding(encoding_name)
+        self.type = TokenizerType.TIKTOKEN_GPT2
+
+    def get_piece_size(self) -> int:
+        return int(self.tokenizer.n_vocab)
+
+    def encode(self, text: str) -> List[int]:
+        # Keep parity with existing pipeline expectations: no implicit EOT insertion.
+        return self.tokenizer.encode_ordinary(text)
+
+    def decode(self, token_ids: List[int]) -> str:
+        return self.tokenizer.decode(token_ids)
+
+    @classmethod
+    def do_cleaning(cls) -> bool:
+        return False
+
+    def get_tokenizer_path(self):
+        return self.encoding_name
+
+    def get_tokenizer_type(self):
+        return self.type
+
 
 TOKENIZER_TYPE_TO_CLASS = {
     TokenizerType.SENTENCEPIECE: SPTokenizer,
     TokenizerType.TEXT: TextTokenizer,
+    TokenizerType.TIKTOKEN_GPT2: TiktokenGPT2Tokenizer,
 }
 
 
@@ -577,55 +702,58 @@ def lstm_last_position_loss(params, model, rng_key, token_ids):
 
 def ldru_seq2seq_loss(params, model, rng_key, token_ids, lambda_l2=0.0):
     """
-    Sequence-to-sequence loss for LDRU with causal masking.
-    Now that LDRU outputs at all positions, we can predict next tokens
-    at every position while respecting causal constraints.
-    The loss ignores the first position since it has no previous context, and focuses on predicting
+    Sequence-to-sequence autoregressive LM loss for LDRU.
+    This mirrors the standard nanoGPT-style objective (no clipping/fallback shaping).
     """
-    # Standard autoregressive setup
-    input_token_ids = token_ids[:, :-1]  # [B, L-1] - input context
-    targets = token_ids[:, 1:]  # [B, L-1] - targets (next tokens)
+    input_token_ids = token_ids[:, :-1]  # [B, L-1]
+    targets = token_ids[:, 1:]  # [B, L-1]
 
-    # Forward pass - your model returns [B, L-1, vocab_size]
     logits = model.apply(params, rng_key, input_token_ids)  # [B, L-1, V]
-
-    # Apply stability improvements
-    logits = jnp.clip(logits, -10, 10)  # Clip extreme logits
-
-    # Compute cross-entropy loss across all positions except the first one (which has no context)
-    log_probs = jax.nn.log_softmax(logits, axis=-1)  # [B, L-1, V]
-
-    # Get target probabilities for each position
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
     target_log_probs = jnp.take_along_axis(
         log_probs, targets[..., None], axis=-1
-    ).squeeze(
-        -1
-    )  # [B, L-1]
+    ).squeeze(-1)  # [B, L-1]
 
-    # Clip target log probs to prevent numerical issues
-    target_log_probs = jnp.clip(target_log_probs, -10, 0)
-
-    # Mean loss over all positions and batch
     loss = -jnp.mean(target_log_probs)
     loss += lambda_l2 * compute_l2_loss(params)
 
-    # Apply loss clipping for stability
-    loss = jnp.where(jnp.isnan(loss), jnp.array(10.0), loss)
-    loss = jnp.clip(loss, 0, 20)
-
-    # Compute accuracy
     predictions = jnp.argmax(logits, axis=-1)
     accuracy = jnp.mean(predictions == targets)
 
-    # Compute per-position perplexity for seq2seq models
-    per_position_loss = -jnp.mean(
-        target_log_probs, axis=0
-    )  # [L-1] - average over batch
-    per_position_perplexity = jnp.exp(jnp.clip(per_position_loss, 0, 10))  # [L-1]
+    per_position_loss = -jnp.mean(target_log_probs, axis=0)
+    per_position_perplexity = jnp.exp(per_position_loss)
 
     return loss, {
         "accuracy": accuracy,
-        "perplexity": jnp.exp(jnp.clip(loss, 0, 10)),
+        "perplexity": jnp.exp(loss),
+        "per_position_perplexity": per_position_perplexity,
+        "per_position_loss": per_position_loss,
+    }
+
+
+def transformer_seq2seq_loss(params, model, rng_key, token_ids, lambda_l2=0.0):
+    """Standard autoregressive seq2seq LM loss (nanoGPT-style, no clipping)."""
+    input_token_ids = token_ids[:, :-1]  # [B, L-1]
+    targets = token_ids[:, 1:]  # [B, L-1]
+
+    logits = model.apply(params, rng_key, input_token_ids)  # [B, L-1, V]
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    target_log_probs = jnp.take_along_axis(
+        log_probs, targets[..., None], axis=-1
+    ).squeeze(-1)  # [B, L-1]
+
+    loss = -jnp.mean(target_log_probs)
+    loss += lambda_l2 * compute_l2_loss(params)
+
+    predictions = jnp.argmax(logits, axis=-1)
+    accuracy = jnp.mean(predictions == targets)
+
+    per_position_loss = -jnp.mean(target_log_probs, axis=0)
+    per_position_perplexity = jnp.exp(per_position_loss)
+
+    return loss, {
+        "accuracy": accuracy,
+        "perplexity": jnp.exp(loss),
         "per_position_perplexity": per_position_perplexity,
         "per_position_loss": per_position_loss,
     }
@@ -656,15 +784,24 @@ def create_data_loader(sequences, batch_size, rng_key):
     num_samples = sequences.shape[0]
     num_batches = num_samples // batch_size
 
-    # Shuffle data
-    indices = jax.random.permutation(rng_key, num_samples)
-    shuffled_sequences = sequences[indices]
+    if num_samples == 0 or num_batches == 0:
+        return
 
-    # Yield batches
+    # For very large datasets, avoid materializing a full permutation.
+    if num_samples > 2_000_000:
+        seed = int(jax.random.randint(rng_key, shape=(), minval=0, maxval=2**31 - 1))
+        np_rng = np.random.default_rng(seed)
+        for _ in range(num_batches):
+            batch_indices = np_rng.integers(0, num_samples, size=batch_size)
+            yield np.asarray(sequences[batch_indices])
+        return
+
+    indices = np.asarray(jax.random.permutation(rng_key, num_samples))
     for i in range(num_batches):
         start_idx = i * batch_size
         end_idx = start_idx + batch_size
-        yield shuffled_sequences[start_idx:end_idx]
+        batch_indices = indices[start_idx:end_idx]
+        yield np.asarray(sequences[batch_indices])
 
 
 def iter_token_sequences_from_text_file(
@@ -749,6 +886,164 @@ def estimate_num_sequences_from_text_file(
     return count
 
 
+def estimate_num_sequences_from_file_size(
+    file_path: str,
+    seq_length: int,
+    stride: int,
+    bytes_per_token: float = 4.0,
+) -> int:
+    """Fast rough estimate of sequence count from file size."""
+    if seq_length <= 0:
+        raise ValueError("seq_length must be > 0")
+    if stride <= 0:
+        raise ValueError("stride must be > 0")
+    if bytes_per_token <= 0:
+        raise ValueError("bytes_per_token must be > 0")
+
+    total_bytes = os.path.getsize(file_path)
+    approx_tokens = max(0, int(total_bytes / bytes_per_token))
+    if approx_tokens < seq_length:
+        return 0
+    return 1 + (approx_tokens - seq_length) // stride
+
+
+def resolve_sequence_bin_dtype(dtype_name: str) -> np.dtype:
+    dtype_map = {
+        "uint16": np.uint16,
+        "uint32": np.uint32,
+        "int32": np.int32,
+    }
+    if dtype_name not in dtype_map:
+        raise ValueError(
+            f"Unsupported --seq_bin_dtype '{dtype_name}'. "
+            f"Expected one of: {list(dtype_map.keys())}"
+        )
+    return dtype_map[dtype_name]
+
+
+def load_pretokenized_sequences(
+    file_path: str, seq_length: int, dtype_name: str
+) -> np.memmap:
+    if seq_length <= 0:
+        raise ValueError("seq_length must be > 0")
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Pretokenized sequence file not found: {file_path}")
+
+    dtype = resolve_sequence_bin_dtype(dtype_name)
+    itemsize = np.dtype(dtype).itemsize
+    file_size = os.path.getsize(file_path)
+
+    if file_size == 0:
+        raise ValueError(f"Pretokenized sequence file is empty: {file_path}")
+    if file_size % itemsize != 0:
+        raise ValueError(
+            f"File size ({file_size}) is not divisible by dtype itemsize ({itemsize}) "
+            f"for {file_path}."
+        )
+
+    total_tokens = file_size // itemsize
+    if total_tokens % seq_length != 0:
+        raise ValueError(
+            f"Token count ({total_tokens}) in {file_path} is not divisible by "
+            f"seq_length ({seq_length})."
+        )
+
+    num_sequences = total_tokens // seq_length
+    if num_sequences == 0:
+        raise ValueError(
+            f"No full sequences of length {seq_length} available in {file_path}."
+        )
+
+    return np.memmap(
+        file_path, dtype=dtype, mode="r", shape=(num_sequences, seq_length)
+    )
+
+
+def load_pretokenized_token_stream(file_path: str, dtype_name: str) -> np.memmap:
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Pretokenized token file not found: {file_path}")
+
+    dtype = resolve_sequence_bin_dtype(dtype_name)
+    itemsize = np.dtype(dtype).itemsize
+    file_size = os.path.getsize(file_path)
+
+    if file_size == 0:
+        raise ValueError(f"Pretokenized token file is empty: {file_path}")
+    if file_size % itemsize != 0:
+        raise ValueError(
+            f"File size ({file_size}) is not divisible by dtype itemsize ({itemsize}) "
+            f"for {file_path}."
+        )
+
+    total_tokens = file_size // itemsize
+    if total_tokens == 0:
+        raise ValueError(f"No tokens found in {file_path}.")
+
+    return np.memmap(file_path, dtype=dtype, mode="r", shape=(total_tokens,))
+
+
+def token_stream_to_sequence_view(
+    token_stream: np.ndarray, seq_length: int, stride: int
+) -> np.ndarray:
+    if seq_length <= 0:
+        raise ValueError("seq_length must be > 0")
+    if stride <= 0:
+        raise ValueError("stride must be > 0")
+
+    total_tokens = int(token_stream.shape[0])
+    if total_tokens < seq_length:
+        raise ValueError(
+            f"Token stream has only {total_tokens} tokens, fewer than seq_length={seq_length}."
+        )
+
+    num_sequences = 1 + (total_tokens - seq_length) // stride
+    if num_sequences <= 0:
+        raise ValueError(
+            f"No full windows can be formed with seq_length={seq_length}, stride={stride}."
+        )
+
+    itemsize = token_stream.dtype.itemsize
+    return np.lib.stride_tricks.as_strided(
+        token_stream,
+        shape=(num_sequences, seq_length),
+        strides=(stride * itemsize, itemsize),
+        writeable=False,
+    )
+
+
+def create_nanogpt_token_stream_loader(
+    token_stream: np.ndarray,
+    seq_length: int,
+    batch_size: int,
+    rng_key,
+    num_batches: int,
+) -> Iterator[np.ndarray]:
+    """nanoGPT-style random contiguous token batches sampled with replacement."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+    if seq_length <= 0:
+        raise ValueError("seq_length must be > 0")
+    if num_batches <= 0:
+        raise ValueError("num_batches must be > 0")
+
+    total_tokens = int(token_stream.shape[0])
+    max_start = total_tokens - seq_length
+    if max_start <= 0:
+        raise ValueError(
+            f"Token stream has {total_tokens} tokens, cannot sample seq_length={seq_length}."
+        )
+
+    seed = int(jax.random.randint(rng_key, shape=(), minval=0, maxval=2**31 - 1))
+    np_rng = np.random.default_rng(seed)
+    for _ in range(num_batches):
+        starts = np_rng.integers(0, max_start, size=batch_size)
+        batch = np.stack(
+            [np.asarray(token_stream[s : s + seq_length], dtype=np.int32) for s in starts],
+            axis=0,
+        )
+        yield batch
+
+
 def _pop_random_batch(
     shuffle_buffer: List[np.ndarray], batch_size: int, rng: np.random.Generator
 ) -> np.ndarray:
@@ -791,10 +1086,14 @@ def create_streaming_data_loader(
         chunk_line_buffer=chunk_line_buffer,
     )
 
+    target_watermark = effective_buffer + batch_size
+
     for sequence in sequence_iter:
         shuffle_buffer.append(sequence)
 
-        while len(shuffle_buffer) >= effective_buffer:
+        # Keep a high-watermark buffer for randomness, but avoid draining it in
+        # a burst (which causes long apparent stalls while refilling).
+        while len(shuffle_buffer) >= target_watermark:
             yield _pop_random_batch(shuffle_buffer, batch_size, np_rng)
 
     while len(shuffle_buffer) >= batch_size:
@@ -819,7 +1118,7 @@ def make_train_step(
         if use_transformer:
             # Use dedicated transformer loss function for proper autoregressive LM
             if seq2seq:
-                loss_fn = lambda p: ldru_seq2seq_loss(
+                loss_fn = lambda p: transformer_seq2seq_loss(
                     p, model, rng_key, batch, lambda_l2
                 )
             else:
@@ -827,7 +1126,7 @@ def make_train_step(
         elif use_transformer_ldru:
             # Transformer+LDRU hybrid: use LDRU loss functions since LDRU provides causal modeling
             if seq2seq:
-                loss_fn = lambda p: ldru_seq2seq_loss(
+                loss_fn = lambda p: transformer_seq2seq_loss(
                     p, model, rng_key, batch, lambda_l2
                 )
             else:
@@ -835,7 +1134,7 @@ def make_train_step(
         elif use_ldru_transformer:
             # LDRU+Transformer hybrid: use transformer loss functions since transformer provides final output
             if seq2seq:
-                loss_fn = lambda p: ldru_seq2seq_loss(
+                loss_fn = lambda p: transformer_seq2seq_loss(
                     p, model, rng_key, batch, lambda_l2
                 )
             else:
@@ -862,6 +1161,58 @@ def make_train_step(
         return new_params, new_opt_state, loss, metrics
 
     return jax.jit(_train_step)
+
+
+def make_grad_step(
+    model,
+    use_lstm=False,
+    use_transformer=False,
+    use_transformer_ldru=False,
+    use_ldru_transformer=False,
+    seq2seq=True,
+    lambda_l2=0.0,
+):
+    """Create a JIT-compiled gradient step that returns grads without updating."""
+
+    def _grad_step(params, rng_key, batch):
+        if use_transformer:
+            if seq2seq:
+                loss_fn = lambda p: transformer_seq2seq_loss(
+                    p, model, rng_key, batch, lambda_l2
+                )
+            else:
+                loss_fn = lambda p: next_token_loss(p, model, rng_key, batch)
+        elif use_transformer_ldru:
+            if seq2seq:
+                loss_fn = lambda p: transformer_seq2seq_loss(
+                    p, model, rng_key, batch, lambda_l2
+                )
+            else:
+                loss_fn = lambda p: next_token_loss(p, model, rng_key, batch)
+        elif use_ldru_transformer:
+            if seq2seq:
+                loss_fn = lambda p: transformer_seq2seq_loss(
+                    p, model, rng_key, batch, lambda_l2
+                )
+            else:
+                loss_fn = lambda p: next_token_loss(p, model, rng_key, batch)
+        elif use_lstm:
+            if seq2seq:
+                loss_fn = lambda p: lstm_next_token_loss(p, model, rng_key, batch)
+            else:
+                loss_fn = lambda p: lstm_last_position_loss(p, model, rng_key, batch)
+        else:
+            if seq2seq:
+                loss_fn = lambda p: ldru_seq2seq_loss(
+                    p, model, rng_key, batch, lambda_l2
+                )
+            else:
+                loss_fn = lambda p: next_token_loss(p, model, rng_key, batch)
+
+        (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        return loss, metrics, grads
+
+    return jax.jit(_grad_step)
 
 
 def create_lstm_model(config: LDRUExperimenstConfig):
@@ -911,7 +1262,9 @@ def create_transformer_model(config: LDRUExperimenstConfig):
         num_heads=config.num_transformer_heads,
         dropout_prob=config.dropout_prob,
         emb_init_scale=config.emb_init_scale,
-        use_embeddings=config.use_embeddings,
+        use_embeddings=(
+            False if config.tie_embeddings_transformer else config.use_embeddings
+        ),
         share_embeddings=config.share_embeddings,
         chunk_size=config.chunk_size,
         positional_encodings=pos_encs,
@@ -922,24 +1275,39 @@ def create_transformer_model(config: LDRUExperimenstConfig):
         ),
         widening_factor=config.widening_factor,
         causal_masking=config.causal_masking,
+        share_weight=False,
+        pre_norm_gelu_block=config.transformer_prenorm_gelu_block,
     )
     # Print config
     print("Transformer Config:")
     print(transformer_config)
 
     def transformer_forward(token_ids):
-        # Convert token_ids to one-hot encoding as expected by the transformer
-        one_hot_inputs = jax.nn.one_hot(token_ids, config.vocab_size)
-
-        # Use transformer encoder in decoder-only mode with causal masking
-        # This is appropriate for autoregressive language modeling
         transformer_encoder = TransformerEncoder(transformer_config)
-        encoded_output = transformer_encoder(one_hot_inputs)  # [B, L, embedding_dim]
+        if config.tie_embeddings_transformer:
+            emb_init = hk.initializers.TruncatedNormal(stddev=config.emb_init_scale)
+            token_embedding = hk.get_parameter(
+                "transformer_tied_token_embedding",
+                shape=(config.vocab_size, config.embedding_dim),
+                init=emb_init,
+            )
+            embedded_inputs = jnp.take(token_embedding, token_ids, axis=0)
+            # Match TransformerEncoder embedding path scale when use_embeddings=True.
+            embedded_inputs = embedded_inputs * jnp.sqrt(config.embedding_dim)
+            encoded_output = transformer_encoder(embedded_inputs)  # [B, L, emb]
+        else:
+            # Convert token_ids to one-hot encoding as expected by the transformer
+            one_hot_inputs = jax.nn.one_hot(token_ids, config.vocab_size)
+            # Use transformer encoder in decoder-only mode with causal masking.
+            encoded_output = transformer_encoder(one_hot_inputs)  # [B, L, emb]
 
         # Project to vocabulary size for next-token prediction
         # Return all positions for sequence-to-sequence loss
-        output_projection = hk.Linear(config.vocab_size)
-        logits = output_projection(encoded_output)  # [B, L, vocab_size]
+        if config.tie_embeddings_transformer:
+            logits = jnp.einsum("ble,ve->blv", encoded_output, token_embedding)
+        else:
+            output_projection = hk.Linear(config.vocab_size)
+            logits = output_projection(encoded_output)  # [B, L, vocab_size]
 
         return logits
 
@@ -966,9 +1334,14 @@ def create_ldru_transformer_model(config: LDRUExperimenstConfig):
             max_sequence_length=config.max_sequence_length,
             use_positional_encoding=False,  # Transformer already added positional encodings
             operator=config.operator,
+            binop_expansion_factor=config.binop_expansion_factor,
+            ablation_expansion_mode=config.ablation_expansion_mode,
+            ablation_combine_mode=config.ablation_combine_mode,
             scan_method=config.scan_method,
             expand_to_power_of_2=config.expand_to_power_of_2,
             attention_per_scan_step=config.attention_per_scan_step,
+            prenorm_gelu_block=config.ldru_prenorm_gelu_block,
+            tie_embeddings=False,
         )
 
         ldru_encoder = CausalLDRUEncoder(ldru_config)
@@ -992,6 +1365,8 @@ def create_ldru_transformer_model(config: LDRUExperimenstConfig):
             ),
             widening_factor=4,
             causal_masking=True,  # Critical for causal language modeling
+            share_weight=False,
+            pre_norm_gelu_block=config.transformer_prenorm_gelu_block,
         )
 
         transformer_encoder = TransformerEncoder(transformer_config)
@@ -1028,6 +1403,8 @@ def create_transformer_ldru_model(config: LDRUExperimenstConfig):
             ),
             widening_factor=4,  # Reduced widening factor
             causal_masking=True,  # Enable causal masking for proper language modeling
+            share_weight=False,
+            pre_norm_gelu_block=config.transformer_prenorm_gelu_block,
         )
 
         # Convert token_ids to one-hot encoding as expected by the transformer
@@ -1058,9 +1435,14 @@ def create_transformer_ldru_model(config: LDRUExperimenstConfig):
             max_sequence_length=config.max_sequence_length,
             use_positional_encoding=False,  # Transformer already added positional encodings
             operator=config.operator,
+            binop_expansion_factor=config.binop_expansion_factor,
+            ablation_expansion_mode=config.ablation_expansion_mode,
+            ablation_combine_mode=config.ablation_combine_mode,
             scan_method=config.scan_method,
             expand_to_power_of_2=config.expand_to_power_of_2,
             attention_per_scan_step=config.attention_per_scan_step,
+            prenorm_gelu_block=config.ldru_prenorm_gelu_block,
+            tie_embeddings=False,
         )
 
         # Pass encoded transformer output through LDRU encoder
@@ -1094,6 +1476,10 @@ def prepare_tokenizer(
     if tokenizer_type == TokenizerType.TEXT and tokenizer_path is None:
         print("Using TextTokenizer for word-level tokenization.")
         tokenizer = TextTokenizer(text_file_path, vocab_size=max_vocab_size)
+    elif tokenizer_type == TokenizerType.TIKTOKEN_GPT2:
+        encoding_name = tokenizer_path if tokenizer_path else "gpt2"
+        print(f"Using tiktoken tokenizer with encoding: {encoding_name}")
+        tokenizer = TiktokenGPT2Tokenizer(encoding_name=encoding_name)
     else:
         print("Using SPTokenizer for subword tokenization.")
         model_prefix = f"{tokenizer_folder}/{dataset_name}_tokenizer_vocab{max_vocab_size}_seq{seq_length}_for_{model_name}"
@@ -1115,15 +1501,20 @@ def create_datasets_for_training(
     test_text_file_path: str = None,
     tokenizer: BaseTokenizer = None,
     seq_length: int = 128,
+    stride: Optional[int] = None,
 ):
     train_data, val_data, test_data = None, None, None
+    if stride is None:
+        stride = max(1, seq_length // 2)
+    if stride <= 0:
+        raise ValueError("stride must be > 0")
     # Create dataset
     print("Creating training dataset from text file...")
 
     train_data, val_data = create_dataset_from_text_file(
         training_text_file_path,
         seq_length=seq_length,
-        stride=seq_length // 2,  # sliding window
+        stride=stride,
         train_split=1.0 if validation_text_file_path else 0.9,
         tokenizer=tokenizer,
     )
@@ -1138,7 +1529,7 @@ def create_datasets_for_training(
         val_data, _ = create_dataset_from_text_file(
             validation_text_file_path,
             seq_length=seq_length,
-            stride=seq_length // 2,  # sliding window
+            stride=stride,
             train_split=1.0,  # Use all data for validation
             tokenizer=tokenizer,  # Use same tokenizer to ensure consistent vocab
         )
@@ -1149,7 +1540,7 @@ def create_datasets_for_training(
         test_data, _ = create_dataset_from_text_file(
             test_text_file_path,
             seq_length=seq_length,
-            stride=seq_length // 2,  # sliding window
+            stride=stride,
             train_split=1.0,  # Use all data for testing
             tokenizer=tokenizer,  # Use same tokenizer to ensure consistent vocab
         )
@@ -1167,7 +1558,7 @@ def make_eval_step(
     seq2seq=True,
 ):
     if use_transformer or use_transformer_ldru or use_ldru_transformer:
-        loss_fn = ldru_seq2seq_loss if seq2seq else next_token_loss
+        loss_fn = transformer_seq2seq_loss if seq2seq else next_token_loss
     elif use_lstm:
         loss_fn = lstm_next_token_loss if seq2seq else lstm_last_position_loss
     else:
@@ -1182,6 +1573,7 @@ def make_eval_step(
 def train_model(
     log_dir: str,
     config: LDRUExperimenstConfig,
+    rng_seed: int = 42,
     enable_logging: bool = True,
     text_file_path: str = None,
     validation_text_file_path: str = None,
@@ -1202,7 +1594,25 @@ def train_model(
     streaming_train: bool = True,
     streaming_shuffle_buffer_size: int = 8192,
     streaming_chunk_line_buffer: int = 4096,
+    streaming_exact_sequence_estimate: bool = False,
+    streaming_estimate_bytes_per_token: float = 4.0,
+    train_seq_bin_path: str = None,
+    val_seq_bin_path: str = None,
+    test_seq_bin_path: str = None,
+    seq_bin_dtype: str = "uint16",
+    seq_bin_length: Optional[int] = None,
+    seq_bin_format: str = "auto",
+    seq_meta_json: str = None,
     optimizer_name: str = "adamw",
+    target_tokens: Optional[int] = None,
+    train_stride: Optional[int] = None,
+    nanogpt_batching: bool = False,
+    nanogpt_ppl_metric: bool = False,
+    warmup_steps: int = 0,
+    train_steps_per_epoch: Optional[int] = None,
+    validation_steps_per_epoch: Optional[int] = None,
+    test_steps_per_epoch: Optional[int] = None,
+    compute_dtype: str = ComputeDType.FLOAT32.value,
 ):
     """Main training function."""
 
@@ -1228,8 +1638,15 @@ def train_model(
         )
     )
     loss_type = "seq2seq" if seq2seq else "lastpos"
-    scan_type = "blelloch_random" if config.blelloch_random else "default"
-    model_name = f"{model_prefix}_model_{model_type}_{loss_type}_silu_{scan_type}_{seq_length}_SP"
+    scan_type = config.scan_method
+    if config.blelloch_random:
+        scan_type = f"{scan_type}_blelloch_random"
+    tokenizer_suffix = (
+        "TKGPT2"
+        if tokenizer_type == TokenizerType.TIKTOKEN_GPT2
+        else "TXT" if tokenizer_type == TokenizerType.TEXT else "SP"
+    )
+    model_name = f"{model_prefix}_model_{model_type}_{loss_type}_silu_{scan_type}_{seq_length}_{tokenizer_suffix}"
     checkpoint_path = os.path.join(checkpoint_dir, f"{model_name}")
     if enable_logging:
         if not os.path.exists(f"{log_dir}/{model_name}"):
@@ -1237,33 +1654,125 @@ def train_model(
         writer = SummaryWriter(logdir=f"{log_dir}/{model_name}")
 
     # Initialize RNG
-    rng_key = jax.random.PRNGKey(42)
+    rng_key = jax.random.PRNGKey(rng_seed)
     rng_key, init_key, data_key = jax.random.split(rng_key, 3)
 
-    assert (
-        text_file_path is not None
-    ), "Please provide a path to the training text file."
+    use_pretokenized_bins = train_seq_bin_path is not None
+    if not use_pretokenized_bins:
+        assert (
+            text_file_path is not None
+        ), "Please provide a path to the training text file."
 
-    print("Creating dataset from text file...")
-    # Prepare tokenizer
-    tokenizer = prepare_tokenizer(
-        tokenizer_type,
-        text_file_path,
-        tokenizer_path,
-        max_vocab_size,
-        seq_length,
-        model_name,
-        tokenizer_folder=DEFAULT_TOKENIZER_FOLDER,
-        dataset_name=text_file_path.split("/")[-1].split(".")[
-            0
-        ],  # Use filename as dataset name
-    )
+    configure_mixed_precision(compute_dtype)
+    print(f"Compute dtype: {compute_dtype} (params/output kept in float32)")
 
-    vocab_size = tokenizer.get_piece_size()
-    print(f"Tokenizer vocab size: {vocab_size}")
+    tokenizer = None
+    if use_pretokenized_bins:
+        print("Using pretokenized binary files for training data.")
+        selected_seq_bin_format = seq_bin_format
+        if seq_meta_json:
+            if not os.path.exists(seq_meta_json):
+                raise FileNotFoundError(f"--seq_meta_json not found: {seq_meta_json}")
+            with open(seq_meta_json, "r", encoding="utf-8") as f:
+                seq_meta = json.load(f)
+            meta_format = seq_meta.get("format")
+            if selected_seq_bin_format == "auto" and meta_format in (
+                "sequence",
+                "token_stream",
+            ):
+                selected_seq_bin_format = meta_format
+            meta_seq_len = seq_meta.get("sequence_config", {}).get("seq_length")
+            if (
+                selected_seq_bin_format in ("auto", "sequence")
+                and seq_bin_length is None
+                and meta_seq_len is not None
+            ):
+                seq_bin_length = int(meta_seq_len)
+            meta_tok = seq_meta.get("tokenizer", {})
+            if tokenizer_path is None and meta_tok.get("name_or_path"):
+                tokenizer_path = meta_tok.get("name_or_path")
+            if (
+                tokenizer_type == TokenizerType.SENTENCEPIECE
+                and meta_tok.get("type") == "tiktoken_gpt2"
+            ):
+                tokenizer_type = TokenizerType.TIKTOKEN_GPT2
+            meta_vocab = meta_tok.get("vocab_size")
+            if meta_vocab is not None:
+                config.vocab_size = int(meta_vocab)
+
+        if selected_seq_bin_format == "auto":
+            selected_seq_bin_format = "sequence"
+        if selected_seq_bin_format not in ("sequence", "token_stream"):
+            raise ValueError(
+                f"Unsupported --seq_bin_format '{selected_seq_bin_format}'. "
+                "Expected one of: auto, sequence, token_stream."
+            )
+
+        if selected_seq_bin_format == "sequence":
+            seq_bin_length = seq_bin_length if seq_bin_length is not None else seq_length
+            if seq_bin_length != seq_length:
+                raise ValueError(
+                    f"--seq_bin_length ({seq_bin_length}) must match training seq_length "
+                    f"({seq_length})."
+                )
+        elif seq_bin_length is not None:
+            print(
+                "Ignoring --seq_bin_length because --seq_bin_format token_stream "
+                "builds windows at runtime."
+            )
+
+        if tokenizer_type == TokenizerType.TIKTOKEN_GPT2:
+            encoding_name = tokenizer_path if tokenizer_path else "gpt2"
+            tokenizer = TiktokenGPT2Tokenizer(encoding_name=encoding_name)
+        elif tokenizer_type == TokenizerType.SENTENCEPIECE and tokenizer_path:
+            tokenizer = SPTokenizer(model_path=tokenizer_path)
+        elif tokenizer_type == TokenizerType.TEXT:
+            tokenizer = None
+
+        if tokenizer is not None:
+            vocab_size = tokenizer.get_piece_size()
+            print(f"Tokenizer vocab size: {vocab_size}")
+            config.vocab_size = vocab_size
+    else:
+        print("Creating dataset from text file...")
+        # Prepare tokenizer
+        tokenizer = prepare_tokenizer(
+            tokenizer_type,
+            text_file_path,
+            tokenizer_path,
+            max_vocab_size,
+            seq_length,
+            model_name,
+            tokenizer_folder=DEFAULT_TOKENIZER_FOLDER,
+            dataset_name=text_file_path.split("/")[-1].split(".")[
+                0
+            ],  # Use filename as dataset name
+        )
+
+        vocab_size = tokenizer.get_piece_size()
+        print(f"Tokenizer vocab size: {vocab_size}")
+        config.vocab_size = vocab_size
 
     train_data, val_data, test_data = None, None, None
-    train_stride = max(1, seq_length // 2)
+    train_stride = max(1, seq_length // 2) if train_stride is None else train_stride
+    if train_stride <= 0:
+        raise ValueError("--train_stride must be > 0 when provided.")
+    print(f"Training stride: {train_stride}")
+
+    if use_pretokenized_bins and streaming_train:
+        print(
+            "Pretokenized binary mode does not use text streaming. "
+            "Ignoring streaming_train and using indexed batch sampling."
+        )
+        streaming_train = False
+
+    if nanogpt_batching and not (
+        use_pretokenized_bins and selected_seq_bin_format == "token_stream"
+    ):
+        raise ValueError(
+            "--nanogpt_batching currently requires token-stream pretokenized input "
+            "(--train_seq_bin with --seq_bin_format token_stream)."
+        )
 
     if streaming_train and validation_text_file_path is None:
         print(
@@ -1271,16 +1780,128 @@ def train_model(
         )
         streaming_train = False
 
-    if streaming_train:
+    if use_pretokenized_bins:
+        if selected_seq_bin_format == "token_stream":
+            train_tokens = load_pretokenized_token_stream(
+                train_seq_bin_path, dtype_name=seq_bin_dtype
+            )
+            if nanogpt_batching:
+                train_data = train_tokens
+                train_sequence_count = max(1, len(train_tokens) - seq_length)
+                print(
+                    f"Loaded train token stream: {len(train_tokens):,} tokens "
+                    f"(nanoGPT-style random-offset batching, len={seq_length}) "
+                    f"from {train_seq_bin_path}"
+                )
+            else:
+                train_data = token_stream_to_sequence_view(
+                    train_tokens, seq_length=seq_length, stride=train_stride
+                )
+                train_sequence_count = len(train_data)
+                print(
+                    f"Loaded train token stream: {len(train_tokens):,} tokens "
+                    f"-> {len(train_data):,} windows (len={seq_length}, stride={train_stride}) "
+                    f"from {train_seq_bin_path}"
+                )
+        else:
+            train_data = load_pretokenized_sequences(
+                train_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
+            )
+            train_sequence_count = len(train_data)
+            print(f"Loaded train sequences: {len(train_data):,} from {train_seq_bin_path}")
+
+        if val_seq_bin_path:
+            if selected_seq_bin_format == "token_stream":
+                val_tokens = load_pretokenized_token_stream(
+                    val_seq_bin_path, dtype_name=seq_bin_dtype
+                )
+                if nanogpt_batching:
+                    val_data = val_tokens
+                    print(
+                        f"Loaded val token stream: {len(val_tokens):,} tokens "
+                        f"(nanoGPT-style random-offset batching) from {val_seq_bin_path}"
+                    )
+                else:
+                    val_data = token_stream_to_sequence_view(
+                        val_tokens, seq_length=seq_length, stride=train_stride
+                    )
+                    print(
+                        f"Loaded val token stream: {len(val_tokens):,} tokens "
+                        f"-> {len(val_data):,} windows from {val_seq_bin_path}"
+                    )
+            else:
+                val_data = load_pretokenized_sequences(
+                    val_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
+                )
+                print(f"Loaded val sequences: {len(val_data):,} from {val_seq_bin_path}")
+
+        if test_seq_bin_path:
+            if selected_seq_bin_format == "token_stream":
+                test_tokens = load_pretokenized_token_stream(
+                    test_seq_bin_path, dtype_name=seq_bin_dtype
+                )
+                if nanogpt_batching:
+                    test_data = test_tokens
+                    print(
+                        f"Loaded test token stream: {len(test_tokens):,} tokens "
+                        f"(nanoGPT-style random-offset batching) from {test_seq_bin_path}"
+                    )
+                else:
+                    test_data = token_stream_to_sequence_view(
+                        test_tokens, seq_length=seq_length, stride=train_stride
+                    )
+                    print(
+                        f"Loaded test token stream: {len(test_tokens):,} tokens "
+                        f"-> {len(test_data):,} windows from {test_seq_bin_path}"
+                    )
+            else:
+                test_data = load_pretokenized_sequences(
+                    test_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
+                )
+                print(f"Loaded test sequences: {len(test_data):,} from {test_seq_bin_path}")
+
+        if nanogpt_batching:
+            preview_loader = create_nanogpt_token_stream_loader(
+                train_data,
+                seq_length=seq_length,
+                batch_size=batch_size,
+                rng_key=data_key,
+                num_batches=1,
+            )
+            preview_batch = next(preview_loader, None)
+        else:
+            preview_batch = np.asarray(train_data[:batch_size])
+        if preview_batch.shape[0] == 0:
+            raise ValueError(
+                "No training batches could be created from pretokenized binaries."
+            )
+        if tokenizer is not None:
+            sample_text = tokenizer.decode(preview_batch[0].tolist())
+            print(f"\nSample sequence: '{sample_text[:100]}...'")
+
+    elif streaming_train:
         print("Using streaming training dataset loader (low-memory mode).")
-        train_sequence_count = estimate_num_sequences_from_text_file(
-            file_path=text_file_path,
-            tokenizer=tokenizer,
-            seq_length=seq_length,
-            stride=train_stride,
-            chunk_line_buffer=streaming_chunk_line_buffer,
-        )
-        print(f"Estimated training sequences: {train_sequence_count:,}")
+        if streaming_exact_sequence_estimate:
+            train_sequence_count = estimate_num_sequences_from_text_file(
+                file_path=text_file_path,
+                tokenizer=tokenizer,
+                seq_length=seq_length,
+                stride=train_stride,
+                chunk_line_buffer=streaming_chunk_line_buffer,
+            )
+            print(f"Estimated training sequences (exact pre-scan): {train_sequence_count:,}")
+        else:
+            train_sequence_count = estimate_num_sequences_from_file_size(
+                file_path=text_file_path,
+                seq_length=seq_length,
+                stride=train_stride,
+                bytes_per_token=streaming_estimate_bytes_per_token,
+            )
+            print(
+                "Estimated training sequences (fast, size-based): "
+                f"{train_sequence_count:,} "
+                f"(bytes_per_token={streaming_estimate_bytes_per_token:.2f})"
+            )
 
         preview_loader = create_streaming_data_loader(
             file_path=text_file_path,
@@ -1327,6 +1948,7 @@ def train_model(
             test_text_file_path,
             tokenizer,
             seq_length,
+            train_stride,
         )
         train_sequence_count = len(train_data)
         preview_batch = np.asarray(train_data[:batch_size])
@@ -1354,11 +1976,68 @@ def train_model(
     params = model.init(init_key, dummy_batch)
 
     # Initialize optimizer with learning rate scheduling
-    train_steps_per_epoch = max(1, train_sequence_count // batch_size)
-    learning_rate_schedule = optax.schedules.cosine_decay_schedule(
-        init_value=config.initial_learning_rate,
-        decay_steps=max(1, num_epochs * train_steps_per_epoch),
-        alpha=min_learning_rate / config.initial_learning_rate,
+    natural_train_steps_per_epoch = max(1, train_sequence_count // batch_size)
+    requested_train_steps_per_epoch = train_steps_per_epoch
+    if requested_train_steps_per_epoch is not None:
+        if requested_train_steps_per_epoch <= 0:
+            raise ValueError("--train_steps_per_epoch must be > 0 when provided.")
+        train_steps_per_epoch = requested_train_steps_per_epoch
+        print(
+            "Using configured train steps per epoch: "
+            f"{train_steps_per_epoch:,} "
+            f"(natural estimate: {natural_train_steps_per_epoch:,})"
+        )
+    else:
+        train_steps_per_epoch = natural_train_steps_per_epoch
+    if validation_steps_per_epoch is not None and validation_steps_per_epoch <= 0:
+        raise ValueError("--validation_steps_per_epoch must be > 0 when provided.")
+    if test_steps_per_epoch is not None and test_steps_per_epoch <= 0:
+        raise ValueError("--test_steps_per_epoch must be > 0 when provided.")
+    if warmup_steps < 0:
+        raise ValueError("--warmup_steps must be >= 0.")
+    tokens_per_step = int(batch_size * seq_length)
+    target_steps = None
+    if target_tokens is not None:
+        if target_tokens <= 0:
+            raise ValueError("--target_tokens must be > 0 when provided.")
+        target_steps = max(1, math.ceil(target_tokens / max(1, tokens_per_step)))
+        print(
+            "Token-budget mode enabled: "
+            f"target_tokens={target_tokens:,}, "
+            f"tokens_per_step={tokens_per_step:,}, "
+            f"target_steps={target_steps:,}"
+        )
+    decay_steps = (
+        max(1, target_steps)
+        if target_steps is not None
+        else max(1, num_epochs * train_steps_per_epoch)
+    )
+    warmup_steps_effective = min(int(warmup_steps), max(0, decay_steps - 1))
+    if warmup_steps_effective > 0:
+        warmup_schedule = optax.linear_schedule(
+            init_value=0.0,
+            end_value=config.initial_learning_rate,
+            transition_steps=warmup_steps_effective,
+        )
+        cosine_schedule = optax.schedules.cosine_decay_schedule(
+            init_value=config.initial_learning_rate,
+            decay_steps=max(1, decay_steps - warmup_steps_effective),
+            alpha=min_learning_rate / config.initial_learning_rate,
+        )
+        learning_rate_schedule = optax.join_schedules(
+            schedules=[warmup_schedule, cosine_schedule],
+            boundaries=[warmup_steps_effective],
+        )
+    else:
+        learning_rate_schedule = optax.schedules.cosine_decay_schedule(
+            init_value=config.initial_learning_rate,
+            decay_steps=decay_steps,
+            alpha=min_learning_rate / config.initial_learning_rate,
+        )
+    print(
+        "LR schedule: "
+        f"decay_steps={decay_steps:,}, "
+        f"warmup_steps={warmup_steps_effective:,}"
     )
     optimizer_name = optimizer_name.lower()
     if optimizer_name == "adamw":
@@ -1481,10 +2160,30 @@ def train_model(
     print(f"Initial learning rate: {current_learning_rate:.2e}")
 
     # Training loop
-    print("Starting training...")
+    estimated_total_epochs = (
+        max(1, math.ceil(target_steps / train_steps_per_epoch))
+        if target_steps is not None
+        else num_epochs
+    )
+    if target_steps is not None:
+        estimated_remaining_epochs = max(0, estimated_total_epochs - start_epoch)
+        print(
+            "Estimated epochs to reach token budget: "
+            f"total={estimated_total_epochs}, "
+            f"remaining_from_current={estimated_remaining_epochs}"
+        )
+    epoch_print_total = estimated_total_epochs if target_steps is not None else num_epochs
+    epoch_loop_limit = max(num_epochs, estimated_total_epochs)
 
-    for epoch in range(start_epoch, num_epochs):
-        print(f"\nEpoch {epoch + 1}/{num_epochs}")
+    print("Starting training...")
+    global_step = max(0, start_epoch * train_steps_per_epoch)
+    stop_for_token_budget = False
+
+    for epoch in range(start_epoch, epoch_loop_limit):
+        if target_steps is not None and global_step >= target_steps:
+            stop_for_token_budget = True
+            break
+        print(f"\nEpoch {epoch + 1}/{epoch_print_total}")
 
         # Create data loader for this epoch
         rng_key, epoch_key = jax.random.split(rng_key)
@@ -1499,6 +2198,14 @@ def train_model(
                 shuffle_buffer_size=streaming_shuffle_buffer_size,
                 chunk_line_buffer=streaming_chunk_line_buffer,
             )
+        elif nanogpt_batching:
+            data_loader = create_nanogpt_token_stream_loader(
+                train_data,
+                seq_length=seq_length,
+                batch_size=batch_size,
+                rng_key=epoch_key,
+                num_batches=train_steps_per_epoch,
+            )
         else:
             data_loader = create_data_loader(train_data, batch_size, epoch_key)
 
@@ -1506,6 +2213,7 @@ def train_model(
         epoch_accuracies = []
         epoch_perplexities = []
         new_best = False
+        epoch_step_count = 0
 
         # Training batches
         pbar = tqdm.tqdm(data_loader, desc="Training", position=0, leave=True)
@@ -1517,6 +2225,8 @@ def train_model(
             params, opt_state, loss, metrics = compiled_train_step(
                 params, opt_state, step_key, batch
             )
+            global_step += 1
+            epoch_step_count += 1
 
             epoch_losses.append(float(loss))
             epoch_accuracies.append(float(metrics["accuracy"]))
@@ -1531,6 +2241,29 @@ def train_model(
                     "LR": f"{current_learning_rate:.2e}",
                 }
             )
+            if target_steps is not None and global_step >= target_steps:
+                stop_for_token_budget = True
+                break
+            if (
+                requested_train_steps_per_epoch is not None
+                and epoch_step_count >= requested_train_steps_per_epoch
+            ):
+                break
+
+        if len(epoch_losses) == 0:
+            raise ValueError(
+                "No training batches were produced for this epoch. "
+                "Check batch_size, dataset size, and data loader settings."
+            )
+        if (
+            requested_train_steps_per_epoch is not None
+            and epoch_step_count < requested_train_steps_per_epoch
+            and not stop_for_token_budget
+        ):
+            print(
+                "Warning: Data loader ended before configured steps-per-epoch were reached "
+                f"({epoch_step_count:,}/{requested_train_steps_per_epoch:,})."
+            )
 
         # Print epoch statistics
         avg_loss = np.mean(epoch_losses)
@@ -1540,6 +2273,9 @@ def train_model(
         print(f"Average loss: {avg_loss:.4f}")
         print(f"Average accuracy: {avg_accuracy:.4f}")
         print(f"Average perplexity: {avg_perplexity:.4f}")
+        if nanogpt_ppl_metric:
+            nanogpt_train_ppl = float(np.exp(avg_loss))
+            print(f"Average perplexity (nanoGPT-style): {nanogpt_train_ppl:.4f}")
         print(f"Current learning rate: {current_learning_rate:.2e}")
 
         if enable_logging:
@@ -1564,6 +2300,10 @@ def train_model(
                 dataset_name="Validation",
                 writer=writer if enable_logging else None,
                 compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
+                max_eval_steps=validation_steps_per_epoch,
+                nanogpt_batching=nanogpt_batching,
+                seq_length=seq_length,
+                nanogpt_ppl_metric=nanogpt_ppl_metric,
             )
 
             # Check for improvement and update learning rate if stagnant
@@ -1611,7 +2351,7 @@ def train_model(
             print("No validation data provided, skipping validation and checkpointing.")
 
         # check if epoch has no improvement for a certain number of epochs and reduce learning rate if needed
-        if epochs_without_improvement >= 10:
+        if target_steps is None and epochs_without_improvement >= 10:
             # terminate
             print(
                 f"Early stopping triggered after {epochs_without_improvement} epochs without improvement."
@@ -1635,6 +2375,10 @@ def train_model(
                 dataset_name="Test",
                 writer=writer if enable_logging else None,
                 compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
+                max_eval_steps=test_steps_per_epoch,
+                nanogpt_batching=nanogpt_batching,
+                seq_length=seq_length,
+                nanogpt_ppl_metric=nanogpt_ppl_metric,
             )
 
         # Generate text after each epoch to monitor progress
@@ -1658,7 +2402,22 @@ def train_model(
                 print(f"Generation failed: {e}")
                 print()
 
+        if stop_for_token_budget:
+            print(
+                f"Reached target step budget ({global_step:,}/{target_steps:,} steps); "
+                "stopping training."
+            )
+            break
+
     print("\nTraining completed")
+    if target_steps is not None:
+        actual_tokens_seen = int(global_step * tokens_per_step)
+        print(
+            "Token-budget summary: "
+            f"steps={global_step:,}, "
+            f"tokens_seen={actual_tokens_seen:,}, "
+            f"target_tokens={target_tokens:,}"
+        )
 
     # Save final checkpoint
     if save_checkpoints:
@@ -1698,6 +2457,10 @@ def evaluate_model_on_dataset(
     dataset_name="Validation",
     writer: SummaryWriter = None,
     compiled_eval_step=None,
+    max_eval_steps: Optional[int] = None,
+    nanogpt_batching: bool = False,
+    seq_length: Optional[int] = None,
+    nanogpt_ppl_metric: bool = False,
 ):
     rng_key, dataset_key = jax.random.split(rng_key)
     dataset_loss, dataset_metrics = evaluate_model(
@@ -1712,10 +2475,26 @@ def evaluate_model_on_dataset(
         seq2seq=seq2seq,
         eval_model=eval_model,  # Use dropout-free model for evaluation
         compiled_eval_step=compiled_eval_step,  # Pass the compiled evaluation step for efficiency
+        max_eval_steps=max_eval_steps,
+        nanogpt_batching=nanogpt_batching,
+        seq_length=seq_length,
+        nanogpt_ppl_metric=nanogpt_ppl_metric,
     )
     print(f"{dataset_name} loss: {dataset_loss:.4f}")
     print(f"{dataset_name} accuracy: {dataset_metrics['accuracy']:.4f}")
     print(f"{dataset_name} perplexity: {dataset_metrics['perplexity']:.4f}")
+    if "nanogpt_perplexity" in dataset_metrics:
+        print(
+            f"{dataset_name} perplexity (nanoGPT-style): "
+            f"{dataset_metrics['nanogpt_perplexity']:.4f}"
+        )
+    if "last_token_perplexity" in dataset_metrics:
+        print(f"{dataset_name} last-token perplexity: {dataset_metrics['last_token_perplexity']:.4f}")
+    if "last_token_perplexity_nanogpt" in dataset_metrics:
+        print(
+            f"{dataset_name} last-token perplexity (nanoGPT-style): "
+            f"{dataset_metrics['last_token_perplexity_nanogpt']:.4f}"
+        )
 
     # Report per-position perplexity for seq2seq models
     if seq2seq and "per_position_perplexity" in dataset_metrics:
@@ -1744,6 +2523,24 @@ def evaluate_model_on_dataset(
             dataset_metrics["perplexity"],
             epoch + 1,
         )
+        if "nanogpt_perplexity" in dataset_metrics:
+            writer.add_scalar(
+                "Perplexity/{}_NanoGPTStyle".format(dataset_name),
+                dataset_metrics["nanogpt_perplexity"],
+                epoch + 1,
+            )
+        if "last_token_perplexity" in dataset_metrics:
+            writer.add_scalar(
+                "Perplexity/{}_LastToken".format(dataset_name),
+                dataset_metrics["last_token_perplexity"],
+                epoch + 1,
+            )
+        if "last_token_perplexity_nanogpt" in dataset_metrics:
+            writer.add_scalar(
+                "Perplexity/{}_LastToken_NanoGPTStyle".format(dataset_name),
+                dataset_metrics["last_token_perplexity_nanogpt"],
+                epoch + 1,
+            )
 
         # Log per-position metrics if available
         if seq2seq and "per_position_perplexity" in dataset_metrics:
@@ -1876,15 +2673,9 @@ def save_checkpoint(
     print(f"Saved checkpoint at step {step} -> {step_path}")
 
 
-def load_checkpoint(checkpoint_dir: str, step: int, load_best_only: bool = True, tokenizer_override: str = None):
+def load_checkpoint(checkpoint_dir: str, step: int, load_best_only: bool = True):
     """
     Load JAX training state using Orbax.
-    
-    Args:
-        checkpoint_dir: Path to checkpoint directory
-        step: Step number to load
-        load_best_only: If True, load best_model; else load step_{step}
-        tokenizer_override: If provided, use this tokenizer path instead of checkpoint metadata
     """
     checkpoint_dir = os.path.abspath(checkpoint_dir)
 
@@ -1938,13 +2729,11 @@ def load_checkpoint(checkpoint_dir: str, step: int, load_best_only: bool = True,
 
     tokenizer_type = metadata.get("tokenizer_type")
     tokenizer_path = metadata.get("tokenizer_path")
-    
-    # Use tokenizer_override if provided (CLI arg takes precedence)
-    if tokenizer_override is not None:
-        tokenizer_path = tokenizer_override
-    
     if tokenizer_type == TokenizerType.SENTENCEPIECE:
         tokenizer = SPTokenizer(model_path=tokenizer_path)
+    elif tokenizer_type == TokenizerType.TIKTOKEN_GPT2:
+        encoding_name = tokenizer_path if tokenizer_path else "gpt2"
+        tokenizer = TiktokenGPT2Tokenizer(encoding_name=encoding_name)
     elif tokenizer_type == TokenizerType.TEXT:
         tokenizer = None
         print(
@@ -1968,61 +2757,39 @@ def load_checkpoint(checkpoint_dir: str, step: int, load_best_only: bool = True,
     )
 
 
-def _iter_param_leaves(params, prefix=()):
-    if isinstance(params, Mapping):
-        for key, value in params.items():
-            yield from _iter_param_leaves(value, prefix + (str(key),))
-    else:
-        yield prefix, params
-
-
-def _infer_transformer_widening_factor(params, embedding_dim: int) -> Optional[int]:
-    if params is None or embedding_dim is None:
-        return None
-    for path, value in _iter_param_leaves(params):
-        if not hasattr(value, "shape"):
-            continue
-        if len(value.shape) != 2:
-            continue
-        if value.shape[0] != embedding_dim:
-            continue
-        if value.shape[1] % embedding_dim != 0:
-            continue
-        path_str = "/".join(path)
-        if "transformer_encoder" in path_str and "transformer_layer" in path_str and "linear" in path_str:
-            return int(value.shape[1] // embedding_dim)
-    return None
-
-
-def _align_transformer_config_with_params(
-    config: LDRUExperimenstConfig,
-    params,
-    checkpoint_path: str,
-) -> LDRUExperimenstConfig:
-    if config is None:
-        return config
-    updated = None
-    inferred_widening = _infer_transformer_widening_factor(params, config.embedding_dim)
-    if inferred_widening and inferred_widening != config.widening_factor:
-        print(
-            "  Compatibility mode: checkpoint transformer widening factor "
-            f"({inferred_widening}) overrides metadata ({config.widening_factor}) "
-            f"for {checkpoint_path}."
+def checkpoint_uses_legacy_projection_layout(params) -> bool:
+    if not isinstance(params, dict):
+        return False
+    keys = [str(key) for key in params.keys()]
+    has_input_output = any(
+        re.search(
+            r"/CausalLDRUEncoder/CausalLDRULayer(?:_\d+)?/~/"
+            r"(input_proj|output_proj)$",
+            key,
         )
-        updated = config.__dict__.copy()
-        updated["widening_factor"] = inferred_widening
-
-    checkpoint_lower = checkpoint_path.lower()
-    if "alibi" in checkpoint_lower and not getattr(config, "use_alibi", False):
-        print(
-            "  Compatibility mode: checkpoint name includes 'alibi'; "
-            "enabling ALiBi positional encodings for evaluation."
+        for key in keys
+    )
+    has_legacy_linear = any(
+        re.search(
+            r"/CausalLDRUEncoder/CausalLDRULayer(?:_\d+)?/~/"
+            r"linear(?:_1)?$",
+            key,
         )
-        if updated is None:
-            updated = config.__dict__.copy()
-        updated["use_alibi"] = True
+        for key in keys
+    )
+    return has_legacy_linear and not has_input_output
 
-    return LDRUExperimenstConfig(**updated) if updated is not None else config
+
+def resolve_legacy_projection_layout(config, params):
+    if checkpoint_uses_legacy_projection_layout(params):
+        print(
+            "  Compatibility mode: legacy projection layout detected; "
+            "disabling input/output projections"
+        )
+        return LDRUExperimenstConfig(
+            **{**config.__dict__, "use_input_output_proj": False}
+        )
+    return config
 
 
 def format_per_position_perplexity(per_pos_ppl, max_display=16):
@@ -2147,9 +2914,39 @@ def evaluate_model(
     seq2seq=True,
     eval_model=None,  # Optional evaluation model with dropout disabled
     compiled_eval_step=None,  # Optional pre-compiled evaluation step for efficiency
+    max_eval_steps: Optional[int] = None,
+    nanogpt_batching: bool = False,
+    seq_length: Optional[int] = None,
+    nanogpt_ppl_metric: bool = False,
 ):
     """Evaluate model on validation data."""
-    val_loader = create_data_loader(val_data, batch_size, rng_key)
+    if nanogpt_batching:
+        if seq_length is None:
+            raise ValueError("seq_length is required when nanogpt_batching=True.")
+        if not hasattr(val_data, "shape") or len(val_data.shape) != 1:
+            raise ValueError(
+                "nanogpt_batching expects 1D token-stream validation data."
+            )
+        total_possible = int(val_data.shape[0]) - int(seq_length)
+        if total_possible <= 0:
+            raise ValueError(
+                f"Validation token stream too short ({int(val_data.shape[0])} tokens) "
+                f"for seq_length={seq_length}."
+            )
+        eval_batches = (
+            max_eval_steps
+            if max_eval_steps is not None
+            else max(1, total_possible // max(1, batch_size))
+        )
+        val_loader = create_nanogpt_token_stream_loader(
+            val_data,
+            seq_length=seq_length,
+            batch_size=batch_size,
+            rng_key=rng_key,
+            num_batches=eval_batches,
+        )
+    else:
+        val_loader = create_data_loader(val_data, batch_size, rng_key)
 
     # Use evaluation model if provided (should have dropout disabled)
     model_for_eval = eval_model if eval_model is not None else model
@@ -2178,6 +2975,7 @@ def evaluate_model(
 
     # Wrap validation iterator with tqdm for progress reporting
     pbar = tqdm.tqdm(val_loader, desc="Validation", leave=False)
+    eval_step_count = 0
 
     for batch in pbar:
         rng_key, step_key = jax.random.split(rng_key)
@@ -2203,9 +3001,20 @@ def evaluate_model(
                 "PPL": f"{np.mean(perplexities):.1f}",
             }
         )
+        eval_step_count += 1
+        if max_eval_steps is not None and eval_step_count >= max_eval_steps:
+            break
+
+    if len(losses) == 0:
+        raise ValueError(
+            "No evaluation batches were produced. "
+            "Check evaluation dataset size, batch_size, and step limits."
+        )
 
     avg_loss = np.mean(losses)
     avg_metrics = {"accuracy": np.mean(accuracies), "perplexity": np.mean(perplexities)}
+    if nanogpt_ppl_metric:
+        avg_metrics["nanogpt_perplexity"] = float(np.exp(avg_loss))
 
     # Add per-position metrics for seq2seq models
     if seq2seq and len(per_position_perplexities) > 0:
@@ -2216,9 +3025,11 @@ def evaluate_model(
         avg_metrics["per_position_perplexity"] = avg_per_position_perplexity
         avg_metrics["per_position_loss"] = avg_per_position_loss
         avg_metrics["last_token_perplexity"] = float(avg_per_position_perplexity[-1])
-        avg_metrics["last_token_perplexity_nanogpt"] = float(
-            np.exp(np.clip(avg_per_position_loss[-1], 0, 10))
-        )
+        avg_metrics["last_token_loss"] = float(avg_per_position_loss[-1])
+        if nanogpt_ppl_metric:
+            avg_metrics["last_token_perplexity_nanogpt"] = float(
+                np.exp(avg_per_position_loss[-1])
+            )
 
         # Additional summary statistics
         avg_metrics["min_position_perplexity"] = np.min(avg_per_position_perplexity)
@@ -2839,14 +3650,15 @@ def evaluate_from_checkpoint(
                   ``eval_plots/<checkpoint_stem>/``.
         batch_size: Batch size for aggregate evaluation (only used when
                     n_sequences == 0).
+        nanogpt_ppl_metric: Also report nanoGPT-style perplexity metrics.
 
     Returns:
         Dict with evaluation results.
     """
     params, _, config, epoch, best_ppl, tokenizer = load_checkpoint(
-        checkpoint_path, step=step, tokenizer_override=tokenizer_model_path
+        checkpoint_path, step=step
     )
-    config = _align_transformer_config_with_params(config, params, checkpoint_path)
+    config = resolve_legacy_projection_layout(config, params)
     print(f"Model config: {config}")
     if tokenizer is None:
         raise ValueError(
@@ -2926,6 +3738,7 @@ def evaluate_from_checkpoint(
             use_ldru_transformer=use_ldru_transformer,
             seq2seq=seq2seq,
             eval_model=eval_model,
+            nanogpt_ppl_metric=nanogpt_ppl_metric,
         )
 
         print(f"\n{'=' * 60}")
@@ -2933,11 +3746,11 @@ def evaluate_from_checkpoint(
         print(f"{'=' * 60}")
         print(f"  Loss       : {avg_loss:.4f}")
         print(f"  Perplexity : {avg_metrics['perplexity']:.4f}")
-        if nanogpt_ppl_metric:
-            print(f"  nanoGPT PPL: {float(np.exp(np.clip(avg_loss, 0, 10))):.4f}")
-        if "last_token_perplexity_nanogpt" in avg_metrics:
+        if nanogpt_ppl_metric and "nanogpt_perplexity" in avg_metrics:
+            print(f"  nanoGPT PPL: {avg_metrics['nanogpt_perplexity']:.4f}")
+        if "last_token_perplexity" in avg_metrics:
             print(
-                f"  Last token PPL: {avg_metrics['last_token_perplexity_nanogpt']:.4f}"
+                f"  Last token PPL: {avg_metrics['last_token_perplexity']:.4f}"
             )
         print(f"  Accuracy   : {avg_metrics['accuracy']:.4f}")
 
@@ -3003,10 +3816,6 @@ def evaluate_sequence_length_range(
     max_seq_len: int = 64,
     plot_dir: str = None,
     batch_size: int = 512,
-    tokenizer_model_path: str = None,
-    acc_y_min: float = None,
-    acc_y_max: float = None,
-    nanogpt_ppl_metric: bool = False,
 ):
     """
     Evaluate a checkpoint across a range of sequence lengths (min_seq_len to
@@ -3043,8 +3852,9 @@ def evaluate_sequence_length_range(
 
     # --- load checkpoint once ---
     params, _, config, epoch, best_ppl, tokenizer = load_checkpoint(
-        checkpoint_path, step=step, tokenizer_override=tokenizer_model_path
+        checkpoint_path, step=step
     )
+    config = resolve_legacy_projection_layout(config, params)
     if tokenizer is None:
         raise ValueError(
             "Checkpoint does not contain a saved tokenizer. "
@@ -3121,17 +3931,7 @@ def evaluate_sequence_length_range(
             "seq_len": seq_len,
             "n_sequences": int(len(sequences)),
             "loss": float(avg_loss),
-            "perplexity": float(
-                np.exp(np.clip(avg_loss, 0, 10))
-                if nanogpt_ppl_metric
-                else avg_metrics["perplexity"]
-            ),
-            "last_token_perplexity": float(
-                avg_metrics.get(
-                    "last_token_perplexity_nanogpt" if nanogpt_ppl_metric else "last_token_perplexity",
-                    np.nan,
-                )
-            ),
+            "perplexity": float(avg_metrics["perplexity"]),
             "accuracy": float(avg_metrics["accuracy"]),
         }
         results.append(row)
@@ -3147,11 +3947,10 @@ def evaluate_sequence_length_range(
     # --- save CSV ---
     csv_path = os.path.join(plot_dir, "seqlen_range_results.csv")
     with open(csv_path, "w") as fh:
-        fh.write("seq_len,n_sequences,loss,perplexity,last_token_perplexity,accuracy\n")
+        fh.write("seq_len,n_sequences,loss,perplexity,accuracy\n")
         for r in results:
             fh.write(
-                f"{r['seq_len']},{r['n_sequences']},{r['loss']:.6f},{r['perplexity']:.6f},"
-                f"{r['last_token_perplexity']:.6f},{r['accuracy']:.6f}\n"
+                f"{r['seq_len']},{r['n_sequences']},{r['loss']:.6f},{r['perplexity']:.6f},{r['accuracy']:.6f}\n"
             )
     print(f"\n  CSV  → {csv_path}")
 
@@ -3197,21 +3996,7 @@ def evaluate_sequence_length_range(
     )
     ax2.set_ylabel("Accuracy", color=color_acc, fontsize=12)
     ax2.tick_params(axis="y", labelcolor=color_acc)
-    if acc_y_min is not None or acc_y_max is not None:
-        ax2.set_ylim(bottom=acc_y_min, top=acc_y_max)
-    else:
-        acc_vals = accuracies[np.isfinite(accuracies)]
-        if len(acc_vals) > 0:
-            lo = float(np.min(acc_vals))
-            hi = float(np.max(acc_vals))
-            pad = max(0.01, (hi - lo) * 0.15)
-            lo = max(0.0, lo - pad)
-            hi = min(1.0, hi + pad)
-            if hi - lo < 0.05:
-                center = (lo + hi) / 2.0
-                lo = max(0.0, center - 0.025)
-                hi = min(1.0, center + 0.025)
-            ax2.set_ylim(bottom=lo, top=hi)
+    ax2.set_ylim(0, 1.05)
 
     ckpt_stem = os.path.basename(checkpoint_path.rstrip("/"))
     ax1.set_title(
@@ -3285,6 +4070,7 @@ def compare_models(
         params, config, tokenizer, _, _, epoch, best_ppl, _, _, _ = load_checkpoint(
             cp_path
         )
+        config = resolve_legacy_projection_layout(config, params)
         if tokenizer is None:
             raise ValueError(f"Checkpoint {cp_path} has no saved tokenizer.")
 
@@ -3559,6 +4345,12 @@ if __name__ == "__main__":
         help="Optimizer to use for training (default: adamw).",
     )
     parser.add_argument(
+        "--rng_seed",
+        type=int,
+        default=42,
+        help="Random seed for JAX PRNG (default: 42).",
+    )
+    parser.add_argument(
         "--binary_operator",
         type=str,
         default="default",
@@ -3566,9 +4358,39 @@ if __name__ == "__main__":
         help="Binary operator to use for LDRU composition (default: default).",
     )
     parser.add_argument(
+        "--binop_expansion_factor",
+        type=int,
+        default=4,
+        help="Hidden expansion factor for compatible binary operators like GRC (default: 4).",
+    )
+    parser.add_argument(
+        "--ablation_expansion_mode",
+        type=str,
+        default="grc",
+        choices=["binary", "grc"],
+        help="Expansion stage mode for --binary_operator ablation.",
+    )
+    parser.add_argument(
+        "--ablation_combine_mode",
+        type=str,
+        default="grc",
+        choices=["binary", "grc"],
+        help="Combine stage mode for --binary_operator ablation.",
+    )
+    parser.add_argument(
         "--blelloch_random",
         action="store_true",
         help="Use Blelloch random scan method for LDRU (default is deterministic)",
+    )
+    parser.add_argument(
+        "--scan_method",
+        type=str,
+        default="default",
+        choices=["default", "assoc", "sequential", "simple"],
+        help=(
+            "LDRU scan method: 'default'/'assoc' for associative tree scan, "
+            "'sequential'/'simple' for naive left-to-right scan."
+        ),
     )
     parser.add_argument(
         "--no_logging",
@@ -3624,6 +4446,55 @@ if __name__ == "__main__":
         type=str,
         default="ptb_test.txt",
         help="Path to text file to use as prompt for testing a saved model (used with --test_model)",
+    )
+    parser.add_argument(
+        "--train_seq_bin",
+        type=str,
+        default=None,
+        help="Optional path to pretokenized train sequence binary file.",
+    )
+    parser.add_argument(
+        "--val_seq_bin",
+        type=str,
+        default=None,
+        help="Optional path to pretokenized validation sequence binary file.",
+    )
+    parser.add_argument(
+        "--test_seq_bin",
+        type=str,
+        default=None,
+        help="Optional path to pretokenized test sequence binary file.",
+    )
+    parser.add_argument(
+        "--seq_bin_dtype",
+        type=str,
+        default="uint16",
+        choices=["uint16", "uint32", "int32"],
+        help="Dtype used in pretokenized sequence binaries.",
+    )
+    parser.add_argument(
+        "--seq_bin_length",
+        type=int,
+        default=None,
+        help="Sequence length stored in pretokenized binaries (must match --max_seq_len).",
+    )
+    parser.add_argument(
+        "--seq_bin_format",
+        type=str,
+        default="auto",
+        choices=["auto", "sequence", "token_stream"],
+        help=(
+            "Binary format for --train_seq_bin/--val_seq_bin/--test_seq_bin. "
+            "'sequence' expects pre-windowed rows; "
+            "'token_stream' expects a flat token stream and windows it at runtime; "
+            "'auto' infers from --seq_meta_json format when available."
+        ),
+    )
+    parser.add_argument(
+        "--seq_meta_json",
+        type=str,
+        default=None,
+        help="Optional metadata JSON from pretokenization step.",
     )
     parser.add_argument(
         "--max_vocab_size",
@@ -3688,24 +4559,6 @@ if __name__ == "__main__":
         help="Batch size for aggregate evaluation when --n_sequences 0 (default: 32)",
     )
     parser.add_argument(
-        "--seq_len_acc_min",
-        type=float,
-        default=None,
-        help="Optional lower y-axis bound for accuracy plots.",
-    )
-    parser.add_argument(
-        "--seq_len_acc_max",
-        type=float,
-        default=None,
-        help="Optional upper y-axis bound for accuracy plots.",
-    )
-    parser.add_argument(
-        "--nanogpt_ppl_metric",
-        action="store_true",
-        default=False,
-        help="Also report perplexity as exp(mean loss) like nanoGPT.",
-    )
-    parser.add_argument(
         "--use_alibi",
         action="store_true",
         default=False,
@@ -3716,6 +4569,61 @@ if __name__ == "__main__":
         type=int,
         default=100,
         help="Number of training epochs (default: 100)",
+    )
+    parser.add_argument(
+        "--train_steps_per_epoch",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on training steps per epoch. "
+            "If provided, each epoch stops after this many train steps "
+            "(or earlier if the data loader is exhausted)."
+        ),
+    )
+    parser.add_argument(
+        "--validation_steps_per_epoch",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on validation steps per epoch. "
+            "If provided, validation averages are computed over at most this many batches."
+        ),
+    )
+    parser.add_argument(
+        "--test_steps_per_epoch",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on test-evaluation steps per epoch (when test is run on new best)."
+        ),
+    )
+    parser.add_argument(
+        "--compute_dtype",
+        type=str,
+        default=ComputeDType.FLOAT32.value,
+        choices=[d.value for d in ComputeDType],
+        help=(
+            "Compute dtype for model ops. "
+            "Use 'float32' for current behavior or 'bfloat16' for bf16 compute."
+        ),
+    )
+    parser.add_argument(
+        "--target_tokens",
+        type=int,
+        default=None,
+        help=(
+            "Optional token budget. If set, training stops after approximately this many "
+            "tokens (converted via batch_size * seq_length)."
+        ),
+    )
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=0,
+        help=(
+            "Linear warmup steps before cosine decay. "
+            "Set 0 to disable warmup (default)."
+        ),
     )
     parser.add_argument(
         "--embedding_dim",
@@ -3754,6 +4662,45 @@ if __name__ == "__main__":
         help="Number of transformer layers for Transformer models (default: 2)",
     )
     parser.add_argument(
+        "--tie_embeddings_transformer",
+        action="store_true",
+        default=False,
+        help="Tie transformer token-embedding and output-projection weights.",
+    )
+    parser.add_argument(
+        "--tie_embeddings_ldru",
+        action="store_true",
+        default=False,
+        help="Tie LDRU token-embedding and output-projection weights.",
+    )
+    parser.add_argument(
+        "--transformer_prenorm_gelu_block",
+        action="store_true",
+        default=False,
+        help="Use pre-norm + GELU transformer blocks (nanoGPT-style).",
+    )
+    parser.add_argument(
+        "--ldru_prenorm_gelu_block",
+        action="store_true",
+        default=False,
+        help="Enable an optional pre-norm + GELU FFN block inside each LDRU layer.",
+    )
+    parser.add_argument(
+        "--nanogpt_ppl_metric",
+        action="store_true",
+        default=False,
+        help="Also report perplexity as exp(mean loss) like nanoGPT.",
+    )
+    parser.add_argument(
+        "--nanogpt_batching",
+        action="store_true",
+        default=False,
+        help=(
+            "Use nanoGPT-style random offset batching from token-stream bins "
+            "(requires --seq_bin_format token_stream)."
+        ),
+    )
+    parser.add_argument(
         "--tensorboard_log_dir",
         type=str,
         default="tensorboard_logs",
@@ -3777,6 +4724,33 @@ if __name__ == "__main__":
         default=4096,
         help="How many lines to tokenize per streaming chunk (default: 4096).",
     )
+    parser.add_argument(
+        "--train_stride",
+        type=int,
+        default=None,
+        help=(
+            "Stride for training/eval sequence windows. "
+            "Default uses half-overlap: max_seq_len//2."
+        ),
+    )
+    parser.add_argument(
+        "--streaming_exact_sequence_estimate",
+        action="store_true",
+        default=False,
+        help=(
+            "Do an exact pre-scan to count streaming train windows. "
+            "Disabled by default to avoid long startup on very large corpora."
+        ),
+    )
+    parser.add_argument(
+        "--streaming_estimate_bytes_per_token",
+        type=float,
+        default=4.0,
+        help=(
+            "Bytes/token used by the fast size-based streaming sequence estimator "
+            "(default: 4.0)."
+        ),
+    )
     args = parser.parse_args()
 
     configure_output(args.print_log_file)
@@ -3794,11 +4768,6 @@ if __name__ == "__main__":
             min_seq_len=args.min_seq_len,
             max_seq_len=args.max_seq_len,
             plot_dir=args.plot_dir,
-            batch_size=args.batch_size,
-            tokenizer_model_path=args.tokenizer_path,
-            acc_y_min=getattr(args, "seq_len_acc_min", None),
-            acc_y_max=getattr(args, "seq_len_acc_max", None),
-            nanogpt_ppl_metric=args.nanogpt_ppl_metric,
         )
         exit(0)
 
@@ -3817,21 +4786,24 @@ if __name__ == "__main__":
         )
         exit(0)
 
+    use_seq_bins = args.train_seq_bin is not None
+
     # check tokenizer path
     if args.tokenizer_path:
         tokenizer_path = args.tokenizer_path
         print(f"Using tokenizer from: {tokenizer_path}")
     else:
         tokenizer_path = None
-        print(
-            "No tokenizer path provided, training will create a new tokenizer from the training text"
-        )
-        print(
-            "Usage: python train_causal_ldru.py --tokenizer_path <path_to_tokenizer_file>"
-        )
-        print(
-            "Example: python train_causal_ldru.py --tokenizer_path /path/to/your/tokenizer.model"
-        )
+        if not use_seq_bins:
+            print(
+                "No tokenizer path provided, training will create a new tokenizer from the training text"
+            )
+            print(
+                "Usage: python train_causal_ldru.py --tokenizer_path <path_to_tokenizer_file>"
+            )
+            print(
+                "Example: python train_causal_ldru.py --tokenizer_path /path/to/your/tokenizer.model"
+            )
 
     # Evaluate mode - load checkpoint and evaluate on a text file
     if args.evaluate:
@@ -3858,38 +4830,48 @@ if __name__ == "__main__":
         load_and_test_model(args.test_model, args.test_text)
         exit(0)
 
-    # Check if text file path is provided
-    if args.text_file:
-        text_file_path = args.text_file
-        print(f"Training with text file: {text_file_path}")
-    else:
+    if use_seq_bins:
         text_file_path = None
-        print(
-            "No training text file provided. Please provide a text file for training using --text_file."
-        )
-        exit(1)
-
-    # check if validation text file is provided
-    if args.val_text_file:
-        val_text_file_path = args.val_text_file
-        print(f"Using validation text file: {val_text_file_path}")
-    else:
         val_text_file_path = None
-        print(
-            "No validation text file provided, splitting 10 percent of training data for validation"
-        )
-        print(
-            "Usage: python train_causal_ldru.py --val_text_file <path_to_validation_text_file>"
-        )
-        print(
-            "Example: python train_causal_ldru.py --val_text_file /path/to/your/val.txt"
-        )
-
-    if args.test_text_file:
-        test_text_file_path = args.test_text_file
-        print(f"Using test text file for model testing: {test_text_file_path}")
-    else:
         test_text_file_path = None
+        print(f"Training with pretokenized train bin: {args.train_seq_bin}")
+        if args.val_seq_bin:
+            print(f"Using pretokenized val bin: {args.val_seq_bin}")
+        if args.test_seq_bin:
+            print(f"Using pretokenized test bin: {args.test_seq_bin}")
+    else:
+        # Check if text file path is provided
+        if args.text_file:
+            text_file_path = args.text_file
+            print(f"Training with text file: {text_file_path}")
+        else:
+            text_file_path = None
+            print(
+                "No training text file provided. Please provide a text file for training using --text_file."
+            )
+            exit(1)
+
+        # check if validation text file is provided
+        if args.val_text_file:
+            val_text_file_path = args.val_text_file
+            print(f"Using validation text file: {val_text_file_path}")
+        else:
+            val_text_file_path = None
+            print(
+                "No validation text file provided, splitting 10 percent of training data for validation"
+            )
+            print(
+                "Usage: python train_causal_ldru.py --val_text_file <path_to_validation_text_file>"
+            )
+            print(
+                "Example: python train_causal_ldru.py --val_text_file /path/to/your/val.txt"
+            )
+
+        if args.test_text_file:
+            test_text_file_path = args.test_text_file
+            print(f"Using test text file for model testing: {test_text_file_path}")
+        else:
+            test_text_file_path = None
 
     # Set model creation function
     model_creation_fn = create_causal_ldru_model
@@ -3916,6 +4898,9 @@ if __name__ == "__main__":
         use_ldru_transformer = True
         model_type_name = "LDRU+Transformer"
     seq2seq = not args.last_pos  # Use full sequence unless --last_pos is specified
+
+    if args.binop_expansion_factor <= 0:
+        raise ValueError("--binop_expansion_factor must be > 0.")
 
     checkpoint_dir = args.checkpoint_dir
     resume_from_checkpoint = args.resume
@@ -3947,14 +4932,39 @@ if __name__ == "__main__":
         num_epochs=args.num_epochs,
         num_transformer_heads=args.num_transformer_heads,
         num_transformer_layers=args.num_transformer_layers,
+        tie_embeddings_transformer=args.tie_embeddings_transformer,
+        tie_embeddings_ldru=args.tie_embeddings_ldru,
+        transformer_prenorm_gelu_block=args.transformer_prenorm_gelu_block,
+        ldru_prenorm_gelu_block=args.ldru_prenorm_gelu_block,
+        tie_embeddings=args.tie_embeddings_ldru,
+        prenorm_gelu_block=args.ldru_prenorm_gelu_block,
+        scan_method=args.scan_method,
         operator=resolve_binary_operator(args.binary_operator),
+        binop_expansion_factor=args.binop_expansion_factor,
+        ablation_expansion_mode=args.ablation_expansion_mode,
+        ablation_combine_mode=args.ablation_combine_mode,
     )
     print(f"Selected binary operator: {binary_operator_to_name(config.operator)}")
+    print(f"Selected scan method: {config.scan_method}")
+    print(f"Binary operator expansion factor: {config.binop_expansion_factor}")
+    print(
+        "Feature toggles: "
+        f"tie_embeddings_transformer={args.tie_embeddings_transformer}, "
+        f"tie_embeddings_ldru={args.tie_embeddings_ldru}, "
+        f"transformer_prenorm_gelu_block={args.transformer_prenorm_gelu_block}, "
+        f"ldru_prenorm_gelu_block={args.ldru_prenorm_gelu_block}, "
+        f"nanogpt_ppl_metric={args.nanogpt_ppl_metric}, "
+        f"nanogpt_batching={args.nanogpt_batching}"
+    )
+    if args.binary_operator == "ablation":
+        print(f"Ablation expansion mode: {config.ablation_expansion_mode}")
+        print(f"Ablation combine mode: {config.ablation_combine_mode}")
 
     # Run training
     params, model, config, tokenizer, _ = train_model(
         log_dir=LOG_DIR,
         config=config,
+        rng_seed=args.rng_seed,
         enable_logging=enable_logging,
         text_file_path=text_file_path,
         model_creation_fn=model_creation_fn,
@@ -3972,7 +4982,25 @@ if __name__ == "__main__":
         streaming_train=not args.no_streaming_train,
         streaming_shuffle_buffer_size=args.streaming_shuffle_buffer_size,
         streaming_chunk_line_buffer=args.streaming_chunk_line_buffer,
+        streaming_exact_sequence_estimate=args.streaming_exact_sequence_estimate,
+        streaming_estimate_bytes_per_token=args.streaming_estimate_bytes_per_token,
+        train_seq_bin_path=args.train_seq_bin,
+        val_seq_bin_path=args.val_seq_bin,
+        test_seq_bin_path=args.test_seq_bin,
+        seq_bin_dtype=args.seq_bin_dtype,
+        seq_bin_length=args.seq_bin_length,
+        seq_bin_format=args.seq_bin_format,
+        seq_meta_json=args.seq_meta_json,
         optimizer_name=args.optimizer,
+        target_tokens=args.target_tokens,
+        train_stride=args.train_stride,
+        nanogpt_batching=args.nanogpt_batching,
+        nanogpt_ppl_metric=args.nanogpt_ppl_metric,
+        warmup_steps=args.warmup_steps,
+        train_steps_per_epoch=args.train_steps_per_epoch,
+        validation_steps_per_epoch=args.validation_steps_per_epoch,
+        test_steps_per_epoch=args.test_steps_per_epoch,
+        compute_dtype=args.compute_dtype,
     )
 
     print(f"\\nModel Summary:")

@@ -17,9 +17,11 @@ import json
 import orbax.checkpoint as ocp
 import datetime
 import shutil
+import subprocess
 
 matplotlib.use("Agg")  # Non-interactive backend for saving plots
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter, NullFormatter
 
 from causal_ldru_v2 import CausalLDRUConfig, create_causal_ldru_model, BinaryOperator
 from causal_ldru_v2 import (
@@ -48,6 +50,44 @@ from ldru.models import positional_encodings as pos_encs_lib
 import sentencepiece as spm
 
 DEFAULT_TOKENIZER_FOLDER = "tokenizers"
+
+
+def _plain_tick_label(x: float) -> str:
+    if not np.isfinite(x):
+        return ""
+    x = float(x)
+    ax = abs(x)
+    if ax >= 1000:
+        return f"{x:,.0f}"
+    if ax >= 1:
+        return f"{x:.0f}"
+    if ax >= 0.01:
+        return f"{x:.2f}"
+    return f"{x:.3f}"
+
+
+def _apply_y_axis_style(ax, scale: str) -> None:
+    if scale == "log":
+        ax.set_yscale("log")
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: _plain_tick_label(x)))
+    ax.yaxis.set_minor_formatter(NullFormatter())
+
+
+def _resolve_plot_value(primary, fallback, default):
+    return default if primary is None and fallback is None else (
+        primary if primary is not None else fallback
+    )
+
+
+def _natural_sort_key(value: str):
+    parts = re.split(r"(\d+)", str(value))
+    key = []
+    for part in parts:
+        if part.isdigit():
+            key.append(int(part))
+        else:
+            key.append(part.lower())
+    return key
 
 
 from enum import Enum
@@ -135,6 +175,19 @@ def configure_mixed_precision(compute_dtype: str) -> None:
         hk.mixed_precision.set_policy(module_cls, policy)
 
 
+def configure_jax_platform(platform: Optional[str]) -> None:
+    """Optionally pin JAX to a specific backend before any JAX work starts."""
+    if not platform or platform == "auto":
+        return
+    valid_platforms = {"cpu", "gpu", "metal", "tpu"}
+    if platform not in valid_platforms:
+        raise ValueError(
+            f"Unsupported JAX platform '{platform}'. "
+            f"Expected one of: {sorted(valid_platforms)}"
+        )
+    jax.config.update("jax_platform_name", platform)
+
+
 def resolve_binary_operator(operator_name: Optional[str]):
     if operator_name is None:
         return None
@@ -180,14 +233,23 @@ class LDRUExperimenstConfig:
     ablation_expansion_mode: str = "grc"
     ablation_combine_mode: str = "grc"
 
-    # Scan method: 'default' (assoc_scan), or 'simple'
+    # Scan method: 'default' (assoc_scan), 'simple', or 'pairwise'
     scan_method: str = "default"
+    # Optional override for evaluation-time scan method.
+    eval_scan_method: Optional[str] = None
 
-    # Whether to expand sequence to power of 2 with random zero insertion
+    # Whether to expand sequence to power of 2 before scanning.
+    # Default expansion is deterministic right-padding with zeros.
     expand_to_power_of_2: bool = False
+    # If True, power-of-2 expansion uses random zero insertion instead of right-padding.
+    pow_2_expansion_random: bool = False
 
     # Whether to apply attention at each scan step in custom associative scan
     attention_per_scan_step: bool = False
+    # Whether to apply the scan post-merge MLP (can be disabled for old checkpoints).
+    scan_post_merge_mlp: bool = True
+    # Whether to project into/out of the scan state dimension.
+    use_input_output_proj: bool = True
 
     # specifies transformer encoding type
     use_alibi: bool = False  # defaults to sin cos
@@ -202,6 +264,7 @@ class LDRUExperimenstConfig:
     tie_embeddings_ldru: bool = False
     transformer_prenorm_gelu_block: bool = False
     ldru_prenorm_gelu_block: bool = False
+    transformer_share_weight: bool = False
     # Aliases consumed directly by causal_ldru_v2 components.
     tie_embeddings: bool = False
     prenorm_gelu_block: bool = False
@@ -215,7 +278,7 @@ class LDRUExperimenstConfig:
     num_epochs: int = (100,)
     dropout_prob: float = 0.3
 
-    blelloch_random: bool = False  # Whether to use random pairing in Blelloch scan
+    blelloch_random: bool = False  # Deprecated alias for random power-of-2 expansion.
 
 
 # base tokenizer class to define the interface for different tokenizers (SPTokenizer, TextTokenizer, etc.)
@@ -710,7 +773,9 @@ def ldru_seq2seq_loss(params, model, rng_key, token_ids, lambda_l2=0.0):
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     target_log_probs = jnp.take_along_axis(
         log_probs, targets[..., None], axis=-1
-    ).squeeze(-1)  # [B, L-1]
+    ).squeeze(
+        -1
+    )  # [B, L-1]
 
     loss = -jnp.mean(target_log_probs)
     loss += lambda_l2 * compute_l2_loss(params)
@@ -738,7 +803,9 @@ def transformer_seq2seq_loss(params, model, rng_key, token_ids, lambda_l2=0.0):
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     target_log_probs = jnp.take_along_axis(
         log_probs, targets[..., None], axis=-1
-    ).squeeze(-1)  # [B, L-1]
+    ).squeeze(
+        -1
+    )  # [B, L-1]
 
     loss = -jnp.mean(target_log_probs)
     loss += lambda_l2 * compute_l2_loss(params)
@@ -1036,7 +1103,10 @@ def create_nanogpt_token_stream_loader(
     for _ in range(num_batches):
         starts = np_rng.integers(0, max_start, size=batch_size)
         batch = np.stack(
-            [np.asarray(token_stream[s : s + seq_length], dtype=np.int32) for s in starts],
+            [
+                np.asarray(token_stream[s : s + seq_length], dtype=np.int32)
+                for s in starts
+            ],
             axis=0,
         )
         yield batch
@@ -1273,7 +1343,7 @@ def create_transformer_model(config: LDRUExperimenstConfig):
         ),
         widening_factor=config.widening_factor,
         causal_masking=config.causal_masking,
-        share_weight=False,
+        share_weight=config.transformer_share_weight,
         pre_norm_gelu_block=config.transformer_prenorm_gelu_block,
     )
     # Print config
@@ -1337,7 +1407,10 @@ def create_ldru_transformer_model(config: LDRUExperimenstConfig):
             ablation_combine_mode=config.ablation_combine_mode,
             scan_method=config.scan_method,
             expand_to_power_of_2=config.expand_to_power_of_2,
+            pow_2_expansion_random=config.pow_2_expansion_random,
             attention_per_scan_step=config.attention_per_scan_step,
+            scan_post_merge_mlp=config.scan_post_merge_mlp,
+            use_input_output_proj=config.use_input_output_proj,
             prenorm_gelu_block=config.ldru_prenorm_gelu_block,
             tie_embeddings=False,
         )
@@ -1438,7 +1511,10 @@ def create_transformer_ldru_model(config: LDRUExperimenstConfig):
             ablation_combine_mode=config.ablation_combine_mode,
             scan_method=config.scan_method,
             expand_to_power_of_2=config.expand_to_power_of_2,
+            pow_2_expansion_random=config.pow_2_expansion_random,
             attention_per_scan_step=config.attention_per_scan_step,
+            scan_post_merge_mlp=config.scan_post_merge_mlp,
+            use_input_output_proj=config.use_input_output_proj,
             prenorm_gelu_block=config.ldru_prenorm_gelu_block,
             tie_embeddings=False,
         )
@@ -1637,8 +1713,8 @@ def train_model(
     )
     loss_type = "seq2seq" if seq2seq else "lastpos"
     scan_type = config.scan_method
-    if config.blelloch_random:
-        scan_type = f"{scan_type}_blelloch_random"
+    if getattr(config, "pow_2_expansion_random", False) or config.blelloch_random:
+        scan_type = f"{scan_type}_pow2_random"
     tokenizer_suffix = (
         "TKGPT2"
         if tokenizer_type == TokenizerType.TIKTOKEN_GPT2
@@ -1707,7 +1783,9 @@ def train_model(
             )
 
         if selected_seq_bin_format == "sequence":
-            seq_bin_length = seq_bin_length if seq_bin_length is not None else seq_length
+            seq_bin_length = (
+                seq_bin_length if seq_bin_length is not None else seq_length
+            )
             if seq_bin_length != seq_length:
                 raise ValueError(
                     f"--seq_bin_length ({seq_bin_length}) must match training seq_length "
@@ -1806,7 +1884,9 @@ def train_model(
                 train_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
             )
             train_sequence_count = len(train_data)
-            print(f"Loaded train sequences: {len(train_data):,} from {train_seq_bin_path}")
+            print(
+                f"Loaded train sequences: {len(train_data):,} from {train_seq_bin_path}"
+            )
 
         if val_seq_bin_path:
             if selected_seq_bin_format == "token_stream":
@@ -1831,7 +1911,9 @@ def train_model(
                 val_data = load_pretokenized_sequences(
                     val_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
                 )
-                print(f"Loaded val sequences: {len(val_data):,} from {val_seq_bin_path}")
+                print(
+                    f"Loaded val sequences: {len(val_data):,} from {val_seq_bin_path}"
+                )
 
         if test_seq_bin_path:
             if selected_seq_bin_format == "token_stream":
@@ -1856,7 +1938,9 @@ def train_model(
                 test_data = load_pretokenized_sequences(
                     test_seq_bin_path, seq_length=seq_length, dtype_name=seq_bin_dtype
                 )
-                print(f"Loaded test sequences: {len(test_data):,} from {test_seq_bin_path}")
+                print(
+                    f"Loaded test sequences: {len(test_data):,} from {test_seq_bin_path}"
+                )
 
         if nanogpt_batching:
             preview_loader = create_nanogpt_token_stream_loader(
@@ -1887,7 +1971,9 @@ def train_model(
                 stride=train_stride,
                 chunk_line_buffer=streaming_chunk_line_buffer,
             )
-            print(f"Estimated training sequences (exact pre-scan): {train_sequence_count:,}")
+            print(
+                f"Estimated training sequences (exact pre-scan): {train_sequence_count:,}"
+            )
         else:
             train_sequence_count = estimate_num_sequences_from_file_size(
                 file_path=text_file_path,
@@ -1953,10 +2039,6 @@ def train_model(
 
     # Create model
     model = model_creation_fn(config)
-
-    # Create evaluation model with dropout disabled
-    eval_model = create_evaluation_model(config, model_creation_fn)
-    print("Created evaluation model with dropout disabled")
 
     # Initialize model parameters
     print("Initializing model...")
@@ -2097,6 +2179,10 @@ def train_model(
             f"Resumed from epoch {start_epoch} with best validation perplexity: {best_val_perplexity:.4f}"
         )
 
+    # Create evaluation model with dropout disabled after params are available.
+    eval_model = create_evaluation_model(config, model_creation_fn, params=params)
+    print("Created evaluation model with dropout disabled")
+
     # Create checkpoint directory
     if save_checkpoints:
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -2170,7 +2256,9 @@ def train_model(
             f"total={estimated_total_epochs}, "
             f"remaining_from_current={estimated_remaining_epochs}"
         )
-    epoch_print_total = estimated_total_epochs if target_steps is not None else num_epochs
+    epoch_print_total = (
+        estimated_total_epochs if target_steps is not None else num_epochs
+    )
     epoch_loop_limit = max(num_epochs, estimated_total_epochs)
 
     print("Starting training...")
@@ -2487,7 +2575,9 @@ def evaluate_model_on_dataset(
             f"{dataset_metrics['nanogpt_perplexity']:.4f}"
         )
     if "last_token_perplexity" in dataset_metrics:
-        print(f"{dataset_name} last-token perplexity: {dataset_metrics['last_token_perplexity']:.4f}")
+        print(
+            f"{dataset_name} last-token perplexity: {dataset_metrics['last_token_perplexity']:.4f}"
+        )
     if "last_token_perplexity_nanogpt" in dataset_metrics:
         print(
             f"{dataset_name} last-token perplexity (nanoGPT-style): "
@@ -2671,7 +2761,13 @@ def save_checkpoint(
     print(f"Saved checkpoint at step {step} -> {step_path}")
 
 
-def load_checkpoint(checkpoint_dir: str, step: int, load_best_only: bool = True):
+def load_checkpoint(
+    checkpoint_dir: str,
+    step: int,
+    load_best_only: bool = True,
+    tokenizer_path_override: Optional[str] = None,
+    tokenizer_type_override: Optional[TokenizerType] = None,
+):
     """
     Load JAX training state using Orbax.
     """
@@ -2688,7 +2784,25 @@ def load_checkpoint(checkpoint_dir: str, step: int, load_best_only: bool = True)
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    restored = checkpointer.restore(ckpt_path)
+    if jax.default_backend() == "cpu":
+        metadata = checkpointer.metadata(ckpt_path)
+        cpu_sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+        sharding_tree = jax.tree.map(
+            lambda leaf: (
+                cpu_sharding
+                if hasattr(leaf, "shape")
+                and hasattr(leaf, "dtype")
+                and hasattr(leaf, "sharding")
+                else None
+            ),
+            metadata.item_metadata.tree,
+        )
+        restore_args = ocp.checkpoint_utils.construct_restore_args(
+            metadata.item_metadata.tree, sharding_tree
+        )
+        restored = checkpointer.restore(ckpt_path, restore_args=restore_args)
+    else:
+        restored = checkpointer.restore(ckpt_path)
 
     # Load metadata
     metadata_path = os.path.join(checkpoint_dir, "metadata.json")
@@ -2707,10 +2821,29 @@ def load_checkpoint(checkpoint_dir: str, step: int, load_best_only: bool = True)
                 )
             config = LDRUExperimenstConfig(**config_dict)
 
-    tokenizer_type = metadata.get("tokenizer_type")
-    tokenizer_path = metadata.get("tokenizer_path")
+    tokenizer_type = (
+        tokenizer_type_override
+        if tokenizer_type_override is not None
+        else metadata.get("tokenizer_type")
+    )
+    tokenizer_path = (
+        tokenizer_path_override
+        if tokenizer_path_override is not None
+        else metadata.get("tokenizer_path")
+    )
     if tokenizer_type == TokenizerType.SENTENCEPIECE:
-        tokenizer = SPTokenizer(model_path=tokenizer_path)
+        if not tokenizer_path:
+            print("No SentencePiece tokenizer path found. Tokenizer will not be loaded.")
+            tokenizer = None
+        else:
+            try:
+                tokenizer = SPTokenizer(model_path=tokenizer_path)
+            except (FileNotFoundError, OSError) as e:
+                print(
+                    "Warning: Failed to load SentencePiece tokenizer from "
+                    f"'{tokenizer_path}': {e}"
+                )
+                tokenizer = None
     elif tokenizer_type == TokenizerType.TIKTOKEN_GPT2:
         encoding_name = tokenizer_path if tokenizer_path else "gpt2"
         tokenizer = TiktokenGPT2Tokenizer(encoding_name=encoding_name)
@@ -2831,7 +2964,7 @@ def analyze_position_trends(per_pos_ppl):
     }
 
 
-def create_evaluation_model(config, model_creation_fn):
+def create_evaluation_model(config, model_creation_fn, params=None):
     """
     Create a model instance with dropout disabled for evaluation.
     This creates a new model with dropout_prob=0.0 while keeping all other config the same.
@@ -2839,11 +2972,193 @@ def create_evaluation_model(config, model_creation_fn):
     # Create a copy of the config with dropout disabled
     eval_config_params = config.__dict__.copy()
     eval_config_params["dropout_prob"] = 0.0
+    override_scan = eval_config_params.get("eval_scan_method")
+    if override_scan:
+        eval_config_params["scan_method"] = override_scan
+        eval_config_params["eval_scan_method"] = override_scan
+    if (
+        params is not None
+        and eval_config_params.get("num_transformer_layers", 1) > 1
+        and checkpoint_uses_shared_transformer_weights(params)
+    ):
+        eval_config_params["transformer_share_weight"] = True
     eval_config = LDRUExperimenstConfig(**eval_config_params)
 
     # Create the evaluation model
     eval_model = model_creation_fn(eval_config)
     return eval_model
+
+
+def checkpoint_has_scan_post_merge_params(params) -> bool:
+    """
+    Return True if checkpoint contains scan post-merge MLP parameters.
+    Older checkpoints (pre-scan-refactor) may not include these.
+    """
+    if not isinstance(params, dict):
+        return True
+    for key in params.keys():
+        key_str = str(key)
+        if "/CausalLDRULayer/~/linear" in key_str:
+            return True
+    return False
+
+
+def checkpoint_uses_legacy_ldru_projection_layout(params) -> bool:
+    """
+    Return True when the checkpoint predates the newer input/output projection
+    modules and still stores the scan-side projections under `linear` names.
+    """
+    if not isinstance(params, dict):
+        return False
+
+    keys = [str(key) for key in params.keys()]
+    has_input_output = any(
+        re.search(
+            r"/CausalLDRUEncoder/CausalLDRULayer(?:_\d+)?/~/"
+            r"(input_proj|output_proj)$",
+            key,
+        )
+        for key in keys
+    )
+    has_legacy_linear = any(
+        re.search(
+            r"/CausalLDRUEncoder/CausalLDRULayer(?:_\d+)?/~/"
+            r"linear(?:_1)?$",
+            key,
+        )
+        for key in keys
+    )
+    return has_legacy_linear and not has_input_output
+
+
+def resolve_scan_post_merge_mlp(
+    config: "LDRUExperimenstConfig", params, override: Optional[bool] = None
+) -> "LDRUExperimenstConfig":
+    """
+    Apply explicit scan post-merge choice if provided, otherwise fall back to
+    checkpoint compatibility detection.
+    """
+    if checkpoint_uses_legacy_ldru_projection_layout(params):
+        print(
+            "  Compatibility mode: checkpoint uses legacy LDRU projection layout; "
+            "keeping scan post-merge MLP enabled and disabling input/output projections"
+        )
+        return LDRUExperimenstConfig(
+            **{
+                **config.__dict__,
+                "scan_post_merge_mlp": True,
+                "use_input_output_proj": False,
+            }
+        )
+    if override is not None:
+        return LDRUExperimenstConfig(
+            **{**config.__dict__, "scan_post_merge_mlp": bool(override)}
+        )
+    if not checkpoint_has_scan_post_merge_params(params):
+        print(
+            "  Compatibility mode: checkpoint lacks scan post-merge MLP params; "
+            "disabling scan post-merge MLP for evaluation"
+        )
+        return LDRUExperimenstConfig(
+            **{**config.__dict__, "scan_post_merge_mlp": False}
+        )
+    return config
+
+
+def _run_legacy_ldru_eval(
+    args,
+    evaluate_override: Optional[str] = None,
+    eval_seq_len_range_override: Optional[str] = None,
+    plot_dir_override: Optional[str] = None,
+) -> None:
+    """
+    Delegate evaluation to the checked-in historical LDRU files for old checkpoints.
+    """
+    legacy_script = os.path.join(
+        os.path.dirname(__file__), "train_causal_ldru_old.py"
+    )
+    if not os.path.exists(legacy_script):
+        raise FileNotFoundError(
+            f"Legacy eval entrypoint not found: {legacy_script}"
+        )
+    cmd = [sys.executable, legacy_script]
+
+    if evaluate_override is not None:
+        cmd.extend(["--evaluate", evaluate_override])
+    elif eval_seq_len_range_override is not None:
+        cmd.extend(["--eval_seq_len_range", eval_seq_len_range_override])
+    elif args.evaluate:
+        cmd.extend(["--evaluate", args.evaluate])
+    elif args.compare:
+        cmd.append("--compare")
+        cmd.extend(args.compare)
+    elif args.eval_seq_len_range:
+        cmd.extend(["--eval_seq_len_range", args.eval_seq_len_range])
+    else:
+        raise ValueError("Legacy eval requested without an evaluation target.")
+
+    eval_file = args.eval_file if args.eval_file else args.text_file
+    if eval_file:
+        cmd.extend(["--eval_file", eval_file])
+
+    if args.seq_length is not None:
+        cmd.extend(["--seq_length", str(args.seq_length)])
+    if args.no_plots:
+        cmd.extend(["--n_sequences", "0"])
+    elif args.n_sequences is not None:
+        cmd.extend(["--n_sequences", str(args.n_sequences)])
+    effective_plot_dir = (
+        plot_dir_override if plot_dir_override is not None else args.plot_dir
+    )
+    if effective_plot_dir is not None:
+        cmd.extend(["--plot_dir", effective_plot_dir])
+    if args.eval_step is not None:
+        cmd.extend(["--eval_step", str(args.eval_step)])
+    if args.batch_size is not None:
+        cmd.extend(["--batch_size", str(args.batch_size)])
+    if getattr(args, "seq_len_acc_min", None) is not None:
+        cmd.extend(["--seq_len_acc_min", str(args.seq_len_acc_min)])
+    if getattr(args, "seq_len_acc_max", None) is not None:
+        cmd.extend(["--seq_len_acc_max", str(args.seq_len_acc_max)])
+    if args.min_seq_len is not None:
+        cmd.extend(["--min_seq_len", str(args.min_seq_len)])
+    if args.max_seq_len is not None:
+        cmd.extend(["--max_seq_len", str(args.max_seq_len)])
+    if args.nanogpt_ppl_metric:
+        cmd.append("--nanogpt_ppl_metric")
+    if getattr(args, "tokenizer_path", None):
+        cmd.extend(["--tokenizer_path", args.tokenizer_path])
+
+    print("Delegating to legacy LDRU eval:", " ".join(cmd), flush=True)
+    env = os.environ.copy()
+    repo_root = os.path.dirname(__file__)
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        repo_root
+        if not existing_pythonpath
+        else os.pathsep.join([repo_root, existing_pythonpath])
+    )
+    subprocess.run(cmd, check=True, cwd=repo_root, env=env)
+
+
+def checkpoint_uses_shared_transformer_weights(params) -> bool:
+    """
+    Return True if a transformer checkpoint appears to reuse one layer block.
+
+    Older transformer checkpoints in this repo store only
+    transformer_encoder/transformer_layer/* parameters even when the config
+    records multiple transformer layers.
+    """
+    if not isinstance(params, dict):
+        return False
+    keys = [str(key) for key in params.keys()]
+    has_first_layer = any(
+        key.startswith("transformer_encoder/transformer_layer/") for key in keys
+    )
+    has_second_layer = any(
+        key.startswith("transformer_encoder/transformer_layer_1/") for key in keys
+    )
+    return has_first_layer and not has_second_layer
 
 
 def evaluate_model(
@@ -3119,7 +3434,7 @@ def load_and_test_model(checkpoint_path: str, test_text: str = None):
         use_transformer_ldru = False
 
     # Create evaluation model with dropout disabled
-    eval_model = create_evaluation_model(config, model_creation_fn)
+    eval_model = create_evaluation_model(config, model_creation_fn, params=params)
 
     seq2seq = "seq2seq" in checkpoint_path.lower()
 
@@ -3457,6 +3772,17 @@ def _choose_sequence_indices(n_total: int, n_sequences: int) -> List[int]:
     return np.linspace(0, n_total - 1, n_sequences, dtype=int).tolist()
 
 
+def _token_label(tokenizer, token_id: int) -> str:
+    token_id = int(token_id)
+    if hasattr(tokenizer, "id_to_word"):
+        return tokenizer.id_to_word.get(token_id, f"[{token_id}]")
+    if hasattr(tokenizer, "tokenizer") and hasattr(tokenizer.tokenizer, "IdToPiece"):
+        return tokenizer.tokenizer.IdToPiece(token_id)
+    if hasattr(tokenizer, "decode"):
+        return tokenizer.decode([token_id])
+    return f"[{token_id}]"
+
+
 def _evaluate_sequences(
     params,
     eval_model,
@@ -3487,14 +3813,11 @@ def _evaluate_sequences(
 
         # Token labels for x-axis (the *target* tokens being predicted)
         target_ids = np.array(seq[1:])
-        token_labels = [
-            tokenizer.id_to_word.get(int(tid), f"[{int(tid)}]") for tid in target_ids
-        ]
+        token_labels = [_token_label(tokenizer, tid) for tid in target_ids]
 
         # Predicted token labels (what the model actually guessed)
         predicted_token_labels = [
-            tokenizer.id_to_word.get(int(pid), f"[{int(pid)}]")
-            for pid in metrics["predicted_token_ids"]
+            _token_label(tokenizer, pid) for pid in metrics["predicted_token_ids"]
         ]
 
         save_path = os.path.join(plot_dir, f"seq_{plot_i:03d}_idx{seq_idx}.png")
@@ -3574,6 +3897,12 @@ def evaluate_from_checkpoint(
     plot_dir: str = None,
     batch_size: int = 32,
     tokenizer_model_path: str = None,
+    eval_scan_method: str = None,
+    expand_to_power_of_2: bool = False,
+    pow_2_expansion_random: bool = False,
+    no_plots: bool = False,
+    nanogpt_ppl_metric: bool = False,
+    scan_post_merge_mlp: Optional[bool] = None,
 ):
     """
     Load a model from checkpoint and evaluate it on a .txt file.
@@ -3582,6 +3911,7 @@ def evaluate_from_checkpoint(
       per-sequence plots (default behaviour).
     - ``n_sequences == 0``: run a fast aggregate evaluation over **all**
       sequences with no plots.  Use ``--n_sequences 0`` from the CLI.
+    - ``no_plots``: forces aggregate evaluation (equivalent to n_sequences=0).
 
     Args:
         checkpoint_path: Path to the .pkl checkpoint file.
@@ -3593,13 +3923,23 @@ def evaluate_from_checkpoint(
         plot_dir: Directory to save plots.  Defaults to
                   ``eval_plots/<checkpoint_stem>/``.
         batch_size: Batch size for aggregate evaluation (only used when
-                    n_sequences == 0).
+                     n_sequences == 0).
+        eval_scan_method: Optional scan method override for evaluation.
+        expand_to_power_of_2: Force deterministic power-of-two right-padding in eval.
+        pow_2_expansion_random: Use random insertion (instead of right-padding)
+                                when power-of-two expansion is enabled.
+        no_plots: Disable plotting and force aggregate evaluation.
+        nanogpt_ppl_metric: Also report nanoGPT-style perplexity metrics.
+        scan_post_merge_mlp: Explicitly enable/disable scan post-merge MLP.
 
     Returns:
         Dict with evaluation results.
     """
     params, _, config, epoch, best_ppl, tokenizer = load_checkpoint(
-        checkpoint_path, step=step
+        checkpoint_path,
+        step=step,
+        tokenizer_path_override=tokenizer_path,
+        tokenizer_type_override=tokenizer_type if tokenizer_path else None,
     )
     print(f"Model config: {config}")
     if tokenizer is None:
@@ -3613,6 +3953,10 @@ def evaluate_from_checkpoint(
         print(f"  Using default seq_length={seq_length} (override with --seq_length)")
     if stride is None:
         stride = seq_length // 2
+    if no_plots and n_sequences != 0:
+        print("  no_plots enabled → switching to aggregate evaluation (n_sequences=0)")
+        n_sequences = 0
+        plot_dir = None
 
     # test tokenizer
     test_sentence = "This is a test sentence for the tokenizer."
@@ -3643,7 +3987,27 @@ def evaluate_from_checkpoint(
     print(f"{'=' * 60}\n")
 
     # 2. Create evaluation model (dropout disabled)
-    eval_model = create_evaluation_model(config, model_creation_fn)
+    if eval_scan_method:
+        print(f"  Eval scan method override: {eval_scan_method}")
+        config = LDRUExperimenstConfig(
+            **{**config.__dict__, "eval_scan_method": eval_scan_method}
+        )
+    config = resolve_scan_post_merge_mlp(config, params, override=scan_post_merge_mlp)
+    if expand_to_power_of_2:
+        print("  Power-of-two expansion enabled for evaluation")
+        config = LDRUExperimenstConfig(
+            **{**config.__dict__, "expand_to_power_of_2": True}
+        )
+    if pow_2_expansion_random:
+        print("  Random power-of-two expansion enabled for evaluation")
+        config = LDRUExperimenstConfig(
+            **{
+                **config.__dict__,
+                "expand_to_power_of_2": True,
+                "pow_2_expansion_random": True,
+            }
+        )
+    eval_model = create_evaluation_model(config, model_creation_fn, params=params)
 
     # 3. Load, clean, and tokenize evaluation text
     print(f"Loading evaluation text from: {eval_text_file}")
@@ -3680,6 +4044,7 @@ def evaluate_from_checkpoint(
             use_ldru_transformer=use_ldru_transformer,
             seq2seq=seq2seq,
             eval_model=eval_model,
+            nanogpt_ppl_metric=nanogpt_ppl_metric,
         )
 
         print(f"\n{'=' * 60}")
@@ -3688,6 +4053,13 @@ def evaluate_from_checkpoint(
         print(f"  Loss       : {avg_loss:.4f}")
         print(f"  Perplexity : {avg_metrics['perplexity']:.4f}")
         print(f"  Accuracy   : {avg_metrics['accuracy']:.4f}")
+        if "nanogpt_perplexity" in avg_metrics:
+            print(f"  nanoGPT PPL: {avg_metrics['nanogpt_perplexity']:.4f}")
+        if "last_token_perplexity_nanogpt" in avg_metrics:
+            print(
+                f"  nanoGPT last-token PPL: "
+                f"{avg_metrics['last_token_perplexity_nanogpt']:.4f}"
+            )
 
         if best_ppl < float("inf"):
             ratio = avg_metrics["perplexity"] / best_ppl
@@ -3743,6 +4115,652 @@ def evaluate_from_checkpoint(
     }
 
 
+def _load_tokenizer_override(
+    tokenizer_path: Optional[str], tokenizer_type: TokenizerType
+) -> Optional[BaseTokenizer]:
+    if not tokenizer_path:
+        return None
+    if tokenizer_type == TokenizerType.SENTENCEPIECE:
+        return SPTokenizer(model_path=tokenizer_path)
+    if tokenizer_type == TokenizerType.TIKTOKEN_GPT2:
+        encoding_name = tokenizer_path if tokenizer_path else "gpt2"
+        return TiktokenGPT2Tokenizer(encoding_name=encoding_name)
+    if tokenizer_type == TokenizerType.TEXT:
+        raise ValueError(
+            "TextTokenizer cannot be reconstructed from a path. "
+            "Please use a checkpoint with a saved tokenizer."
+        )
+    raise ValueError(f"Unknown tokenizer_type: {tokenizer_type}")
+
+
+def _select_eval_tokenizer(
+    checkpoint_path: str,
+    tokenizer: Optional[BaseTokenizer],
+    tokenizer_override: Optional[BaseTokenizer],
+) -> BaseTokenizer:
+    if tokenizer_override is not None:
+        return tokenizer_override
+    if tokenizer is None:
+        raise ValueError(
+            f"Checkpoint does not contain a saved tokenizer: {checkpoint_path}. "
+            "Please pass --tokenizer_path so the tokenizer can be loaded."
+        )
+    return tokenizer
+
+
+def _apply_eval_config_overrides(
+    config: LDRUExperimenstConfig,
+    params,
+    eval_scan_method: Optional[str],
+    expand_to_power_of_2: bool,
+    pow_2_expansion_random: bool,
+    scan_post_merge_mlp: Optional[bool],
+) -> LDRUExperimenstConfig:
+    if eval_scan_method:
+        print(f"  Eval scan method override: {eval_scan_method}")
+        config = LDRUExperimenstConfig(
+            **{**config.__dict__, "eval_scan_method": eval_scan_method}
+        )
+    config = resolve_scan_post_merge_mlp(config, params, override=scan_post_merge_mlp)
+    if expand_to_power_of_2:
+        print("  Power-of-two expansion enabled for evaluation")
+        config = LDRUExperimenstConfig(
+            **{**config.__dict__, "expand_to_power_of_2": True}
+        )
+    if pow_2_expansion_random:
+        print("  Random power-of-two expansion enabled for evaluation")
+        config = LDRUExperimenstConfig(
+            **{
+                **config.__dict__,
+                "expand_to_power_of_2": True,
+                "pow_2_expansion_random": True,
+            }
+        )
+    return config
+
+
+def _detect_eval_model_flags(checkpoint_path: str):
+    cp_lower = checkpoint_path.lower()
+    use_lstm = "lstm" in cp_lower
+    use_transformer_ldru = (
+        "transformer_ldru" in cp_lower and "ldru_transformer" not in cp_lower
+    )
+    use_ldru_transformer = "ldru_transformer" in cp_lower
+    use_transformer = (
+        "transformer" in cp_lower
+        and not use_transformer_ldru
+        and not use_ldru_transformer
+    )
+    return use_lstm, use_transformer, use_transformer_ldru, use_ldru_transformer
+
+
+def _evaluate_seq_len_range_core(
+    *,
+    params,
+    eval_model,
+    tokenizer: BaseTokenizer,
+    seq2seq: bool,
+    use_lstm: bool,
+    use_transformer: bool,
+    use_transformer_ldru: bool,
+    use_ldru_transformer: bool,
+    text: str,
+    seq_lengths: List[int],
+    batch_size: int,
+    nanogpt_ppl_metric: bool,
+):
+    results = []
+    rng_key = jax.random.PRNGKey(0)
+
+    for seq_len in tqdm.tqdm(seq_lengths, desc="Seq lengths"):
+        stride = max(1, seq_len * 2)
+        sequences = create_text_dataset(text, tokenizer, seq_len, stride)
+
+        if len(sequences) == 0:
+            print(f"  [seq_len={seq_len}] No sequences produced – skipping.")
+            continue
+
+        # change batch size dynamically based on sequence length to keep evaluation time reasonable
+        max_batch_size_seq_len = 512 * 128
+        eval_batch_size = min(batch_size, max(1, max_batch_size_seq_len // seq_len))
+
+        rng_key, eval_key = jax.random.split(rng_key)
+        avg_loss, avg_metrics = evaluate_model(
+            params=params,
+            model=None,
+            rng_key=eval_key,
+            val_data=sequences,
+            batch_size=eval_batch_size,
+            use_lstm=use_lstm,
+            use_transformer=use_transformer,
+            use_transformer_ldru=use_transformer_ldru,
+            use_ldru_transformer=use_ldru_transformer,
+            seq2seq=seq2seq,
+            eval_model=eval_model,
+            nanogpt_ppl_metric=nanogpt_ppl_metric,
+        )
+
+        ppl_value = float(avg_metrics["perplexity"])
+        if nanogpt_ppl_metric and "nanogpt_perplexity" in avg_metrics:
+            ppl_value = float(avg_metrics["nanogpt_perplexity"])
+
+        last_token_ppl = float("nan")
+        if nanogpt_ppl_metric and "last_token_perplexity_nanogpt" in avg_metrics:
+            last_token_ppl = float(avg_metrics["last_token_perplexity_nanogpt"])
+        elif "last_token_perplexity" in avg_metrics:
+            last_token_ppl = float(avg_metrics["last_token_perplexity"])
+
+        row = {
+            "seq_len": seq_len,
+            "n_sequences": int(len(sequences)),
+            "loss": float(avg_loss),
+            "perplexity": ppl_value,
+            "last_token_perplexity": last_token_ppl,
+            "accuracy": float(avg_metrics["accuracy"]),
+        }
+        results.append(row)
+        print(
+            f"  seq_len={seq_len:4d} | n={row['n_sequences']:6,} | "
+            f"loss={row['loss']:.4f} | ppl={row['perplexity']:.4f} | "
+            f"last_ppl={row['last_token_perplexity']:.4f} | acc={row['accuracy']:.4f}"
+        )
+
+    return results
+
+
+def _write_seq_len_range_results(results, plot_dir: str, basename: str):
+    csv_path = os.path.join(plot_dir, f"{basename}.csv")
+    with open(csv_path, "w") as fh:
+        fh.write("seq_len,n_sequences,loss,perplexity,last_token_perplexity,accuracy\n")
+        for r in results:
+            fh.write(
+                f"{r['seq_len']},{r['n_sequences']},{r['loss']:.6f},{r['perplexity']:.6f},"
+                f"{r['last_token_perplexity']:.6f},{r['accuracy']:.6f}\n"
+            )
+
+    json_path = os.path.join(plot_dir, f"{basename}.json")
+    with open(json_path, "w") as fh:
+        json.dump(results, fh, indent=2)
+
+    return csv_path, json_path
+
+
+def _read_checkpoint_list(list_path: str) -> List[str]:
+    base_dir = os.path.dirname(os.path.abspath(list_path))
+    checkpoints = []
+    with open(list_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "#" in line:
+                line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            path = os.path.expanduser(line)
+            if not os.path.isabs(path):
+                path = os.path.join(base_dir, path)
+            checkpoints.append(path)
+
+    missing = [path for path in checkpoints if not os.path.exists(path)]
+    if missing:
+        missing_list = "\n  - ".join(missing)
+        raise FileNotFoundError(
+            f"Checkpoint paths not found:\n  - {missing_list}"
+        )
+    return checkpoints
+
+
+def _aggregate_seq_len_results(results_by_model, seq_lengths):
+    model_maps = [
+        {row["seq_len"]: row for row in rows} for rows in results_by_model.values()
+    ]
+    aggregates = []
+
+    for seq_len in seq_lengths:
+        per_model_rows = [seq_map.get(seq_len) for seq_map in model_maps]
+        perplexity_vals = [
+            _extract_metric_value(row, "perplexity") for row in per_model_rows
+        ]
+        accuracy_vals = [
+            _extract_metric_value(row, "accuracy") for row in per_model_rows
+        ]
+        last_token_vals = [
+            _extract_metric_value(row, "last_token_perplexity")
+            for row in per_model_rows
+        ]
+
+        perplexity_arr = np.array(
+            [np.nan if v is None else v for v in perplexity_vals], dtype=float
+        )
+        n_models = int(np.sum(~np.isnan(perplexity_arr)))
+        if n_models == 0:
+            continue
+
+        accuracy_arr = np.array(
+            [np.nan if v is None else v for v in accuracy_vals], dtype=float
+        )
+        last_token_arr = np.array(
+            [np.nan if v is None else v for v in last_token_vals], dtype=float
+        )
+
+        aggregates.append(
+            {
+                "seq_len": seq_len,
+                "n_models": n_models,
+                "perplexity_mean": float(np.nanmean(perplexity_arr)),
+                "perplexity_std": float(np.nanstd(perplexity_arr)),
+                "accuracy_mean": float(np.nanmean(accuracy_arr)),
+                "accuracy_std": float(np.nanstd(accuracy_arr)),
+                "last_token_perplexity_mean": float(np.nanmean(last_token_arr)),
+                "last_token_perplexity_std": float(np.nanstd(last_token_arr)),
+            }
+        )
+
+    return aggregates
+
+
+def _write_seq_len_range_aggregate_results(rows, plot_dir: str, basename: str):
+    csv_path = os.path.join(plot_dir, f"{basename}.csv")
+    with open(csv_path, "w") as fh:
+        fh.write(
+            "seq_len,n_models,perplexity_mean,perplexity_std,accuracy_mean,"
+            "accuracy_std,last_token_perplexity_mean,last_token_perplexity_std\n"
+        )
+        for row in rows:
+            fh.write(
+                f"{row['seq_len']},{row['n_models']},"
+                f"{row['perplexity_mean']:.6f},{row['perplexity_std']:.6f},"
+                f"{row['accuracy_mean']:.6f},{row['accuracy_std']:.6f},"
+                f"{row['last_token_perplexity_mean']:.6f},"
+                f"{row['last_token_perplexity_std']:.6f}\n"
+            )
+
+    json_path = os.path.join(plot_dir, f"{basename}.json")
+    with open(json_path, "w") as fh:
+        json.dump(rows, fh, indent=2)
+
+    return csv_path, json_path
+
+
+def _load_seq_len_range_results_from_output_dir(output_dir: str):
+    """
+    Load cached sequence-length evaluation results from an existing output tree.
+
+    Expected layout:
+        output_dir/
+          model_a/seqlen_range_results.json
+          model_b/seqlen_range_results.json
+          seqlen_range_aggregate.json   (optional, ignored for recomputation)
+    """
+    output_dir = os.path.abspath(output_dir)
+    if not os.path.isdir(output_dir):
+        raise ValueError(f"Output directory does not exist: {output_dir}")
+
+    results_by_model = {}
+
+    def _maybe_load_model_dir(model_dir: str, model_name: str):
+        results_path = os.path.join(model_dir, "seqlen_range_results.json")
+        if not os.path.isfile(results_path):
+            return
+        with open(results_path, "r", encoding="utf-8") as fh:
+            rows = json.load(fh)
+        if not isinstance(rows, list):
+            raise ValueError(f"Invalid results file (expected list): {results_path}")
+        results_by_model[model_name] = rows
+
+    root_results_path = os.path.join(output_dir, "seqlen_range_results.json")
+    if os.path.isfile(root_results_path):
+        _maybe_load_model_dir(output_dir, os.path.basename(output_dir.rstrip("/")))
+
+    for entry in sorted(os.listdir(output_dir), key=_natural_sort_key):
+        model_dir = os.path.join(output_dir, entry)
+        if os.path.isdir(model_dir):
+            _maybe_load_model_dir(model_dir, entry)
+
+    if not results_by_model:
+        raise ValueError(
+            "No cached sequence-length results found. Expected one or more "
+            "seqlen_range_results.json files under the provided directory."
+        )
+
+    seq_lengths = sorted(
+        {
+            int(row["seq_len"])
+            for rows in results_by_model.values()
+            for row in rows
+            if row.get("seq_len") is not None
+        }
+    )
+    if not seq_lengths:
+        raise ValueError("Cached results did not contain any seq_len values.")
+
+    aggregate_rows = _aggregate_seq_len_results(results_by_model, seq_lengths)
+    if not aggregate_rows:
+        raise ValueError("Could not aggregate cached results from the output directory.")
+
+    return results_by_model, aggregate_rows
+
+
+def regenerate_seq_len_range_plots_from_output_dir(
+    output_dir: str,
+    plot_dir: str = None,
+    avg_ppl_y_min: Optional[float] = None,
+    avg_ppl_y_max: Optional[float] = None,
+    last_ppl_y_min: Optional[float] = None,
+    last_ppl_y_max: Optional[float] = None,
+    acc_y_min: Optional[float] = None,
+    acc_y_max: Optional[float] = None,
+    avg_ppl_scale: str = "log",
+    last_ppl_scale: str = "log",
+    acc_scale: str = "linear",
+):
+    """
+    Regenerate aggregate plots from cached sequence-length results only.
+
+    This does not load checkpoints or re-run model evaluation.
+    """
+    results_by_model, aggregate_rows = _load_seq_len_range_results_from_output_dir(
+        output_dir
+    )
+    if plot_dir is None:
+        plot_dir = os.path.abspath(output_dir)
+    os.makedirs(plot_dir, exist_ok=True)
+
+    csv_path, json_path = _write_seq_len_range_aggregate_results(
+        aggregate_rows, plot_dir, basename="seqlen_range_aggregate"
+    )
+    print(f"\n  Aggregate CSV  → {csv_path}")
+    print(f"  Aggregate JSON → {json_path}")
+
+    _plot_multi_model_seq_len_metric(
+        results_by_model,
+        metric_name="perplexity",
+        y_label="Perplexity",
+        plot_path=os.path.join(plot_dir, "avg_perplexity_vs_seq_len.png"),
+        log_scale=(avg_ppl_scale == "log"),
+        aggregate_rows=aggregate_rows,
+        y_min=avg_ppl_y_min,
+        y_max=avg_ppl_y_max,
+    )
+    _plot_multi_model_seq_len_metric(
+        results_by_model,
+        metric_name="last_token_perplexity",
+        y_label="Last-token Perplexity",
+        plot_path=os.path.join(plot_dir, "avg_last_token_perplexity_vs_seq_len.png"),
+        log_scale=(last_ppl_scale == "log"),
+        aggregate_rows=aggregate_rows,
+        y_min=last_ppl_y_min,
+        y_max=last_ppl_y_max,
+    )
+    _plot_multi_model_seq_len_metric(
+        results_by_model,
+        metric_name="accuracy",
+        y_label="Accuracy",
+        plot_path=os.path.join(plot_dir, "avg_accuracy_vs_seq_len.png"),
+        log_scale=(acc_scale == "log"),
+        clamp_accuracy=True,
+        aggregate_rows=aggregate_rows,
+        y_min=acc_y_min,
+        y_max=acc_y_max,
+        auto_tight_accuracy=True,
+    )
+    _plot_avg_seq_len_metric(
+        aggregate_rows,
+        metric_key="perplexity_mean",
+        std_key="perplexity_std",
+        y_label="Perplexity",
+        plot_path=os.path.join(plot_dir, "avg_perplexity_vs_seq_len_mean_std.png"),
+        log_scale=(avg_ppl_scale == "log"),
+        y_min=avg_ppl_y_min,
+        y_max=avg_ppl_y_max,
+    )
+    _plot_avg_seq_len_metric(
+        aggregate_rows,
+        metric_key="last_token_perplexity_mean",
+        std_key="last_token_perplexity_std",
+        y_label="Last-token Perplexity",
+        plot_path=os.path.join(
+            plot_dir, "avg_last_token_perplexity_vs_seq_len_mean_std.png"
+        ),
+        log_scale=(last_ppl_scale == "log"),
+        y_min=last_ppl_y_min,
+        y_max=last_ppl_y_max,
+    )
+    _plot_avg_seq_len_metric(
+        aggregate_rows,
+        metric_key="accuracy_mean",
+        std_key="accuracy_std",
+        y_label="Accuracy",
+        plot_path=os.path.join(plot_dir, "avg_accuracy_vs_seq_len_mean_std.png"),
+        log_scale=(acc_scale == "log"),
+        clamp_accuracy=True,
+        y_min=acc_y_min,
+        y_max=acc_y_max,
+        auto_tight_accuracy=True,
+    )
+
+    return {
+        "plot_dir": plot_dir,
+        "aggregate": aggregate_rows,
+        "per_model": results_by_model,
+    }
+
+
+def _plot_avg_seq_len_metric(
+    rows,
+    metric_key: str,
+    std_key: Optional[str],
+    y_label: str,
+    plot_path: str,
+    log_scale: bool,
+    clamp_accuracy: bool = False,
+    y_min: Optional[float] = None,
+    y_max: Optional[float] = None,
+    auto_tight_accuracy: bool = False,
+):
+    seq_lens = [row["seq_len"] for row in rows if row.get(metric_key) is not None]
+    values = [row[metric_key] for row in rows if row.get(metric_key) is not None]
+    if not seq_lens:
+        print(f"  Skipping plot (no data): {plot_path}")
+        return
+
+    values_arr = np.array(values, dtype=float)
+    std_arr = None
+    if std_key:
+        std_vals = [
+            row.get(std_key) for row in rows if row.get(metric_key) is not None
+        ]
+        std_arr = np.array(std_vals, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(
+        seq_lens,
+        values_arr,
+        color="#4C72B0",
+        marker="o",
+        markersize=4,
+        linewidth=1.5,
+        label="Average",
+    )
+    if std_arr is not None and not np.all(np.isnan(std_arr)):
+        ax.fill_between(
+            seq_lens,
+            values_arr - std_arr,
+            values_arr + std_arr,
+            color="#4C72B0",
+            alpha=0.15,
+            label="Std. dev.",
+        )
+    ax.set_xlabel("Sequence Length", fontsize=12)
+    ax.set_ylabel(y_label, fontsize=12)
+    _apply_y_axis_style(ax, "log" if log_scale else "linear")
+    if y_min is not None or y_max is not None:
+        ax.set_ylim(bottom=y_min, top=y_max)
+    if clamp_accuracy and y_min is None and y_max is None and auto_tight_accuracy:
+        lo = float(np.nanmin(values_arr))
+        hi = float(np.nanmax(values_arr))
+        pad = max(0.01, (hi - lo) * 0.15)
+        lo = max(0.0, lo - pad)
+        hi = min(1.0, hi + pad)
+        if hi - lo < 0.05:
+            center = (lo + hi) / 2.0
+            lo = max(0.0, center - 0.025)
+            hi = min(1.0, center + 0.025)
+        ax.set_ylim(bottom=lo, top=hi)
+    elif clamp_accuracy and y_min is None and y_max is None:
+        ax.set_ylim(0, 1.0)
+    ax.set_title(f"Average {y_label} vs Sequence Length", fontsize=11, fontweight="bold")
+    ax.legend(fontsize=9, loc="best")
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Plot → {plot_path}")
+
+
+def _extract_metric_value(row: dict, metric_name: str):
+    if row is None:
+        return np.nan
+    if metric_name == "perplexity":
+        for key in ("perplexity", "nanogpt_perplexity"):
+            value = row.get(key)
+            if value is not None:
+                return value
+    elif metric_name == "last_token_perplexity":
+        for key in (
+            "last_token_perplexity",
+            "last_token_perplexity_nanogpt",
+            "nanogpt_last_token_perplexity",
+        ):
+            value = row.get(key)
+            if value is not None:
+                return value
+        metrics = row.get("metrics")
+        if isinstance(metrics, dict):
+            for key in (
+                "last_token_perplexity",
+                "last_token_perplexity_nanogpt",
+                "nanogpt_last_token_perplexity",
+            ):
+                value = metrics.get(key)
+                if value is not None:
+                    return value
+    elif metric_name == "accuracy":
+        value = row.get("accuracy")
+        if value is not None:
+            return value
+    else:
+        value = row.get(metric_name)
+        if value is not None:
+            return value
+    return np.nan
+
+
+def _plot_multi_model_seq_len_metric(
+    results_by_model: dict,
+    metric_name: str,
+    y_label: str,
+    plot_path: str,
+    log_scale: bool,
+    clamp_accuracy: bool = False,
+    aggregate_rows: Optional[List[dict]] = None,
+    y_min: Optional[float] = None,
+    y_max: Optional[float] = None,
+    auto_tight_accuracy: bool = False,
+):
+    fig, ax = plt.subplots(figsize=(10, 5))
+    cmap = plt.get_cmap("tab10")
+    plotted_any = False
+
+    for idx, (model_name, rows) in enumerate(
+        sorted(results_by_model.items(), key=lambda item: _natural_sort_key(item[0]))
+    ):
+        seq_lens = []
+        values = []
+        for row in rows:
+            value = _extract_metric_value(row, metric_name)
+            if value is None or (isinstance(value, float) and np.isnan(value)):
+                continue
+            seq_lens.append(row["seq_len"])
+            values.append(float(value))
+        if not seq_lens:
+            continue
+        plotted_any = True
+        color = cmap(idx % cmap.N)
+        ax.plot(
+            seq_lens,
+            values,
+            color=color,
+            marker="o",
+            markersize=4,
+            linewidth=1.5,
+            label=model_name,
+        )
+
+    if aggregate_rows:
+        agg_seq_lens = []
+        agg_values = []
+        agg_key = f"{metric_name}_mean"
+        for row in aggregate_rows:
+            value = row.get(agg_key)
+            if value is None or (isinstance(value, float) and np.isnan(value)):
+                continue
+            agg_seq_lens.append(row["seq_len"])
+            agg_values.append(float(value))
+        if agg_seq_lens:
+            ax.plot(
+                agg_seq_lens,
+                agg_values,
+                color="black",
+                marker="none",
+                linewidth=2.0,
+                linestyle="--",
+                label="Mean",
+            )
+
+    if clamp_accuracy:
+        all_values = []
+        for row in aggregate_rows or []:
+            value = row.get("accuracy_mean" if metric_name == "accuracy" else None)
+            if value is not None and not np.isnan(value):
+                all_values.append(float(value))
+        if not all_values:
+            for rows in results_by_model.values():
+                for row in rows:
+                    value = _extract_metric_value(row, metric_name)
+                    if value is not None and not (isinstance(value, float) and np.isnan(value)):
+                        all_values.append(float(value))
+        if y_min is None and y_max is None and auto_tight_accuracy and all_values:
+            lo = min(all_values)
+            hi = max(all_values)
+            pad = max(0.01, (hi - lo) * 0.15)
+            y_min = max(0.0, lo - pad)
+            y_max = min(1.0, hi + pad)
+            if y_max - y_min < 0.05:
+                center = (lo + hi) / 2.0
+                y_min = max(0.0, center - 0.025)
+                y_max = min(1.0, center + 0.025)
+        elif y_min is None and y_max is None:
+            y_min, y_max = 0.0, 1.0
+
+    if not plotted_any and not aggregate_rows:
+        print(f"  Skipping plot (no data): {plot_path}")
+        plt.close(fig)
+        return
+
+    ax.set_xlabel("Sequence Length", fontsize=12)
+    ax.set_ylabel(y_label, fontsize=12)
+    _apply_y_axis_style(ax, "log" if log_scale else "linear")
+    if y_min is not None or y_max is not None:
+        ax.set_ylim(bottom=y_min, top=y_max)
+    ax.set_title(f"{y_label} vs Sequence Length", fontsize=11, fontweight="bold")
+    ax.legend(fontsize=8, loc="best")
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Plot → {plot_path}")
+
+
 def evaluate_sequence_length_range(
     checkpoint_path: str,
     eval_text_file: str,
@@ -3751,10 +4769,27 @@ def evaluate_sequence_length_range(
     max_seq_len: int = 64,
     plot_dir: str = None,
     batch_size: int = 512,
+    eval_scan_method: str = None,
+    expand_to_power_of_2: bool = False,
+    pow_2_expansion_random: bool = False,
+    nanogpt_ppl_metric: bool = False,
+    plot_metric: str = "both",
+    scan_post_merge_mlp: Optional[bool] = None,
+    tokenizer_path: Optional[str] = None,
+    tokenizer_type: TokenizerType = TokenizerType.SENTENCEPIECE,
+    avg_ppl_y_min: Optional[float] = None,
+    avg_ppl_y_max: Optional[float] = None,
+    last_ppl_y_min: Optional[float] = None,
+    last_ppl_y_max: Optional[float] = None,
+    acc_y_min: Optional[float] = None,
+    acc_y_max: Optional[float] = None,
+    avg_ppl_scale: str = "log",
+    last_ppl_scale: str = "log",
+    acc_scale: str = "linear",
 ):
     """
     Evaluate a checkpoint across a range of sequence lengths (min_seq_len to
-    max_seq_len inclusive, step 1).  For each length L the evaluation text is
+    max_seq_len inclusive, step 128).  For each length L the evaluation text is
     re-tokenised into windows of length L and the aggregate loss / perplexity /
     accuracy are computed.  A summary plot of perplexity vs sequence length is
     saved to *plot_dir*.
@@ -3775,6 +4810,16 @@ def evaluate_sequence_length_range(
         plot_dir:        Where to save the summary plot and CSV.  Defaults to
                          ``eval_plots/<checkpoint_stem>_seqlen_range/``.
         batch_size:      Batch size for evaluation (default: 64).
+        eval_scan_method: Optional scan method override for evaluation.
+        expand_to_power_of_2: Force deterministic power-of-two right-padding in eval.
+        pow_2_expansion_random: Use random insertion (instead of right-padding)
+                                when power-of-two expansion is enabled.
+        nanogpt_ppl_metric: Use nanoGPT-style perplexity (exp(mean loss)).
+        plot_metric: Which PPL curves to plot on left axis: pplx, last_token, both.
+        scan_post_merge_mlp: Explicitly enable/disable scan post-merge MLP.
+        tokenizer_path: Optional tokenizer override path (used if checkpoint lacks one
+                        or to enforce a shared tokenizer).
+        tokenizer_type: Tokenizer type used with tokenizer_path.
 
     Returns:
         List of dicts, one per evaluated length, with keys
@@ -3789,25 +4834,25 @@ def evaluate_sequence_length_range(
     params, _, config, epoch, best_ppl, tokenizer = load_checkpoint(
         checkpoint_path, step=step
     )
-    if tokenizer is None:
-        raise ValueError(
-            "Checkpoint does not contain a saved tokenizer. "
-            "Please pass --tokenizer_path so the tokenizer can be loaded."
-        )
+    tokenizer_override = _load_tokenizer_override(tokenizer_path, tokenizer_type)
+    if tokenizer_override is not None:
+        print(f"Using tokenizer override from: {tokenizer_path}")
+    tokenizer = _select_eval_tokenizer(
+        checkpoint_path, tokenizer, tokenizer_override
+    )
 
     model_creation_fn, model_type_str, seq2seq = _detect_model_type(checkpoint_path)
-    eval_model = create_evaluation_model(config, model_creation_fn)
-
-    cp_lower = checkpoint_path.lower()
-    use_lstm = "lstm" in cp_lower
-    use_transformer_ldru = (
-        "transformer_ldru" in cp_lower and "ldru_transformer" not in cp_lower
+    config = _apply_eval_config_overrides(
+        config,
+        params,
+        eval_scan_method,
+        expand_to_power_of_2,
+        pow_2_expansion_random,
+        scan_post_merge_mlp,
     )
-    use_ldru_transformer = "ldru_transformer" in cp_lower
-    use_transformer = (
-        "transformer" in cp_lower
-        and not use_transformer_ldru
-        and not use_ldru_transformer
+    eval_model = create_evaluation_model(config, model_creation_fn, params=params)
+    use_lstm, use_transformer, use_transformer_ldru, use_ldru_transformer = (
+        _detect_eval_model_flags(checkpoint_path)
     )
 
     # --- read the raw text once ---
@@ -3827,94 +4872,77 @@ def evaluate_sequence_length_range(
     print(f"  Checkpoint : {checkpoint_path}")
     print(f"  Eval file  : {eval_text_file}")
     print(f"  Model type : {model_type_str}")
-    print(f"  Lengths    : {min_seq_len} → {max_seq_len} (step 1)")
+    print(f"  Lengths    : {min_seq_len} → {max_seq_len} (step 128)")
     print(f"  Output dir : {plot_dir}")
     print(f"{'=' * 60}\n")
 
-    results = []
-    rng_key = jax.random.PRNGKey(0)
-
-    for seq_len in tqdm.tqdm(seq_lengths, desc="Seq lengths"):
-        stride = max(1, seq_len // 2)
-        sequences = create_text_dataset(text, tokenizer, seq_len, stride)
-
-        if len(sequences) == 0:
-            print(f"  [seq_len={seq_len}] No sequences produced – skipping.")
-            continue
-
-        # change batch size dynamically based on sequence length to keep evaluation time reasonable
-        max_batch_size_seq_len = 512 * 128
-        batch_size = min(batch_size, max_batch_size_seq_len // seq_len)
-
-        rng_key, eval_key = jax.random.split(rng_key)
-        avg_loss, avg_metrics = evaluate_model(
-            params=params,
-            model=None,
-            rng_key=eval_key,
-            val_data=sequences,
-            batch_size=batch_size,
-            use_lstm=use_lstm,
-            use_transformer=use_transformer,
-            use_transformer_ldru=use_transformer_ldru,
-            use_ldru_transformer=use_ldru_transformer,
-            seq2seq=seq2seq,
-            eval_model=eval_model,
-        )
-
-        row = {
-            "seq_len": seq_len,
-            "n_sequences": int(len(sequences)),
-            "loss": float(avg_loss),
-            "perplexity": float(avg_metrics["perplexity"]),
-            "accuracy": float(avg_metrics["accuracy"]),
-        }
-        results.append(row)
-        print(
-            f"  seq_len={seq_len:4d} | n={row['n_sequences']:6,} | "
-            f"loss={row['loss']:.4f} | ppl={row['perplexity']:.4f} | acc={row['accuracy']:.4f}"
-        )
+    results = _evaluate_seq_len_range_core(
+        params=params,
+        eval_model=eval_model,
+        tokenizer=tokenizer,
+        seq2seq=seq2seq,
+        use_lstm=use_lstm,
+        use_transformer=use_transformer,
+        use_transformer_ldru=use_transformer_ldru,
+        use_ldru_transformer=use_ldru_transformer,
+        text=text,
+        seq_lengths=seq_lengths,
+        batch_size=batch_size,
+        nanogpt_ppl_metric=nanogpt_ppl_metric,
+    )
 
     if not results:
         print("No results collected – check that the eval file has enough text.")
         return results
 
-    # --- save CSV ---
-    csv_path = os.path.join(plot_dir, "seqlen_range_results.csv")
-    with open(csv_path, "w") as fh:
-        fh.write("seq_len,n_sequences,loss,perplexity,accuracy\n")
-        for r in results:
-            fh.write(
-                f"{r['seq_len']},{r['n_sequences']},{r['loss']:.6f},{r['perplexity']:.6f},{r['accuracy']:.6f}\n"
-            )
+    csv_path, json_path = _write_seq_len_range_results(
+        results, plot_dir, basename="seqlen_range_results"
+    )
     print(f"\n  CSV  → {csv_path}")
-
-    # --- save JSON ---
-    json_path = os.path.join(plot_dir, "seqlen_range_results.json")
-    with open(json_path, "w") as fh:
-        json.dump(results, fh, indent=2)
     print(f"  JSON → {json_path}")
 
     # --- plot ---
     seq_lens_arr = np.array([r["seq_len"] for r in results])
     perplexities = np.array([r["perplexity"] for r in results])
+    last_token_perplexities = np.array([r["last_token_perplexity"] for r in results])
     accuracies = np.array([r["accuracy"] for r in results])
 
     fig, ax1 = plt.subplots(figsize=(10, 5))
 
     color_ppl = "#4C72B0"
-    ax1.plot(
-        seq_lens_arr,
-        perplexities,
-        color=color_ppl,
-        marker="o",
-        markersize=4,
-        linewidth=1.5,
-        label="Perplexity",
-    )
+    color_last = "#55A868"
+    if plot_metric in ("pplx", "both"):
+        ax1.plot(
+            seq_lens_arr,
+            perplexities,
+            color=color_ppl,
+            marker="o",
+            markersize=4,
+            linewidth=1.5,
+            label="Perplexity",
+        )
+    if plot_metric in ("last_token", "both"):
+        ax1.plot(
+            seq_lens_arr,
+            last_token_perplexities,
+            color=color_last,
+            marker="^",
+            markersize=4,
+            linewidth=1.5,
+            linestyle="-.",
+            label="Last-token Perplexity",
+        )
     ax1.set_xlabel("Sequence Length", fontsize=12)
-    ax1.set_ylabel("Perplexity", color=color_ppl, fontsize=12)
-    ax1.tick_params(axis="y", labelcolor=color_ppl)
-    ax1.set_yscale("log")
+    ax1.set_ylabel("Perplexity", fontsize=12)
+    ax1.tick_params(axis="y")
+    if plot_metric in ("pplx", "both"):
+        _apply_y_axis_style(ax1, avg_ppl_scale)
+        if avg_ppl_y_min is not None or avg_ppl_y_max is not None:
+            ax1.set_ylim(bottom=avg_ppl_y_min, top=avg_ppl_y_max)
+    else:
+        _apply_y_axis_style(ax1, last_ppl_scale)
+        if last_ppl_y_min is not None or last_ppl_y_max is not None:
+            ax1.set_ylim(bottom=last_ppl_y_min, top=last_ppl_y_max)
 
     ax2 = ax1.twinx()
     color_acc = "#DD8452"
@@ -3930,7 +4958,24 @@ def evaluate_sequence_length_range(
     )
     ax2.set_ylabel("Accuracy", color=color_acc, fontsize=12)
     ax2.tick_params(axis="y", labelcolor=color_acc)
-    ax2.set_ylim(0, 1.05)
+    if acc_scale == "log":
+        ax2.set_yscale("log")
+    ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, _: _plain_tick_label(x)))
+    if acc_y_min is not None or acc_y_max is not None:
+        ax2.set_ylim(bottom=acc_y_min, top=acc_y_max)
+    else:
+        acc_values = accuracies[np.isfinite(accuracies)]
+        if len(acc_values) > 0:
+            lo = float(np.min(acc_values))
+            hi = float(np.max(acc_values))
+            pad = max(0.01, (hi - lo) * 0.15)
+            lo = max(0.0, lo - pad)
+            hi = min(1.0, hi + pad)
+            if hi - lo < 0.05:
+                center = (lo + hi) / 2.0
+                lo = max(0.0, center - 0.025)
+                hi = min(1.0, center + 0.025)
+            ax2.set_ylim(bottom=lo, top=hi)
 
     ckpt_stem = os.path.basename(checkpoint_path.rstrip("/"))
     ax1.set_title(
@@ -3960,6 +5005,227 @@ def evaluate_sequence_length_range(
     return results
 
 
+def evaluate_sequence_length_range_list(
+    list_path: str,
+    eval_text_file: str,
+    step: int = 1,
+    min_seq_len: int = 4,
+    max_seq_len: int = 64,
+    plot_dir: str = None,
+    batch_size: int = 512,
+    eval_scan_method: str = None,
+    expand_to_power_of_2: bool = False,
+    pow_2_expansion_random: bool = False,
+    nanogpt_ppl_metric: bool = False,
+    scan_post_merge_mlp: Optional[bool] = None,
+    tokenizer_path: Optional[str] = None,
+    tokenizer_type: TokenizerType = TokenizerType.SENTENCEPIECE,
+    avg_ppl_y_min: Optional[float] = None,
+    avg_ppl_y_max: Optional[float] = None,
+    last_ppl_y_min: Optional[float] = None,
+    last_ppl_y_max: Optional[float] = None,
+    acc_y_min: Optional[float] = None,
+    acc_y_max: Optional[float] = None,
+    avg_ppl_scale: str = "log",
+    last_ppl_scale: str = "log",
+    acc_scale: str = "linear",
+):
+    """
+    Evaluate multiple checkpoints over a range of sequence lengths and plot
+    averaged curves for perplexity, last-token perplexity, and accuracy.
+
+    The list file should contain one checkpoint directory per line. Blank
+    lines and `#` comments are ignored. Relative paths are resolved relative
+    to the list file location.
+
+    Usage example::
+
+        python train_causal_ldru.py \\
+            --eval_seq_len_range_list checkpoint_list.txt \\
+            --eval_file ptb_test.txt \\
+            --min_seq_len 4 --max_seq_len 64
+    """
+    if min_seq_len < 2:
+        raise ValueError("min_seq_len must be >= 2 (need at least input + one target)")
+    if max_seq_len < min_seq_len:
+        raise ValueError("max_seq_len must be >= min_seq_len")
+
+    checkpoint_paths = _read_checkpoint_list(list_path)
+    if not checkpoint_paths:
+        raise ValueError("No checkpoints found in list file.")
+
+    seq_lengths = list(range(min_seq_len, max_seq_len + 1, 128))
+
+    with open(eval_text_file, "r", encoding="utf-8") as fh:
+        text = fh.read()
+
+    tokenizer_override = _load_tokenizer_override(tokenizer_path, tokenizer_type)
+    if tokenizer_override is not None:
+        print(f"Using shared tokenizer override from: {tokenizer_path}")
+
+    list_stem = os.path.splitext(os.path.basename(list_path))[0]
+    if plot_dir is None:
+        plot_dir = os.path.join("eval_plots", list_stem)
+    os.makedirs(plot_dir, exist_ok=True)
+
+    print(f"\n{'=' * 60}")
+    print(f"  Multi-Model Sequence-Length Evaluation")
+    print(f"{'=' * 60}")
+    print(f"  List file : {list_path}")
+    print(f"  Models    : {len(checkpoint_paths)}")
+    print(f"  Eval file : {eval_text_file}")
+    print(f"  Lengths   : {min_seq_len} → {max_seq_len} (step 128)")
+    print(f"  Output dir: {plot_dir}")
+    print(f"{'=' * 60}\n")
+
+    results_by_model = {}
+
+    for checkpoint_path in checkpoint_paths:
+        print(f"\n{'-' * 60}")
+        print(f"Evaluating: {checkpoint_path}")
+        print(f"{'-' * 60}")
+        params, _, config, _, _, tokenizer = load_checkpoint(
+            checkpoint_path,
+            step=step,
+            tokenizer_path_override=tokenizer_path,
+            tokenizer_type_override=tokenizer_type if tokenizer_path else None,
+        )
+        tokenizer = _select_eval_tokenizer(
+            checkpoint_path, tokenizer, tokenizer_override
+        )
+
+        model_creation_fn, model_type_str, seq2seq = _detect_model_type(checkpoint_path)
+        config = _apply_eval_config_overrides(
+            config,
+            params,
+            eval_scan_method,
+            expand_to_power_of_2,
+            pow_2_expansion_random,
+            scan_post_merge_mlp,
+        )
+        eval_model = create_evaluation_model(config, model_creation_fn, params=params)
+        use_lstm, use_transformer, use_transformer_ldru, use_ldru_transformer = (
+            _detect_eval_model_flags(checkpoint_path)
+        )
+
+        print(f"  Model type : {model_type_str}")
+
+        results = _evaluate_seq_len_range_core(
+            params=params,
+            eval_model=eval_model,
+            tokenizer=tokenizer,
+            seq2seq=seq2seq,
+            use_lstm=use_lstm,
+            use_transformer=use_transformer,
+            use_transformer_ldru=use_transformer_ldru,
+            use_ldru_transformer=use_ldru_transformer,
+            text=text,
+            seq_lengths=seq_lengths,
+            batch_size=batch_size,
+            nanogpt_ppl_metric=nanogpt_ppl_metric,
+        )
+
+        if not results:
+            print("  No results collected for this model – skipping.")
+            continue
+
+        ckpt_stem = os.path.basename(checkpoint_path.rstrip("/"))
+        model_dir = os.path.join(plot_dir, ckpt_stem)
+        os.makedirs(model_dir, exist_ok=True)
+        _write_seq_len_range_results(
+            results, model_dir, basename="seqlen_range_results"
+        )
+        results_by_model[ckpt_stem] = results
+
+    if not results_by_model:
+        print("No results collected – check checkpoints and eval file.")
+        return {}
+
+    aggregate_rows = _aggregate_seq_len_results(results_by_model, seq_lengths)
+    if not aggregate_rows:
+        print("No aggregate rows created – check per-model results.")
+        return {}
+
+    csv_path, json_path = _write_seq_len_range_aggregate_results(
+        aggregate_rows, plot_dir, basename="seqlen_range_aggregate"
+    )
+    print(f"\n  Aggregate CSV  → {csv_path}")
+    print(f"  Aggregate JSON → {json_path}")
+
+    _plot_multi_model_seq_len_metric(
+        results_by_model,
+        metric_name="perplexity",
+        y_label="Perplexity",
+        plot_path=os.path.join(plot_dir, "avg_perplexity_vs_seq_len.png"),
+        log_scale=(avg_ppl_scale == "log"),
+        aggregate_rows=aggregate_rows,
+        y_min=avg_ppl_y_min,
+        y_max=avg_ppl_y_max,
+    )
+    _plot_multi_model_seq_len_metric(
+        results_by_model,
+        metric_name="last_token_perplexity",
+        y_label="Last-token Perplexity",
+        plot_path=os.path.join(plot_dir, "avg_last_token_perplexity_vs_seq_len.png"),
+        log_scale=(last_ppl_scale == "log"),
+        aggregate_rows=aggregate_rows,
+        y_min=last_ppl_y_min,
+        y_max=last_ppl_y_max,
+    )
+    _plot_multi_model_seq_len_metric(
+        results_by_model,
+        metric_name="accuracy",
+        y_label="Accuracy",
+        plot_path=os.path.join(plot_dir, "avg_accuracy_vs_seq_len.png"),
+        log_scale=(acc_scale == "log"),
+        clamp_accuracy=True,
+        aggregate_rows=aggregate_rows,
+        y_min=acc_y_min,
+        y_max=acc_y_max,
+        auto_tight_accuracy=True,
+    )
+    _plot_avg_seq_len_metric(
+        aggregate_rows,
+        metric_key="perplexity_mean",
+        std_key="perplexity_std",
+        y_label="Perplexity",
+        plot_path=os.path.join(plot_dir, "avg_perplexity_vs_seq_len_mean_std.png"),
+        log_scale=(avg_ppl_scale == "log"),
+        y_min=avg_ppl_y_min,
+        y_max=avg_ppl_y_max,
+    )
+    _plot_avg_seq_len_metric(
+        aggregate_rows,
+        metric_key="last_token_perplexity_mean",
+        std_key="last_token_perplexity_std",
+        y_label="Last-token Perplexity",
+        plot_path=os.path.join(
+            plot_dir, "avg_last_token_perplexity_vs_seq_len_mean_std.png"
+        ),
+        log_scale=(last_ppl_scale == "log"),
+        y_min=last_ppl_y_min,
+        y_max=last_ppl_y_max,
+    )
+    _plot_avg_seq_len_metric(
+        aggregate_rows,
+        metric_key="accuracy_mean",
+        std_key="accuracy_std",
+        y_label="Accuracy",
+        plot_path=os.path.join(plot_dir, "avg_accuracy_vs_seq_len_mean_std.png"),
+        log_scale=(acc_scale == "log"),
+        clamp_accuracy=True,
+        y_min=acc_y_min,
+        y_max=acc_y_max,
+        auto_tight_accuracy=True,
+    )
+
+    return {
+        "plot_dir": plot_dir,
+        "aggregate": aggregate_rows,
+        "per_model": results_by_model,
+    }
+
+
 def compare_models(
     checkpoint_paths: List[str],
     eval_text_file: str,
@@ -3967,6 +5233,10 @@ def compare_models(
     stride: int = None,
     n_sequences: int = 10,
     plot_dir: str = None,
+    eval_scan_method: str = None,
+    expand_to_power_of_2: bool = False,
+    pow_2_expansion_random: bool = False,
+    scan_post_merge_mlp: Optional[bool] = None,
 ):
     """
     Evaluate two or more models on the *same* n sequences and produce
@@ -3984,6 +5254,11 @@ def compare_models(
         n_sequences: Number of sequences to compare (default: 10).
                      0 = aggregate-only over all sequences (no plots).
         plot_dir: Output directory.  Defaults to ``eval_plots/comparison/``.
+        eval_scan_method: Optional scan method override for evaluation.
+        expand_to_power_of_2: Force deterministic power-of-two right-padding in eval.
+        pow_2_expansion_random: Use random insertion (instead of right-padding)
+                                when power-of-two expansion is enabled.
+        scan_post_merge_mlp: Explicitly enable/disable scan post-merge MLP.
 
     Returns:
         Dict mapping model name → list of per-sequence result dicts.
@@ -4008,7 +5283,27 @@ def compare_models(
             raise ValueError(f"Checkpoint {cp_path} has no saved tokenizer.")
 
         model_creation_fn, model_type_str, seq2seq = _detect_model_type(cp_path)
-        eval_model = create_evaluation_model(config, model_creation_fn)
+        if eval_scan_method:
+            print(f"  Eval scan method override: {eval_scan_method}")
+            config = LDRUExperimenstConfig(
+                **{**config.__dict__, "eval_scan_method": eval_scan_method}
+            )
+        config = resolve_scan_post_merge_mlp(config, params, override=scan_post_merge_mlp)
+        if expand_to_power_of_2:
+            print("  Power-of-two expansion enabled for evaluation")
+            config = LDRUExperimenstConfig(
+                **{**config.__dict__, "expand_to_power_of_2": True}
+            )
+        if pow_2_expansion_random:
+            print("  Random power-of-two expansion enabled for evaluation")
+            config = LDRUExperimenstConfig(
+                **{
+                    **config.__dict__,
+                    "expand_to_power_of_2": True,
+                    "pow_2_expansion_random": True,
+                }
+            )
+        eval_model = create_evaluation_model(config, model_creation_fn, params=params)
 
         # Friendly display name: <model_type>(<basename>)
         ckpt_stem = os.path.splitext(os.path.basename(cp_path))[0]
@@ -4066,9 +5361,7 @@ def compare_models(
 
         # Token labels (same for every model — same sequence)
         target_ids = np.array(seq[1:])
-        token_labels = [
-            tokenizer.id_to_word.get(int(tid), f"[{int(tid)}]") for tid in target_ids
-        ]
+        token_labels = [_token_label(tokenizer, tid) for tid in target_ids]
 
         per_model_metrics = []
         model_names = []
@@ -4083,8 +5376,7 @@ def compare_models(
 
             # Predicted token labels for this model
             pred_labels = [
-                tokenizer.id_to_word.get(int(pid), f"[{int(pid)}]")
-                for pid in metrics["predicted_token_ids"]
+                _token_label(tokenizer, pid) for pid in metrics["predicted_token_ids"]
             ]
             all_pred_labels.append(pred_labels)
 
@@ -4313,16 +5605,77 @@ if __name__ == "__main__":
     parser.add_argument(
         "--blelloch_random",
         action="store_true",
-        help="Use Blelloch random scan method for LDRU (default is deterministic)",
+        help="Deprecated alias for --pow_2_expansion_random.",
+    )
+    parser.add_argument(
+        "--expand_to_power_of_2",
+        action="store_true",
+        help=(
+            "Force deterministic power-of-two expansion (right-padding) during "
+            "training and evaluation for all scan methods."
+        ),
+    )
+    parser.add_argument(
+        "--pow_2_expansion_random",
+        action="store_true",
+        help=(
+            "Use random power-of-two expansion (insert zeros at random positions). "
+            "Implies --expand_to_power_of_2."
+        ),
     )
     parser.add_argument(
         "--scan_method",
         type=str,
         default="default",
-        choices=["default", "assoc", "sequential", "simple"],
+        choices=[
+            "default",
+            "assoc",
+            "assoc_rev",
+            "blelloch_rev",
+            "sequential",
+            "simple",
+            "pairwise",
+            "sequential_pairwise_final",
+            "seq_pairwise_final",
+            "hybrid_pairwise_final",
+        ],
         help=(
             "LDRU scan method: 'default'/'assoc' for associative tree scan, "
-            "'sequential'/'simple' for naive left-to-right scan."
+            "'assoc_rev'/'blelloch_rev' for reversed operand order, "
+            "'sequential'/'simple' for naive left-to-right scan, "
+            "'pairwise' for balanced tree scan on power-of-two lengths, "
+            "'sequential_pairwise_final' for sequential prefixes with pairwise final state."
+        ),
+    )
+    parser.add_argument(
+        "--jax_platform",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "gpu", "metal", "tpu"],
+        help=(
+            "Force a specific JAX backend. Use 'metal' on Apple Silicon when "
+            "jax-metal is installed; 'auto' keeps JAX's default selection."
+        ),
+    )
+    parser.add_argument(
+        "--eval_scan_method",
+        type=str,
+        default=None,
+        choices=[
+            "default",
+            "assoc",
+            "assoc_rev",
+            "blelloch_rev",
+            "sequential",
+            "simple",
+            "pairwise",
+            "sequential_pairwise_final",
+            "seq_pairwise_final",
+            "hybrid_pairwise_final",
+        ],
+        help=(
+            "Override scan method at evaluation time (uses checkpoint params "
+            "but swaps scan method). Default: None (use training scan_method)."
         ),
     )
     parser.add_argument(
@@ -4335,6 +5688,15 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Path to checkpoint file to evaluate (no training). Use with --eval_file.",
+    )
+    parser.add_argument(
+        "--legacy_eval",
+        action="store_true",
+        default=False,
+        help=(
+            "Run evaluation through legacy_ldru_files/train_causal_ldru.py so "
+            "older checkpoints load with the legacy model code."
+        ),
     )
     parser.add_argument(
         "--compare",
@@ -4367,6 +5729,12 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Directory to save evaluation plots (default: eval_plots/<checkpoint_name>/ or eval_plots/comparison/)",
+    )
+    parser.add_argument(
+        "--no_plots",
+        action="store_true",
+        default=False,
+        help="Disable evaluation plots and force aggregate evaluation on all sequences.",
     )
     parser.add_argument(
         "--val_text_file",
@@ -4468,6 +5836,28 @@ if __name__ == "__main__":
         "Use with --eval_file, --min_seq_len, and --max_seq_len.",
     )
     parser.add_argument(
+        "--eval_seq_len_range_list",
+        type=str,
+        default=None,
+        metavar="LIST_FILE",
+        help=(
+            "Evaluate multiple checkpoints over a sequence-length range. "
+            "Provide a text file with one checkpoint path per line "
+            "(blank lines and # comments are ignored)."
+        ),
+    )
+    parser.add_argument(
+        "--regen_seq_len_range_plots_from",
+        type=str,
+        default=None,
+        metavar="OUTPUT_DIR",
+        help=(
+            "Regenerate aggregate sequence-length plots from cached "
+            "seqlen_range_results.json files already stored under OUTPUT_DIR. "
+            "No checkpoint evaluation is performed."
+        ),
+    )
+    parser.add_argument(
         "--min_seq_len",
         type=int,
         default=4,
@@ -4478,6 +5868,92 @@ if __name__ == "__main__":
         type=int,
         default=64,
         help="Maximum sequence length for --eval_seq_len_range (default: 64)",
+    )
+    parser.add_argument(
+        "--seq_len_plot_metric",
+        type=str,
+        default="both",
+        choices=["pplx", "last_token", "both"],
+        help=(
+            "For --eval_seq_len_range plots: show overall perplexity, last-token "
+            "perplexity, or both on the left axis."
+        ),
+    )
+    parser.add_argument(
+        "--seq_len_ppl_min",
+        type=float,
+        default=None,
+        help="Shared fallback lower y-axis bound for perplexity plots.",
+    )
+    parser.add_argument(
+        "--seq_len_ppl_max",
+        type=float,
+        default=None,
+        help="Shared fallback upper y-axis bound for perplexity plots.",
+    )
+    parser.add_argument(
+        "--seq_len_avg_ppl_min",
+        type=float,
+        default=None,
+        help="Lower y-axis bound for the average perplexity plots.",
+    )
+    parser.add_argument(
+        "--seq_len_avg_ppl_max",
+        type=float,
+        default=None,
+        help="Upper y-axis bound for the average perplexity plots.",
+    )
+    parser.add_argument(
+        "--seq_len_last_ppl_min",
+        type=float,
+        default=None,
+        help="Lower y-axis bound for the last-token perplexity plots.",
+    )
+    parser.add_argument(
+        "--seq_len_last_ppl_max",
+        type=float,
+        default=None,
+        help="Upper y-axis bound for the last-token perplexity plots.",
+    )
+    parser.add_argument(
+        "--seq_len_acc_min",
+        type=float,
+        default=None,
+        help="Optional lower y-axis bound for accuracy plots.",
+    )
+    parser.add_argument(
+        "--seq_len_acc_max",
+        type=float,
+        default=None,
+        help="Optional upper y-axis bound for accuracy plots.",
+    )
+    parser.add_argument(
+        "--seq_len_ppl_scale",
+        type=str,
+        default="log",
+        choices=["log", "linear"],
+        help="Shared fallback y-axis scale for perplexity plots (default: log).",
+    )
+    parser.add_argument(
+        "--seq_len_avg_ppl_scale",
+        type=str,
+        default=None,
+        choices=["log", "linear"],
+        help="Y-axis scale for the average perplexity plots.",
+    )
+    parser.add_argument(
+        "--seq_len_last_ppl_scale",
+        type=str,
+        default=None,
+        choices=["log", "linear"],
+        help="Y-axis scale for the last-token perplexity plots.",
+    )
+    parser.add_argument(
+        "--seq_len_acc_scale",
+        type=str,
+        default="linear",
+        choices=["linear", "log"],
+        help="Y-axis scale for accuracy plots (default: linear).",
     )
     parser.add_argument(
         "--print_log_file",
@@ -4618,6 +6094,26 @@ if __name__ == "__main__":
         default=False,
         help="Enable an optional pre-norm + GELU FFN block inside each LDRU layer.",
     )
+    scan_post_merge_group = parser.add_mutually_exclusive_group()
+    scan_post_merge_group.add_argument(
+        "--scan_post_merge_mlp",
+        dest="scan_post_merge_mlp",
+        action="store_true",
+        help=(
+            "Enable the scan post-merge MLP explicitly. "
+            "Overrides checkpoint compatibility auto-detection."
+        ),
+    )
+    scan_post_merge_group.add_argument(
+        "--no_scan_post_merge_mlp",
+        dest="scan_post_merge_mlp",
+        action="store_false",
+        help=(
+            "Disable the scan post-merge MLP explicitly. "
+            "Overrides checkpoint compatibility auto-detection."
+        ),
+    )
+    parser.set_defaults(scan_post_merge_mlp=None)
     parser.add_argument(
         "--nanogpt_ppl_metric",
         action="store_true",
@@ -4686,10 +6182,270 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    configure_jax_platform(args.jax_platform)
+    print(f"JAX backend: {jax.default_backend()}")
+    print(f"JAX devices: {jax.devices()}")
+
     configure_output(args.print_log_file)
+
+    if args.regen_seq_len_range_plots_from:
+        regenerate_seq_len_range_plots_from_output_dir(
+            output_dir=args.regen_seq_len_range_plots_from,
+            plot_dir=args.plot_dir,
+            avg_ppl_y_min=_resolve_plot_value(
+                args.seq_len_avg_ppl_min, args.seq_len_ppl_min, None
+            ),
+            avg_ppl_y_max=_resolve_plot_value(
+                args.seq_len_avg_ppl_max, args.seq_len_ppl_max, None
+            ),
+            last_ppl_y_min=_resolve_plot_value(
+                args.seq_len_last_ppl_min, args.seq_len_ppl_min, None
+            ),
+            last_ppl_y_max=_resolve_plot_value(
+                args.seq_len_last_ppl_max, args.seq_len_ppl_max, None
+            ),
+            acc_y_min=args.seq_len_acc_min,
+            acc_y_max=args.seq_len_acc_max,
+            avg_ppl_scale=_resolve_plot_value(
+                args.seq_len_avg_ppl_scale, args.seq_len_ppl_scale, "log"
+            ),
+            last_ppl_scale=_resolve_plot_value(
+                args.seq_len_last_ppl_scale, args.seq_len_ppl_scale, "log"
+            ),
+            acc_scale=args.seq_len_acc_scale,
+        )
+        exit(0)
+
+    if args.legacy_eval:
+        if not (
+            args.evaluate
+            or args.compare
+            or args.eval_seq_len_range
+            or args.eval_seq_len_range_list
+        ):
+            print(
+                "Error: --legacy_eval requires --evaluate, --compare, "
+                "or --eval_seq_len_range."
+            )
+            exit(1)
+        if args.eval_seq_len_range_list:
+            list_paths = _read_checkpoint_list(args.eval_seq_len_range_list)
+            if not list_paths:
+                print("Error: --eval_seq_len_range_list did not contain any checkpoints.")
+                exit(1)
+            print(f"Legacy eval over {len(list_paths)} checkpoints from list.")
+            list_stem = os.path.splitext(
+                os.path.basename(args.eval_seq_len_range_list)
+            )[0]
+            aggregate_plot_dir = (
+                args.plot_dir if args.plot_dir else os.path.join("eval_plots", list_stem)
+            )
+            os.makedirs(aggregate_plot_dir, exist_ok=True)
+            results_by_model = {}
+            for checkpoint_path in list_paths:
+                print(f"\n[legacy_eval] Running seq-len range for: {checkpoint_path}")
+                ckpt_stem = os.path.basename(checkpoint_path.rstrip("/"))
+                model_plot_dir = os.path.join(aggregate_plot_dir, ckpt_stem)
+                _run_legacy_ldru_eval(
+                    args,
+                    eval_seq_len_range_override=checkpoint_path,
+                    plot_dir_override=model_plot_dir,
+                )
+                results_json_path = os.path.join(model_plot_dir, "seqlen_range_results.json")
+                if not os.path.exists(results_json_path):
+                    raise FileNotFoundError(
+                        "Expected legacy seq-len results at "
+                        f"{results_json_path}, but the file was not created."
+                    )
+                with open(results_json_path, "r", encoding="utf-8") as f:
+                    results_by_model[ckpt_stem] = json.load(f)
+
+            seq_lengths = list(range(args.min_seq_len, args.max_seq_len + 1))
+            aggregate_rows = _aggregate_seq_len_results(results_by_model, seq_lengths)
+            if not aggregate_rows:
+                print("No aggregate rows created from legacy results.")
+                exit(1)
+
+            csv_path, json_path = _write_seq_len_range_aggregate_results(
+                aggregate_rows, aggregate_plot_dir, basename="seqlen_range_aggregate"
+            )
+            print(f"\n  Aggregate CSV  → {csv_path}")
+            print(f"  Aggregate JSON → {json_path}")
+            _plot_multi_model_seq_len_metric(
+                results_by_model,
+                metric_name="perplexity",
+                y_label="Perplexity",
+                plot_path=os.path.join(
+                    aggregate_plot_dir, "avg_perplexity_vs_seq_len.png"
+                ),
+                log_scale=(
+                    _resolve_plot_value(
+                        args.seq_len_avg_ppl_scale, args.seq_len_ppl_scale, "log"
+                    )
+                    == "log"
+                ),
+                aggregate_rows=aggregate_rows,
+                y_min=_resolve_plot_value(
+                    args.seq_len_avg_ppl_min, args.seq_len_ppl_min, None
+                ),
+                y_max=_resolve_plot_value(
+                    args.seq_len_avg_ppl_max, args.seq_len_ppl_max, None
+                ),
+            )
+            _plot_multi_model_seq_len_metric(
+                results_by_model,
+                metric_name="last_token_perplexity",
+                y_label="Last-token Perplexity",
+                plot_path=os.path.join(
+                    aggregate_plot_dir, "avg_last_token_perplexity_vs_seq_len.png"
+                ),
+                log_scale=(
+                    _resolve_plot_value(
+                        args.seq_len_last_ppl_scale, args.seq_len_ppl_scale, "log"
+                    )
+                    == "log"
+                ),
+                aggregate_rows=aggregate_rows,
+                y_min=_resolve_plot_value(
+                    args.seq_len_last_ppl_min, args.seq_len_ppl_min, None
+                ),
+                y_max=_resolve_plot_value(
+                    args.seq_len_last_ppl_max, args.seq_len_ppl_max, None
+                ),
+            )
+            _plot_multi_model_seq_len_metric(
+                results_by_model,
+                metric_name="accuracy",
+                y_label="Accuracy",
+                plot_path=os.path.join(aggregate_plot_dir, "avg_accuracy_vs_seq_len.png"),
+                log_scale=(args.seq_len_acc_scale == "log"),
+                clamp_accuracy=True,
+                aggregate_rows=aggregate_rows,
+                y_min=args.seq_len_acc_min,
+                y_max=args.seq_len_acc_max,
+                auto_tight_accuracy=True,
+            )
+            _plot_avg_seq_len_metric(
+                aggregate_rows,
+                metric_key="perplexity_mean",
+                std_key="perplexity_std",
+                y_label="Perplexity",
+                plot_path=os.path.join(
+                    aggregate_plot_dir, "avg_perplexity_vs_seq_len_mean_std.png"
+                ),
+                log_scale=(
+                    _resolve_plot_value(
+                        args.seq_len_avg_ppl_scale, args.seq_len_ppl_scale, "log"
+                    )
+                    == "log"
+                ),
+                y_min=_resolve_plot_value(
+                    args.seq_len_avg_ppl_min, args.seq_len_ppl_min, None
+                ),
+                y_max=_resolve_plot_value(
+                    args.seq_len_avg_ppl_max, args.seq_len_ppl_max, None
+                ),
+            )
+            _plot_avg_seq_len_metric(
+                aggregate_rows,
+                metric_key="last_token_perplexity_mean",
+                std_key="last_token_perplexity_std",
+                y_label="Last-token Perplexity",
+                plot_path=os.path.join(
+                    aggregate_plot_dir,
+                    "avg_last_token_perplexity_vs_seq_len_mean_std.png",
+                ),
+                log_scale=(
+                    _resolve_plot_value(
+                        args.seq_len_last_ppl_scale, args.seq_len_ppl_scale, "log"
+                    )
+                    == "log"
+                ),
+                y_min=_resolve_plot_value(
+                    args.seq_len_last_ppl_min, args.seq_len_ppl_min, None
+                ),
+                y_max=_resolve_plot_value(
+                    args.seq_len_last_ppl_max, args.seq_len_ppl_max, None
+                ),
+            )
+            _plot_avg_seq_len_metric(
+                aggregate_rows,
+                metric_key="accuracy_mean",
+                std_key="accuracy_std",
+                y_label="Accuracy",
+                plot_path=os.path.join(
+                    aggregate_plot_dir, "avg_accuracy_vs_seq_len_mean_std.png"
+                ),
+                log_scale=(args.seq_len_acc_scale == "log"),
+                clamp_accuracy=True,
+                y_min=args.seq_len_acc_min,
+                y_max=args.seq_len_acc_max,
+                auto_tight_accuracy=True,
+            )
+            exit(0)
+        _run_legacy_ldru_eval(args)
+        exit(0)
+
+    if args.eval_seq_len_range and args.eval_seq_len_range_list:
+        print(
+            "Error: choose only one of --eval_seq_len_range or "
+            "--eval_seq_len_range_list."
+        )
+        exit(1)
+
+    if args.eval_seq_len_range_list:
+        use_pow2_random = bool(args.pow_2_expansion_random or args.blelloch_random)
+        use_pow2_expand = bool(args.expand_to_power_of_2 or use_pow2_random)
+        eval_file = args.eval_file if args.eval_file else args.text_file
+        if not eval_file:
+            print(
+                "Error: --eval_seq_len_range_list requires --eval_file "
+                "(or --text_file)."
+            )
+            exit(1)
+        evaluate_sequence_length_range_list(
+            list_path=args.eval_seq_len_range_list,
+            eval_text_file=eval_file,
+            step=args.eval_step,
+            min_seq_len=args.min_seq_len,
+            max_seq_len=args.max_seq_len,
+            plot_dir=args.plot_dir,
+            batch_size=args.batch_size,
+            eval_scan_method=args.eval_scan_method,
+            expand_to_power_of_2=use_pow2_expand,
+            pow_2_expansion_random=use_pow2_random,
+            nanogpt_ppl_metric=args.nanogpt_ppl_metric,
+            scan_post_merge_mlp=args.scan_post_merge_mlp,
+            tokenizer_path=args.tokenizer_path,
+            tokenizer_type=args.tokenizer_type,
+            avg_ppl_y_min=_resolve_plot_value(
+                args.seq_len_avg_ppl_min, args.seq_len_ppl_min, None
+            ),
+            avg_ppl_y_max=_resolve_plot_value(
+                args.seq_len_avg_ppl_max, args.seq_len_ppl_max, None
+            ),
+            last_ppl_y_min=_resolve_plot_value(
+                args.seq_len_last_ppl_min, args.seq_len_ppl_min, None
+            ),
+            last_ppl_y_max=_resolve_plot_value(
+                args.seq_len_last_ppl_max, args.seq_len_ppl_max, None
+            ),
+            acc_y_min=args.seq_len_acc_min,
+            acc_y_max=args.seq_len_acc_max,
+            avg_ppl_scale=_resolve_plot_value(
+                args.seq_len_avg_ppl_scale, args.seq_len_ppl_scale, "log"
+            ),
+            last_ppl_scale=_resolve_plot_value(
+                args.seq_len_last_ppl_scale, args.seq_len_ppl_scale, "log"
+            ),
+            acc_scale=args.seq_len_acc_scale,
+        )
+        exit(0)
 
     # Sequence-length range evaluation mode
     if args.eval_seq_len_range:
+        use_pow2_random = bool(args.pow_2_expansion_random or args.blelloch_random)
+        use_pow2_expand = bool(args.expand_to_power_of_2 or use_pow2_random)
         eval_file = args.eval_file if args.eval_file else args.text_file
         if not eval_file:
             print("Error: --eval_seq_len_range requires --eval_file (or --text_file).")
@@ -4701,11 +6457,43 @@ if __name__ == "__main__":
             min_seq_len=args.min_seq_len,
             max_seq_len=args.max_seq_len,
             plot_dir=args.plot_dir,
+            batch_size=args.batch_size,
+            eval_scan_method=args.eval_scan_method,
+            expand_to_power_of_2=use_pow2_expand,
+            pow_2_expansion_random=use_pow2_random,
+            nanogpt_ppl_metric=args.nanogpt_ppl_metric,
+            plot_metric=args.seq_len_plot_metric,
+            scan_post_merge_mlp=args.scan_post_merge_mlp,
+            tokenizer_path=args.tokenizer_path,
+            tokenizer_type=args.tokenizer_type,
+            avg_ppl_y_min=_resolve_plot_value(
+                args.seq_len_avg_ppl_min, args.seq_len_ppl_min, None
+            ),
+            avg_ppl_y_max=_resolve_plot_value(
+                args.seq_len_avg_ppl_max, args.seq_len_ppl_max, None
+            ),
+            last_ppl_y_min=_resolve_plot_value(
+                args.seq_len_last_ppl_min, args.seq_len_ppl_min, None
+            ),
+            last_ppl_y_max=_resolve_plot_value(
+                args.seq_len_last_ppl_max, args.seq_len_ppl_max, None
+            ),
+            acc_y_min=args.seq_len_acc_min,
+            acc_y_max=args.seq_len_acc_max,
+            avg_ppl_scale=_resolve_plot_value(
+                args.seq_len_avg_ppl_scale, args.seq_len_ppl_scale, "log"
+            ),
+            last_ppl_scale=_resolve_plot_value(
+                args.seq_len_last_ppl_scale, args.seq_len_ppl_scale, "log"
+            ),
+            acc_scale=args.seq_len_acc_scale,
         )
         exit(0)
 
     # Compare mode - evaluate multiple models on the same sequences
     if args.compare:
+        use_pow2_random = bool(args.pow_2_expansion_random or args.blelloch_random)
+        use_pow2_expand = bool(args.expand_to_power_of_2 or use_pow2_random)
         eval_file = args.eval_file
         if eval_file is None:
             eval_file = args.text_file
@@ -4716,6 +6504,10 @@ if __name__ == "__main__":
             seq_length=args.seq_length,
             n_sequences=args.n_sequences,
             plot_dir=args.plot_dir,
+            eval_scan_method=args.eval_scan_method,
+            expand_to_power_of_2=use_pow2_expand,
+            pow_2_expansion_random=use_pow2_random,
+            scan_post_merge_mlp=args.scan_post_merge_mlp,
         )
         exit(0)
 
@@ -4740,6 +6532,8 @@ if __name__ == "__main__":
 
     # Evaluate mode - load checkpoint and evaluate on a text file
     if args.evaluate:
+        use_pow2_random = bool(args.pow_2_expansion_random or args.blelloch_random)
+        use_pow2_expand = bool(args.expand_to_power_of_2 or use_pow2_random)
         eval_file = args.eval_file
         if eval_file is None:
             eval_file = args.text_file  # Fall back to --text_file
@@ -4753,6 +6547,12 @@ if __name__ == "__main__":
             plot_dir=args.plot_dir,
             tokenizer_model_path=tokenizer_path,
             step=args.eval_step,
+            eval_scan_method=args.eval_scan_method,
+            expand_to_power_of_2=use_pow2_expand,
+            pow_2_expansion_random=use_pow2_random,
+            no_plots=args.no_plots,
+            nanogpt_ppl_metric=args.nanogpt_ppl_metric,
+            scan_post_merge_mlp=args.scan_post_merge_mlp,
         )
         exit(0)
 
@@ -4853,7 +6653,14 @@ if __name__ == "__main__":
         use_positional_encoding=(
             True if use_transformer or use_transformer_ldru else False
         ),
-        expand_to_power_of_2=True if args.blelloch_random else False,
+        expand_to_power_of_2=bool(
+            args.expand_to_power_of_2
+            or args.pow_2_expansion_random
+            or args.blelloch_random
+        ),
+        pow_2_expansion_random=bool(
+            args.pow_2_expansion_random or args.blelloch_random
+        ),
         use_alibi=args.use_alibi,
         vocab_size=args.max_vocab_size,  # Set vocab size based on tokenizer
         initial_learning_rate=args.lr,
@@ -4871,10 +6678,15 @@ if __name__ == "__main__":
         tie_embeddings=args.tie_embeddings_ldru,
         prenorm_gelu_block=args.ldru_prenorm_gelu_block,
         scan_method=args.scan_method,
+        eval_scan_method=args.eval_scan_method,
+        scan_post_merge_mlp=(
+            True if args.scan_post_merge_mlp is None else args.scan_post_merge_mlp
+        ),
         operator=resolve_binary_operator(args.binary_operator),
         binop_expansion_factor=args.binop_expansion_factor,
         ablation_expansion_mode=args.ablation_expansion_mode,
         ablation_combine_mode=args.ablation_combine_mode,
+        blelloch_random=bool(args.pow_2_expansion_random or args.blelloch_random),
     )
     print(f"Selected binary operator: {binary_operator_to_name(config.operator)}")
     print(f"Selected scan method: {config.scan_method}")
@@ -4885,6 +6697,9 @@ if __name__ == "__main__":
         f"tie_embeddings_ldru={args.tie_embeddings_ldru}, "
         f"transformer_prenorm_gelu_block={args.transformer_prenorm_gelu_block}, "
         f"ldru_prenorm_gelu_block={args.ldru_prenorm_gelu_block}, "
+        f"scan_post_merge_mlp={config.scan_post_merge_mlp}, "
+        f"expand_to_power_of_2={config.expand_to_power_of_2}, "
+        f"pow_2_expansion_random={config.pow_2_expansion_random}, "
         f"nanogpt_ppl_metric={args.nanogpt_ppl_metric}, "
         f"nanogpt_batching={args.nanogpt_batching}"
     )
