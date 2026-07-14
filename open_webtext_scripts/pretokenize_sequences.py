@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from argparse import SUPPRESS
@@ -131,6 +132,24 @@ def parse_args() -> argparse.Namespace:
         help="SentencePiece model prefix when training.",
     )
     parser.add_argument(
+        "--sp_max_sentence_chars",
+        type=int,
+        default=4096,
+        help=(
+            "When training SentencePiece, split long input lines into chunks of at most "
+            "this many characters (0 disables chunking)."
+        ),
+    )
+    parser.add_argument(
+        "--sp_input_sentence_size",
+        type=int,
+        default=5000000,
+        help=(
+            "SentencePiece sentence sampling size when training (0 uses all input). "
+            "When > 0, shuffled sampling is enabled."
+        ),
+    )
+    parser.add_argument(
         "--append_eos",
         action="store_true",
         help="Append EOS/EOT token after each input line/document if available.",
@@ -186,21 +205,91 @@ def _train_sentencepiece_if_needed(
     train_text: str,
     sp_model_prefix: str,
     vocab_size: int,
+    sp_max_sentence_chars: int,
+    sp_input_sentence_size: int,
 ) -> str:
     import sentencepiece as spm
+
+    if sp_input_sentence_size < 0:
+        raise ValueError("--sp_input_sentence_size must be >= 0")
 
     Path(sp_model_prefix).parent.mkdir(parents=True, exist_ok=True)
     model_path = f"{sp_model_prefix}.model"
     if Path(model_path).exists():
         return model_path
 
-    spm.SentencePieceTrainer.train(
-        input=train_text,
-        model_prefix=sp_model_prefix,
-        vocab_size=vocab_size,
-        model_type="bpe",
-        character_coverage=1.0,
-    )
+    def _iter_sp_chunks(text: str, max_chars: int) -> list[str]:
+        text = text.strip()
+        if not text:
+            return []
+        if max_chars <= 0 or len(text) <= max_chars:
+            return [text]
+
+        chunks: list[str] = []
+        cur_parts: list[str] = []
+        cur_len = 0
+        for word in text.split():
+            if len(word) > max_chars:
+                if cur_parts:
+                    chunks.append(" ".join(cur_parts))
+                    cur_parts = []
+                    cur_len = 0
+                for i in range(0, len(word), max_chars):
+                    chunks.append(word[i : i + max_chars])
+                continue
+
+            added = len(word) if cur_len == 0 else len(word) + 1
+            if cur_len + added > max_chars:
+                chunks.append(" ".join(cur_parts))
+                cur_parts = [word]
+                cur_len = len(word)
+            else:
+                cur_parts.append(word)
+                cur_len += added
+
+        if cur_parts:
+            chunks.append(" ".join(cur_parts))
+        return chunks
+
+    sp_input_path = Path(train_text)
+    temp_sp_input: Optional[Path] = None
+    if sp_max_sentence_chars > 0:
+        temp_file = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix="spm_train_input_",
+            suffix=".txt",
+            delete=False,
+        )
+        temp_sp_input = Path(temp_file.name)
+        with temp_file as f_out, open(train_text, "r", encoding="utf-8", errors="replace") as f_in:
+            split_lines = 0
+            for line in f_in:
+                chunks = _iter_sp_chunks(line, sp_max_sentence_chars)
+                if len(chunks) > 1:
+                    split_lines += 1
+                for chunk in chunks:
+                    f_out.write(chunk + "\n")
+        print(
+            f"Prepared SentencePiece training input with max line chars={sp_max_sentence_chars} "
+            f"(split_lines={split_lines:,})"
+        )
+        sp_input_path = temp_sp_input
+
+    try:
+        spm.SentencePieceTrainer.train(
+            input=str(sp_input_path),
+            model_prefix=sp_model_prefix,
+            vocab_size=vocab_size,
+            model_type="bpe",
+            character_coverage=1.0,
+            input_sentence_size=sp_input_sentence_size,
+            shuffle_input_sentence=sp_input_sentence_size > 0,
+            max_sentence_length=sp_max_sentence_chars * 4, # 4 bytes per character
+        )
+    finally:
+        if temp_sp_input is not None and temp_sp_input.exists():
+            temp_sp_input.unlink()
     return model_path
 
 
@@ -222,7 +311,13 @@ def _build_tokenizer(args: argparse.Namespace, out_dir: Path) -> tuple[_BaseToke
         prefix = args.sp_model_prefix
         if prefix is None:
             prefix = str(out_dir / f"{args.basename}_spm_vocab{args.vocab_size}")
-        model_path = _train_sentencepiece_if_needed(args.train_text, prefix, args.vocab_size)
+        model_path = _train_sentencepiece_if_needed(
+            args.train_text,
+            prefix,
+            args.vocab_size,
+            args.sp_max_sentence_chars,
+            args.sp_input_sentence_size,
+        )
     if not model_path:
         raise ValueError(
             "For sentencepiece, provide --tokenizer_path or set --train_sentencepiece."
