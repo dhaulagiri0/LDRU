@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tar_url",
         type=str,
-        default="https://mystic.the-eye.eu/public/AI/pile_preliminary_components/openwebtext2.jsonl.zst.tar",
+        default="https://huggingface.co/datasets/segyges/OpenWebText2/resolve/main/openwebtext2.jsonl.zst.tar",
         help="Single tarball URL containing OpenWebText2 shard files.",
     )
     parser.add_argument(

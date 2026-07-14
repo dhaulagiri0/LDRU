@@ -30,3 +30,11 @@ tensorboard_logs/
 wikitext-103-raw-test.txt
 wikitext-103-raw-train.txt
 wikitext-103-raw-validation.txt
+
+# Allowlist: only keep Python, notebooks, and shell scripts trackable
+*
+!*/
+!.gitignore
+!*.py
+!*.ipynb
+!*.sh
