@@ -20,6 +20,7 @@ def associative_scan(
     reverse: bool = False,
     axis: int = 0,
     inner_fn: Callable = lambda x: x,
+    pass_level: bool = False,
 ):
     """
     A copy of jax.lax.associative_scan that applies an extra user definable function after each combine step.
@@ -31,10 +32,13 @@ def associative_scan(
     if reverse:
         elems_flat = [lax.rev(elem, [axis]) for elem in elems_flat]
 
-    def combine(a_flat, b_flat):
+    def combine(a_flat, b_flat, reduction_level: int):
         a = tree_unflatten(tree, a_flat)
         b = tree_unflatten(tree, b_flat)
-        c = fn(a, b)
+        if pass_level:
+            c = fn(a, b, reduction_level)
+        else:
+            c = fn(a, b)
         c_flat, _ = tree_flatten(c)
         # Enforce dtype consistency with scan inputs (critical for mixed precision).
         aligned = []
@@ -59,7 +63,7 @@ def associative_scan(
             "first dimension. (saw: {})".format([elem.shape for elem in elems_flat])
         )
 
-    def _scan(elems):
+    def _scan(elems, reduction_level: int = 0):
         """Perform scan on `elems`."""
 
         num_elems = elems[0].shape[axis]
@@ -74,6 +78,7 @@ def associative_scan(
                 slicing.slice_in_dim(elem, 1, None, stride=2, axis=axis)
                 for elem in elems
             ],
+            reduction_level,
         )
         # Apply inner function after each combine step.
         # Keep original dtypes so downstream lax.concatenate/interleave receives
@@ -87,17 +92,19 @@ def associative_scan(
         reduced_elems = cast_reduced_elems
 
         # Recursively compute scan for partially reduced tensors.
-        odd_elems = _scan(reduced_elems)
+        odd_elems = _scan(reduced_elems, reduction_level + 1)
 
         if num_elems % 2 == 0:
             even_elems = combine(
                 [slicing.slice_in_dim(e, 0, -1, axis=axis) for e in odd_elems],
                 [slicing.slice_in_dim(e, 2, None, stride=2, axis=axis) for e in elems],
+                reduction_level,
             )
         else:
             even_elems = combine(
                 odd_elems,
                 [slicing.slice_in_dim(e, 2, None, stride=2, axis=axis) for e in elems],
+                reduction_level,
             )
 
         # The first element of a scan is the same as the first element
@@ -118,7 +125,7 @@ def associative_scan(
         ]
         return list(_map(partial(_interleave, axis=axis), even_elems, odd_elems))
 
-    scans = _scan(elems_flat)
+    scans = _scan(elems_flat, reduction_level=0)
 
     if reverse:
         scans = [lax.rev(scanned, [axis]) for scanned in scans]

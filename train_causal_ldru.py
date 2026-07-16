@@ -273,6 +273,9 @@ class LDRUExperimenstConfig:
     # Aliases consumed directly by causal_ldru_v2 components.
     tie_embeddings: bool = False
     prenorm_gelu_block: bool = False
+    use_multi_operator_ldru: bool = False
+    num_operators: int = 4
+    operator_min_weight: float = 0.01
 
     # General training hyperparameters
     initial_learning_rate: float = (1e-3,)
@@ -1418,6 +1421,9 @@ def create_ldru_transformer_model(config: LDRUExperimenstConfig):
             use_input_output_proj=config.use_input_output_proj,
             prenorm_gelu_block=config.ldru_prenorm_gelu_block,
             tie_embeddings=False,
+            use_multi_operator_ldru=config.use_multi_operator_ldru,
+            num_operators=config.num_operators,
+            operator_min_weight=config.operator_min_weight,
         )
 
         ldru_encoder = CausalLDRUEncoder(ldru_config)
@@ -1522,6 +1528,9 @@ def create_transformer_ldru_model(config: LDRUExperimenstConfig):
             use_input_output_proj=config.use_input_output_proj,
             prenorm_gelu_block=config.ldru_prenorm_gelu_block,
             tie_embeddings=False,
+            use_multi_operator_ldru=config.use_multi_operator_ldru,
+            num_operators=config.num_operators,
+            operator_min_weight=config.operator_min_weight,
         )
 
         # Pass encoded transformer output through LDRU encoder
@@ -2797,21 +2806,16 @@ def load_checkpoint(
     target_sharding = jax.sharding.SingleDeviceSharding(target_device)
     sharding_tree = jax.tree.map(
         lambda leaf: (
-            target_sharding if hasattr(leaf, "shape") and hasattr(leaf, "dtype") else None
+            target_sharding
+            if hasattr(leaf, "shape") and hasattr(leaf, "dtype") and hasattr(leaf, "sharding")
+            else None
         ),
         restore_md.item_metadata.tree,
     )
     restore_args = ocp.checkpoint_utils.construct_restore_args(
         restore_md.item_metadata.tree, sharding_tree
     )
-    try:
-        restored = checkpointer.restore(ckpt_path, restore_args=restore_args)
-    except ValueError as restore_err:
-        # Newer Orbax metadata can omit leaf-level sharding info; retrying plain
-        # restore keeps older checkpoints loadable across versions.
-        if "sharding passed to deserialization" not in str(restore_err):
-            raise
-        restored = checkpointer.restore(ckpt_path)
+    restored = checkpointer.restore(ckpt_path, restore_args=restore_args)
 
     # Load metadata
     metadata_path = os.path.join(checkpoint_dir, "metadata.json")
@@ -6480,6 +6484,30 @@ if __name__ == "__main__":
         default=False,
         help="Enable an optional pre-norm + GELU FFN block inside each LDRU layer.",
     )
+    parser.add_argument(
+        "--use_multi_operator_ldru",
+        action="store_true",
+        default=False,
+        help=(
+            "Use head-style multi-operator composition in LDRU. "
+            "Splits hidden_dim across multiple independent operators."
+        ),
+    )
+    parser.add_argument(
+        "--num_operators",
+        type=int,
+        default=4,
+        help="Number of LDRU composition operators when --use_multi_operator_ldru is enabled.",
+    )
+    parser.add_argument(
+        "--operator_min_weight",
+        type=float,
+        default=0.01,
+        help=(
+            "Minimum per-operator mixture weight floor. "
+            "Must satisfy operator_min_weight < 1/num_operators."
+        ),
+    )
     scan_post_merge_group = parser.add_mutually_exclusive_group()
     scan_post_merge_group.add_argument(
         "--scan_post_merge_mlp",
@@ -7071,6 +7099,19 @@ if __name__ == "__main__":
 
     if args.binop_expansion_factor <= 0:
         raise ValueError("--binop_expansion_factor must be > 0.")
+    if args.num_operators <= 0:
+        raise ValueError("--num_operators must be > 0.")
+    if args.operator_min_weight < 0:
+        raise ValueError("--operator_min_weight must be >= 0.")
+    if args.operator_min_weight * args.num_operators >= 1.0:
+        raise ValueError(
+            "--operator_min_weight must be < 1/--num_operators."
+        )
+    if args.use_multi_operator_ldru and args.hidden_dim % args.num_operators != 0:
+        raise ValueError(
+            f"--hidden_dim ({args.hidden_dim}) must be divisible by "
+            f"--num_operators ({args.num_operators}) when --use_multi_operator_ldru is set."
+        )
 
     checkpoint_dir = args.checkpoint_dir
     resume_from_checkpoint = args.resume
@@ -7115,6 +7156,9 @@ if __name__ == "__main__":
         ldru_prenorm_gelu_block=args.ldru_prenorm_gelu_block,
         tie_embeddings=args.tie_embeddings_ldru,
         prenorm_gelu_block=args.ldru_prenorm_gelu_block,
+        use_multi_operator_ldru=args.use_multi_operator_ldru,
+        num_operators=args.num_operators,
+        operator_min_weight=args.operator_min_weight,
         scan_method=args.scan_method,
         eval_scan_method=args.eval_scan_method,
         scan_post_merge_mlp=(
@@ -7135,6 +7179,9 @@ if __name__ == "__main__":
         f"tie_embeddings_ldru={args.tie_embeddings_ldru}, "
         f"transformer_prenorm_gelu_block={args.transformer_prenorm_gelu_block}, "
         f"ldru_prenorm_gelu_block={args.ldru_prenorm_gelu_block}, "
+        f"use_multi_operator_ldru={args.use_multi_operator_ldru}, "
+        f"num_operators={args.num_operators}, "
+        f"operator_min_weight={args.operator_min_weight}, "
         f"scan_post_merge_mlp={config.scan_post_merge_mlp}, "
         f"expand_to_power_of_2={config.expand_to_power_of_2}, "
         f"pow_2_expansion_random={config.pow_2_expansion_random}, "
