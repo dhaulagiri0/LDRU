@@ -27,6 +27,7 @@ from ldru.models.transformer import (
     MultiHeadDotProductAttention,
 )
 from ldru.models import positional_encodings as pos_encs_lib
+from multi_operator_ldru import MultiOperatorBinaryOperator
 
 
 # Copy the necessary classes from ldru_v2.py and modify them
@@ -82,6 +83,25 @@ class CausalLDRUConfig:
     prenorm_gelu_block: bool = False
     # Optional weight tying between token embedding and LM head.
     tie_embeddings: bool = False
+    # Optional multi-operator composition (head-style binary operators).
+    use_multi_operator_ldru: bool = False
+    num_operators: int = 4
+    operator_min_weight: float = 0.01
+
+    def __post_init__(self) -> None:
+        if self.num_operators <= 0:
+            raise ValueError("num_operators must be > 0.")
+        if self.operator_min_weight < 0:
+            raise ValueError("operator_min_weight must be >= 0.")
+        if self.operator_min_weight * self.num_operators >= 1.0:
+            raise ValueError(
+                "operator_min_weight must be < 1 / num_operators for valid normalized weights."
+            )
+        if self.use_multi_operator_ldru and self.hidden_dim % self.num_operators != 0:
+            raise ValueError(
+                f"hidden_dim ({self.hidden_dim}) must be divisible by "
+                f"num_operators ({self.num_operators}) when use_multi_operator_ldru=True."
+            )
 
 
 class BinaryOperator(hk.Module):
@@ -206,25 +226,42 @@ class CausalLDRULayer(hk.Module):
 
         # Binary operator works in hidden/state space.
         operator_cls = config.operator or BinaryOperator
-        if getattr(operator_cls, "__name__", "") == "AblationBinaryOperator":
-            self.binary_operator = operator_cls(
-                self.state_dim,
+        if getattr(config, "use_multi_operator_ldru", False):
+            max_reduction_levels = int(
+                math.ceil(math.log2(max(2, int(config.max_sequence_length))))
+            ) + 2
+            self.binary_operator = MultiOperatorBinaryOperator(
+                state_dim=self.state_dim,
+                num_operators=int(getattr(config, "num_operators", 4)),
+                min_weight=float(getattr(config, "operator_min_weight", 0.01)),
+                operator_cls=operator_cls,
                 mlp_hidden_size=config.hidden_dim,
                 expansion_factor=config.binop_expansion_factor,
                 dropout_rate=config.dropout_prob,
                 ablation_expansion_mode=config.ablation_expansion_mode,
                 ablation_combine_mode=config.ablation_combine_mode,
+                max_reduction_levels=max_reduction_levels,
             )
         else:
-            try:
+            if getattr(operator_cls, "__name__", "") == "AblationBinaryOperator":
                 self.binary_operator = operator_cls(
                     self.state_dim,
                     mlp_hidden_size=config.hidden_dim,
                     expansion_factor=config.binop_expansion_factor,
                     dropout_rate=config.dropout_prob,
+                    ablation_expansion_mode=config.ablation_expansion_mode,
+                    ablation_combine_mode=config.ablation_combine_mode,
                 )
-            except TypeError:
-                self.binary_operator = operator_cls(self.state_dim)
+            else:
+                try:
+                    self.binary_operator = operator_cls(
+                        self.state_dim,
+                        mlp_hidden_size=config.hidden_dim,
+                        expansion_factor=config.binop_expansion_factor,
+                        dropout_rate=config.dropout_prob,
+                    )
+                except TypeError:
+                    self.binary_operator = operator_cls(self.state_dim)
 
         # Project from embedding space into hidden/state space for scan/operator.
         self.use_input_output_proj = getattr(self.config, "use_input_output_proj", True)
@@ -306,6 +343,16 @@ class CausalLDRULayer(hk.Module):
         red_ex = self._post_merge_3d(red_ex)
         return red_ex[:, 0, :]
 
+    def _call_binary_operator(
+        self,
+        binary_operator,
+        stacked_vals: jnp.ndarray,
+        reduction_level: Optional[jnp.ndarray | int] = None,
+    ) -> jnp.ndarray:
+        if getattr(self.config, "use_multi_operator_ldru", False):
+            return binary_operator(stacked_vals, reduction_level=reduction_level)
+        return binary_operator(stacked_vals)
+
     def simple_causal_scan(
         self, h: jnp.ndarray, binary_operator, post_merge_fn=None
     ) -> jnp.ndarray:
@@ -317,9 +364,14 @@ class CausalLDRULayer(hk.Module):
         carry0 = jnp.zeros((B, E), dtype=h.dtype)
         xs = jnp.swapaxes(h, 0, 1)  # [L, B, E]
 
-        def _step(carry, x_t):
+        step_levels = jnp.arange(xs.shape[0], dtype=jnp.int32)
+
+        def _step(carry, scan_inputs):
+            x_t, step_level = scan_inputs
             pair = jnp.stack([carry, x_t], axis=-2)  # [B, 2, E]
-            new_carry = binary_operator(pair)  # [B, E]
+            new_carry = self._call_binary_operator(
+                binary_operator, pair, reduction_level=step_level
+            )  # [B, E]
             if new_carry.dtype != carry.dtype:
                 new_carry = new_carry.astype(carry.dtype)
             if post_merge_fn is not None:
@@ -328,7 +380,7 @@ class CausalLDRULayer(hk.Module):
                     new_carry = new_carry.astype(carry.dtype)
             return new_carry, carry
 
-        _, ys = hk.scan(_step, carry0, xs)  # ys: [L, B, E]
+        _, ys = hk.scan(_step, carry0, (xs, step_levels))  # ys: [L, B, E]
         return jnp.swapaxes(ys, 0, 1)  # [B, L, E]
 
     def pairwise_causal_scan(
@@ -350,11 +402,17 @@ class CausalLDRULayer(hk.Module):
         if post_merge_fn is None:
             post_merge_fn = lambda x: x
 
-        def combine(a, b):
-            return binary_operator(jnp.stack([a, b], axis=-2))
+        def combine(a, b, reduction_level):
+            return self._call_binary_operator(
+                binary_operator,
+                jnp.stack([a, b], axis=-2),
+                reduction_level=reduction_level,
+            )
 
         def scan_one(x):  # x: [L, E]
-            return associative_scan(combine, x, inner_fn=post_merge_fn)
+            return associative_scan(
+                combine, x, inner_fn=post_merge_fn, pass_level=True
+            )
 
         incl = jax.vmap(scan_one)(h)  # [B, L, E]
 
@@ -383,11 +441,17 @@ class CausalLDRULayer(hk.Module):
         if post_merge_tree_fn is None:
             post_merge_tree_fn = lambda x: x
 
-        def combine(a, b):
-            return binary_operator(jnp.stack([a, b], axis=-2))
+        def combine(a, b, reduction_level):
+            return self._call_binary_operator(
+                binary_operator,
+                jnp.stack([a, b], axis=-2),
+                reduction_level=reduction_level,
+            )
 
         def final_state_one(x):  # x: [L, E]
-            incl = associative_scan(combine, x, inner_fn=post_merge_tree_fn)
+            incl = associative_scan(
+                combine, x, inner_fn=post_merge_tree_fn, pass_level=True
+            )
             return incl[-1]
 
         final_state = jax.vmap(final_state_one)(h)  # [B, E]
@@ -409,7 +473,7 @@ class CausalLDRULayer(hk.Module):
 
         if binary_operator is None:
 
-            def binary_operator(stacked_ab):
+            def binary_operator(stacked_ab, reduction_level=None):
                 # stacked_ab has shape (..., 2, E)
                 return stacked_ab[..., 0, :] + stacked_ab[..., 1, :]
 
@@ -450,7 +514,9 @@ class CausalLDRULayer(hk.Module):
             )  # [B, L_pow2, 2, E]
 
             # Compute reduced values for the "right endpoints"
-            reduced = binary_operator(stacked_vals)  # [B, L_pow2, E]
+            reduced = self._call_binary_operator(
+                binary_operator, stacked_vals, reduction_level=i
+            )  # [B, L_pow2, E]
 
             h = self.fc(reduced) + mix_in_ratio * reduced
             h = self.inner_norm(h)
@@ -490,7 +556,7 @@ class CausalLDRULayer(hk.Module):
 
         if binary_operator is None:
 
-            def binary_operator(stacked_ab):
+            def binary_operator(stacked_ab, reduction_level=None):
                 # stacked_ab has shape (..., 2, E)
                 return stacked_ab[..., 0, :] + stacked_ab[..., 1, :]
 
@@ -537,7 +603,9 @@ class CausalLDRULayer(hk.Module):
             stacked_vals = jnp.stack(
                 [left_vals, right_vals], axis=-2
             )  # [B, L_pow2, 2, E]
-            new_right = binary_operator(stacked_vals)  # [B, L_pow2, E]
+            new_right = self._call_binary_operator(
+                binary_operator, stacked_vals, reduction_level=i
+            )  # [B, L_pow2, E]
 
             is_left = (pos % block) == (half - 1)
             is_right = (pos % block) == (block - 1)
@@ -597,16 +665,25 @@ class CausalLDRULayer(hk.Module):
         if post_merge_fn is None:
             post_merge_fn = lambda x: x
 
-        def combine(a, b):
+        def combine_with_level(a, b, reduction_level):
             if reverse_op:
-                return binary_operator(jnp.stack([b, a], axis=-2))
-            return binary_operator(jnp.stack([a, b], axis=-2))
+                return self._call_binary_operator(
+                    binary_operator,
+                    jnp.stack([b, a], axis=-2),
+                    reduction_level=reduction_level,
+                )
+            return self._call_binary_operator(
+                binary_operator,
+                jnp.stack([a, b], axis=-2),
+                reduction_level=reduction_level,
+            )
 
         def scan_one(x):  # x: [L, E]
             h = associative_scan(
-                combine,
+                combine_with_level,
                 x,
                 inner_fn=post_merge_fn,  # Use shared post-merge function
+                pass_level=True,
             )
             return h
 
