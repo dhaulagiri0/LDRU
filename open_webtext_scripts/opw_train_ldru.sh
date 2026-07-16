@@ -28,7 +28,7 @@ do
 
     EXTRA_ARGS=(
         --num_layers 1
-        --hidden_dim 768
+        --hidden_dim 1028
         --dropout_prob 0.15
         --lr 2e-4
         --l2_lambda 1e-5
@@ -58,6 +58,9 @@ do
         --seq_bin_dtype uint16
         --tie_embeddings_ldru
         --nanogpt_ppl_metric
+        --use_multi_operator_ldru
+        --num_operators 8
+        --ldru_prenorm_gelu_block
     )
 
     echo "Running: python train_causal_ldru.py ${COMMON_ARGS[@]} ${EXTRA_ARGS[@]}"
