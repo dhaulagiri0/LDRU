@@ -62,7 +62,9 @@ do
         --seq_bin_format token_stream
         --seq_bin_dtype uint16
         --tie_embeddings_transformer
+        --transformer_prenorm_gelu_block
         --nanogpt_ppl_metric
+        --warmup_steps 2000
     )
 
     echo "Running: python train_causal_ldru.py ${COMMON_ARGS[@]} ${EXTRA_ARGS[@]}"

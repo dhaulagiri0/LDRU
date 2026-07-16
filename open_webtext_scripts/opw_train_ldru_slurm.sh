@@ -19,7 +19,7 @@ MODE=${MODE}
 DATASET=2
 BATCH=32
 VOCAB_SIZE=50000
-RUN_NUM=1
+RUN_NUM=2
 EXPERIMENT_NAME=openwebtext_tied_v${VOCAB_SIZE}_${RUN_NUM}_GRC
 TF_LOGDIR=tensorboard_logs/${EXPERIMENT_NAME}
 mkdir -p $TF_LOGDIR
@@ -38,7 +38,7 @@ do
         --binary_operator grc
     )
     COMMON_ARGS=(
-        --embedding_dim 768
+        --embedding_dim 1028
         --max_vocab_size $VOCAB_SIZE
         --model_name_prefix ${EXPERIMENT_NAME}_${MODE}_seq${MAX_LEN}
         --batch_size $BATCH
@@ -61,6 +61,8 @@ do
         --seq_bin_dtype uint16
         --tie_embeddings_ldru
         --nanogpt_ppl_metric
+        --ldru_prenorm_gelu_block
+        --warmup_steps 2000
     )
 
     echo "Running: python train_causal_ldru.py ${COMMON_ARGS[@]} ${EXTRA_ARGS[@]}"
