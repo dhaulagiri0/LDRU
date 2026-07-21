@@ -156,7 +156,7 @@ class AblationBinaryOperator(hk.Module):
         y = xy[..., 1, :]
         pair = jnp.reshape(xy, xy.shape[:-2] + (2 * hidden_dim,))
 
-        binary_init = hk.initializers.VarianceScaling(0.02, "fan_avg", "truncated_normal")
+        binary_init = hk.initializers.VarianceScaling(1.0, "fan_avg", "truncated_normal")
         grc_init = hk.initializers.VarianceScaling(1.0, "fan_avg", "truncated_normal")
 
         binary_2e = None

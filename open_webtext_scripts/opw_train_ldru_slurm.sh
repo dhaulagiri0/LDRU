@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=opw-train-ldru
-#SBATCH --output=opw-train-ldru_6.out
-#SBATCH --error=opw-train-ldru_6.err
+#SBATCH --output=opw-train-ldru_7.out
+#SBATCH --error=opw-train-ldru_7.err
 #SBATCH --time=6:00:00
 #SBATCH --mem=128G
 #SBATCH --cpus-per-task=8
@@ -19,7 +19,7 @@ MODE=${MODE}
 DATASET=2
 BATCH=32
 VOCAB_SIZE=50000
-RUN_NUM=6
+RUN_NUM=7
 EXPERIMENT_NAME=openwebtext_tied_v${VOCAB_SIZE}_${RUN_NUM}_GRC
 TF_LOGDIR=tensorboard_logs/${EXPERIMENT_NAME}
 mkdir -p $TF_LOGDIR
@@ -32,7 +32,7 @@ do
     EXTRA_ARGS=(
         --num_layers 1
         --hidden_dim 1024
-        --dropout_prob 0.0
+        --dropout_prob 0.02
         --lr 5e-4
         --l2_lambda 1e-6
         --binary_operator grc
