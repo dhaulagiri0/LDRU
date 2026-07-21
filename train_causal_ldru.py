@@ -4186,6 +4186,174 @@ def evaluate_from_checkpoint(
     }
 
 
+def evaluate_pretokenized_from_checkpoint(
+    checkpoint_path: str,
+    test_seq_bin: str,
+    step: int = 1,
+    seq_length: Optional[int] = None,
+    stride: Optional[int] = None,
+    batch_size: int = 32,
+    seq_bin_dtype: str = "uint16",
+    seq_bin_format: str = "auto",
+    seq_meta_json: Optional[str] = None,
+    eval_scan_method: Optional[str] = None,
+    expand_to_power_of_2: bool = False,
+    pow_2_expansion_random: bool = False,
+    nanogpt_batching: bool = False,
+    nanogpt_ppl_metric: bool = False,
+    scan_post_merge_mlp: Optional[bool] = None,
+):
+    """Load a checkpoint and evaluate it on a pretokenized test binary."""
+    if not test_seq_bin:
+        raise ValueError("--test_seq_bin is required for --evaluate_pretok.")
+
+    params, _, config, epoch, best_ppl, _ = load_checkpoint(checkpoint_path, step=step)
+    if config is None:
+        raise ValueError(
+            "Checkpoint metadata is missing model config; cannot evaluate checkpoint."
+        )
+
+    if seq_length is None:
+        seq_length = int(getattr(config, "seq_length", 32))
+        print(
+            f"  Using checkpoint seq_length={seq_length} "
+            "(override with --seq_length)."
+        )
+    if seq_length <= 0:
+        raise ValueError("--seq_length must be > 0.")
+    if stride is None:
+        stride = max(1, seq_length // 2)
+    if stride <= 0:
+        raise ValueError("--eval_stride must be > 0 when provided.")
+
+    selected_seq_bin_format = seq_bin_format
+    if seq_meta_json:
+        if not os.path.exists(seq_meta_json):
+            raise FileNotFoundError(f"--seq_meta_json not found: {seq_meta_json}")
+        with open(seq_meta_json, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        meta_format = metadata.get("format")
+        if selected_seq_bin_format == "auto" and meta_format in ("sequence", "token_stream"):
+            selected_seq_bin_format = meta_format
+    if selected_seq_bin_format == "auto":
+        selected_seq_bin_format = "sequence"
+    if selected_seq_bin_format not in ("sequence", "token_stream"):
+        raise ValueError(
+            f"Unsupported --seq_bin_format '{selected_seq_bin_format}'. "
+            "Expected one of: auto, sequence, token_stream."
+        )
+    if nanogpt_batching and selected_seq_bin_format != "token_stream":
+        raise ValueError(
+            "--nanogpt_batching requires --seq_bin_format token_stream for "
+            "--evaluate_pretok."
+        )
+
+    model_creation_fn, model_type_str, seq2seq = _detect_model_type(checkpoint_path)
+    use_lstm, use_transformer, use_transformer_ldru, use_ldru_transformer = (
+        _detect_eval_model_flags(checkpoint_path)
+    )
+
+    print(f"\n{'=' * 60}")
+    print("  Pretokenized Checkpoint Evaluation")
+    print(f"{'=' * 60}")
+    print(f"  Checkpoint : {checkpoint_path}")
+    print(f"  Test bin   : {test_seq_bin}")
+    print(f"  Model type : {model_type_str}")
+    print(f"  Loss type  : {'seq2seq' if seq2seq else 'last-position'}")
+    print(f"  Epoch      : {epoch}")
+    print(f"  Best val PPL (training): {best_ppl:.4f}")
+    print(f"  Seq length : {seq_length}  |  Stride : {stride}")
+    print(f"{'=' * 60}\n")
+
+    if eval_scan_method:
+        print(f"  Eval scan method override: {eval_scan_method}")
+        config = LDRUExperimenstConfig(
+            **{**config.__dict__, "eval_scan_method": eval_scan_method}
+        )
+    config = resolve_scan_post_merge_mlp(config, params, override=scan_post_merge_mlp)
+    if expand_to_power_of_2:
+        print("  Power-of-two expansion enabled for evaluation")
+        config = LDRUExperimenstConfig(
+            **{**config.__dict__, "expand_to_power_of_2": True}
+        )
+    if pow_2_expansion_random:
+        print("  Random power-of-two expansion enabled for evaluation")
+        config = LDRUExperimenstConfig(
+            **{
+                **config.__dict__,
+                "expand_to_power_of_2": True,
+                "pow_2_expansion_random": True,
+            }
+        )
+    eval_model = create_evaluation_model(config, model_creation_fn, params=params)
+
+    if selected_seq_bin_format == "token_stream":
+        eval_tokens = load_pretokenized_token_stream(test_seq_bin, dtype_name=seq_bin_dtype)
+        if nanogpt_batching:
+            eval_data = eval_tokens
+            data_desc = (
+                f"{len(eval_tokens):,} tokens "
+                "(nanoGPT-style random-offset evaluation)"
+            )
+        else:
+            eval_data = token_stream_to_sequence_view(
+                eval_tokens, seq_length=seq_length, stride=stride
+            )
+            data_desc = (
+                f"{len(eval_tokens):,} tokens -> {len(eval_data):,} windows "
+                f"(seq_len={seq_length}, stride={stride})"
+            )
+    else:
+        eval_data = load_pretokenized_sequences(
+            test_seq_bin, seq_length=seq_length, dtype_name=seq_bin_dtype
+        )
+        data_desc = f"{len(eval_data):,} fixed sequences"
+
+    print(f"  Test data view: {data_desc}")
+
+    avg_loss, avg_metrics = evaluate_model(
+        params=params,
+        model=None,
+        rng_key=jax.random.PRNGKey(0),
+        val_data=eval_data,
+        batch_size=batch_size,
+        use_lstm=use_lstm,
+        use_transformer=use_transformer,
+        use_transformer_ldru=use_transformer_ldru,
+        use_ldru_transformer=use_ldru_transformer,
+        seq2seq=seq2seq,
+        eval_model=eval_model,
+        nanogpt_batching=nanogpt_batching,
+        seq_length=seq_length,
+        nanogpt_ppl_metric=nanogpt_ppl_metric,
+    )
+
+    print(f"\n{'=' * 60}")
+    print("  Aggregate Results (full pretokenized test set)")
+    print(f"{'=' * 60}")
+    print(f"  Loss       : {avg_loss:.4f}")
+    print(f"  Perplexity : {avg_metrics['perplexity']:.4f}")
+    print(f"  Accuracy   : {avg_metrics['accuracy']:.4f}")
+    if "nanogpt_perplexity" in avg_metrics:
+        print(f"  nanoGPT PPL: {avg_metrics['nanogpt_perplexity']:.4f}")
+    if "last_token_perplexity_nanogpt" in avg_metrics:
+        print(
+            f"  nanoGPT last-token PPL: "
+            f"{avg_metrics['last_token_perplexity_nanogpt']:.4f}"
+        )
+    print(f"{'=' * 60}\n")
+
+    return {
+        "loss": float(avg_loss),
+        "perplexity": float(avg_metrics["perplexity"]),
+        "accuracy": float(avg_metrics["accuracy"]),
+        "metrics": avg_metrics,
+        "training_best_ppl": best_ppl,
+        "epoch": epoch,
+        "dataset_view": data_desc,
+    }
+
+
 def _load_tokenizer_override(
     tokenizer_path: Optional[str], tokenizer_type: TokenizerType
 ) -> Optional[BaseTokenizer]:
@@ -6053,6 +6221,15 @@ if __name__ == "__main__":
         help="Path to checkpoint file to evaluate (no training). Use with --eval_file.",
     )
     parser.add_argument(
+        "--evaluate_pretok",
+        type=str,
+        default=None,
+        help=(
+            "Path to checkpoint directory to evaluate on pretokenized binaries "
+            "(no training). Use with --test_seq_bin."
+        ),
+    )
+    parser.add_argument(
         "--legacy_eval",
         action="store_true",
         default=False,
@@ -6079,6 +6256,15 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Sequence length for evaluation (default: 32)",
+    )
+    parser.add_argument(
+        "--eval_stride",
+        type=int,
+        default=None,
+        help=(
+            "Stride for --evaluate_pretok windowing (token_stream format). "
+            "Default: seq_length//2."
+        ),
     )
     parser.add_argument(
         "--n_sequences",
@@ -6973,6 +7159,31 @@ if __name__ == "__main__":
             eval_scan_method=args.eval_scan_method,
             expand_to_power_of_2=use_pow2_expand,
             pow_2_expansion_random=use_pow2_random,
+            scan_post_merge_mlp=args.scan_post_merge_mlp,
+        )
+        exit(0)
+
+    if args.evaluate_pretok:
+        use_pow2_random = bool(args.pow_2_expansion_random or args.blelloch_random)
+        use_pow2_expand = bool(args.expand_to_power_of_2 or use_pow2_random)
+        if not args.test_seq_bin:
+            print("Error: --evaluate_pretok requires --test_seq_bin.")
+            exit(1)
+        evaluate_pretokenized_from_checkpoint(
+            checkpoint_path=args.evaluate_pretok,
+            test_seq_bin=args.test_seq_bin,
+            step=args.eval_step,
+            seq_length=args.seq_length,
+            stride=args.eval_stride,
+            batch_size=args.batch_size,
+            seq_bin_dtype=args.seq_bin_dtype,
+            seq_bin_format=args.seq_bin_format,
+            seq_meta_json=args.seq_meta_json,
+            eval_scan_method=args.eval_scan_method,
+            expand_to_power_of_2=use_pow2_expand,
+            pow_2_expansion_random=use_pow2_random,
+            nanogpt_batching=args.nanogpt_batching,
+            nanogpt_ppl_metric=args.nanogpt_ppl_metric,
             scan_post_merge_mlp=args.scan_post_merge_mlp,
         )
         exit(0)
