@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=opw-train-ldru
-#SBATCH --output=opw-train-ldru_5.out
-#SBATCH --error=opw-train-ldru_5.err
-#SBATCH --time=12:00:00
+#SBATCH --output=opw-train-ldru_6.out
+#SBATCH --error=opw-train-ldru_6.err
+#SBATCH --time=6:00:00
 #SBATCH --mem=128G
 #SBATCH --cpus-per-task=8
 #SBATCH --ntasks=1
@@ -19,7 +19,7 @@ MODE=${MODE}
 DATASET=2
 BATCH=32
 VOCAB_SIZE=50000
-RUN_NUM=5
+RUN_NUM=6
 EXPERIMENT_NAME=openwebtext_tied_v${VOCAB_SIZE}_${RUN_NUM}_GRC
 TF_LOGDIR=tensorboard_logs/${EXPERIMENT_NAME}
 mkdir -p $TF_LOGDIR
@@ -31,14 +31,14 @@ do
 
     EXTRA_ARGS=(
         --num_layers 1
-        --hidden_dim 768
-        --dropout_prob 0.1
-        --lr 1e-4
-        --l2_lambda 0.0
+        --hidden_dim 1024
+        --dropout_prob 0.0
+        --lr 5e-4
+        --l2_lambda 1e-6
         --binary_operator grc
     )
     COMMON_ARGS=(
-        --embedding_dim 768
+        --embedding_dim 512
         --max_vocab_size $VOCAB_SIZE
         --model_name_prefix ${EXPERIMENT_NAME}_${MODE}_seq${MAX_LEN}
         --batch_size $BATCH
@@ -49,7 +49,9 @@ do
         --streaming_shuffle_buffer_size 8192
         --optimizer adamw
         --compute_dtype bfloat16
-        --num_epochs 10
+        --train_steps_per_epoch 1000
+        --validation_steps_per_epoch 100
+        --test_steps_per_epoch 100
         --train_stride $((MAX_LEN / 2))
         --train_seq_bin data/pretokenized/openwebtext2_sp_50/owt2_sp_50_2k_train.bin
         --val_seq_bin data/pretokenized/openwebtext2_sp_50/owt2_sp_50_2k_val.bin
@@ -60,7 +62,7 @@ do
         --tie_embeddings_ldru
         --ldru_prenorm_gelu_block
         --nanogpt_ppl_metric
-        --warmup_steps 25000
+        --warmup_steps 1000
     )
 
     echo "Running: python train_causal_ldru.py ${COMMON_ARGS[@]} ${EXTRA_ARGS[@]}"
