@@ -705,7 +705,8 @@ class CausalLDRULayer(hk.Module):
 
         # shift right by one slot and include identity at start
         identity = jnp.zeros((h.shape[0], 1, h.shape[2]), dtype=h.dtype)  # [B, 1, E]
-        return jnp.concatenate((identity, incl[:, 1:, :]), axis=1)
+        # return jnp.concatenate((identity, incl[:, 1:, :]), axis=1)
+        return incl
 
     @staticmethod
     def expand_to_power_of_2_with_random_zeros(
