@@ -35,6 +35,7 @@ from improved_binary_operator import (
     GRCOperator,
     AblationBinaryOperator,
 )
+from multi_level_grc_operator import MultiLevelGRCOperator
 from tensorboardX import SummaryWriter
 
 # Import transformer from supplementary_code
@@ -114,6 +115,7 @@ BINARY_OPERATOR_REGISTRY = {
     "binary": BinaryOperator,
     "convex_gated": ConvexGatedBinaryOperator,
     "grc": GRCOperator,
+    "multi_level_grc": MultiLevelGRCOperator,
     "ablation": AblationBinaryOperator,
 }
 
