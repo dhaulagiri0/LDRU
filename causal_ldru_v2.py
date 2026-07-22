@@ -28,6 +28,7 @@ from ldru.models.transformer import (
 )
 from ldru.models import positional_encodings as pos_encs_lib
 from multi_operator_ldru import MultiOperatorBinaryOperator
+from multi_level_grc_operator import MultiLevelGRCOperator
 
 
 # Copy the necessary classes from ldru_v2.py and modify them
@@ -226,7 +227,18 @@ class CausalLDRULayer(hk.Module):
 
         # Binary operator works in hidden/state space.
         operator_cls = config.operator or BinaryOperator
-        if getattr(config, "use_multi_operator_ldru", False):
+        if getattr(operator_cls, "__name__", "") == "MultiLevelGRCOperator":
+            max_reduction_levels = int(
+                math.ceil(math.log2(max(2, int(config.max_sequence_length))))
+            ) + 2
+            self.binary_operator = MultiLevelGRCOperator(
+                self.state_dim,
+                mlp_hidden_size=config.hidden_dim,
+                expansion_factor=config.binop_expansion_factor,
+                dropout_rate=config.dropout_prob,
+                max_reduction_levels=max_reduction_levels,
+            )
+        elif getattr(config, "use_multi_operator_ldru", False):
             max_reduction_levels = int(
                 math.ceil(math.log2(max(2, int(config.max_sequence_length))))
             ) + 2
@@ -350,6 +362,8 @@ class CausalLDRULayer(hk.Module):
         reduction_level: Optional[jnp.ndarray | int] = None,
     ) -> jnp.ndarray:
         if getattr(self.config, "use_multi_operator_ldru", False):
+            return binary_operator(stacked_vals, reduction_level=reduction_level)
+        if getattr(binary_operator.__class__, "__name__", "") == "MultiLevelGRCOperator":
             return binary_operator(stacked_vals, reduction_level=reduction_level)
         return binary_operator(stacked_vals)
 
