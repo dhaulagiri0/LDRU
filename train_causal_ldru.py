@@ -2808,16 +2808,21 @@ def load_checkpoint(
     target_sharding = jax.sharding.SingleDeviceSharding(target_device)
     sharding_tree = jax.tree.map(
         lambda leaf: (
-            target_sharding
-            if hasattr(leaf, "shape") and hasattr(leaf, "dtype") and hasattr(leaf, "sharding")
-            else None
+            target_sharding if hasattr(leaf, "shape") and hasattr(leaf, "dtype") else None
         ),
         restore_md.item_metadata.tree,
     )
     restore_args = ocp.checkpoint_utils.construct_restore_args(
         restore_md.item_metadata.tree, sharding_tree
     )
-    restored = checkpointer.restore(ckpt_path, restore_args=restore_args)
+    try:
+        restored = checkpointer.restore(ckpt_path, restore_args=restore_args)
+    except ValueError as restore_err:
+        # Newer Orbax metadata can omit leaf-level sharding info; retrying plain
+        # restore keeps older checkpoints loadable across versions.
+        if "sharding passed to deserialization" not in str(restore_err):
+            raise
+        restored = checkpointer.restore(ckpt_path)
 
     # Load metadata
     metadata_path = os.path.join(checkpoint_dir, "metadata.json")
