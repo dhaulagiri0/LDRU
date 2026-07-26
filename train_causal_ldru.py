@@ -2784,24 +2784,28 @@ def load_checkpoint(
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    if jax.default_backend() == "cpu":
-        metadata = checkpointer.metadata(ckpt_path)
-        cpu_sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
-        sharding_tree = jax.tree.map(
-            lambda leaf: (
-                cpu_sharding
-                if hasattr(leaf, "shape")
-                and hasattr(leaf, "dtype")
-                and hasattr(leaf, "sharding")
-                else None
-            ),
-            metadata.item_metadata.tree,
-        )
-        restore_args = ocp.checkpoint_utils.construct_restore_args(
-            metadata.item_metadata.tree, sharding_tree
-        )
+    # Always restore arrays onto the active backend device to avoid
+    # cross-backend sharding issues (CPU->GPU/Metal and GPU/Metal->CPU).
+    restore_md = checkpointer.metadata(ckpt_path)
+    active_backend = jax.default_backend()
+    target_device = jax.devices(active_backend)[0]
+    target_sharding = jax.sharding.SingleDeviceSharding(target_device)
+    sharding_tree = jax.tree.map(
+        lambda leaf: (
+            target_sharding if hasattr(leaf, "shape") and hasattr(leaf, "dtype") else None
+        ),
+        restore_md.item_metadata.tree,
+    )
+    restore_args = ocp.checkpoint_utils.construct_restore_args(
+        restore_md.item_metadata.tree, sharding_tree
+    )
+    try:
         restored = checkpointer.restore(ckpt_path, restore_args=restore_args)
-    else:
+    except ValueError as restore_err:
+        # Newer Orbax metadata can omit leaf-level sharding info; retrying plain
+        # restore keeps older checkpoints loadable across versions.
+        if "sharding passed to deserialization" not in str(restore_err):
+            raise
         restored = checkpointer.restore(ckpt_path)
 
     # Load metadata
