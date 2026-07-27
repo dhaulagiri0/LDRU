@@ -1077,7 +1077,7 @@ class CausalLDRUEncoder(hk.Module):
         h = x
 
         # Apply multiple LDRU layers with residual connections
-        first_layer = CausalLDRULayer(self.config, use_mlp=True)
+        first_layer = CausalLDRULayer(self.config, use_mlp=False)
         h = first_layer(h) + 0.1 * h  # Small residual for stability
         for layer_idx in range(self.config.num_layers - 1):
             layer = CausalLDRULayer(self.config)
