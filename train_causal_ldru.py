@@ -3188,6 +3188,7 @@ def evaluate_model(
     seq_length: Optional[int] = None,
     nanogpt_ppl_metric: bool = False,
     measure_batch_timing: bool = False,
+    timing_warmup_batches: int = 1,
 ):
     """Evaluate model on validation data."""
     if nanogpt_batching:
@@ -3232,6 +3233,8 @@ def evaluate_model(
     batch_infer_times = []
     batch_tokens_per_sec = []
     batch_us_per_token = []
+    if timing_warmup_batches < 0:
+        raise ValueError("timing_warmup_batches must be >= 0")
 
     # ---- choose loss function ONCE ----
     if compiled_eval_step is None:
@@ -3262,14 +3265,15 @@ def evaluate_model(
             loss, metrics = compiled_eval_step(params, step_key, batch)
             jax.block_until_ready(loss)
             elapsed_s = float(time.perf_counter() - start_time)
-            batch_infer_times.append(elapsed_s)
-            if hasattr(batch, "shape") and len(batch.shape) >= 2:
-                tokens_in_batch = int(batch.shape[0]) * int(batch.shape[1])
-            else:
-                tokens_in_batch = int(np.size(batch))
-            if tokens_in_batch > 0 and elapsed_s > 0.0:
-                batch_tokens_per_sec.append(tokens_in_batch / elapsed_s)
-                batch_us_per_token.append((elapsed_s * 1_000_000.0) / tokens_in_batch)
+            if eval_step_count >= timing_warmup_batches:
+                batch_infer_times.append(elapsed_s)
+                if hasattr(batch, "shape") and len(batch.shape) >= 2:
+                    tokens_in_batch = int(batch.shape[0]) * int(batch.shape[1])
+                else:
+                    tokens_in_batch = int(np.size(batch))
+                if tokens_in_batch > 0 and elapsed_s > 0.0:
+                    batch_tokens_per_sec.append(tokens_in_batch / elapsed_s)
+                    batch_us_per_token.append((elapsed_s * 1_000_000.0) / tokens_in_batch)
         else:
             loss, metrics = compiled_eval_step(params, step_key, batch)
 
@@ -3311,6 +3315,8 @@ def evaluate_model(
     avg_metrics["eval_batches"] = int(len(losses))
     avg_metrics["accuracy_batch_std"] = float(np.std(accuracies))
     avg_metrics["perplexity_batch_std"] = float(np.std(perplexities))
+    avg_metrics["batch_infer_warmup_skipped"] = int(timing_warmup_batches)
+    avg_metrics["batch_infer_timed_batches"] = int(len(batch_infer_times))
     if measure_batch_timing and len(batch_infer_times) > 0:
         times_arr = np.array(batch_infer_times, dtype=float)
         avg_metrics["batch_infer_time_mean_s"] = float(np.mean(times_arr))
@@ -4270,6 +4276,7 @@ def _evaluate_seq_len_range_core(
     batch_size: int,
     nanogpt_ppl_metric: bool,
     measure_batch_timing: bool = False,
+    timing_warmup_batches: int = 1,
 ):
     results = []
     rng_key = jax.random.PRNGKey(0)
@@ -4301,6 +4308,7 @@ def _evaluate_seq_len_range_core(
             eval_model=eval_model,
             nanogpt_ppl_metric=nanogpt_ppl_metric,
             measure_batch_timing=measure_batch_timing,
+            timing_warmup_batches=timing_warmup_batches,
         )
 
         ppl_value = float(avg_metrics["perplexity"])
@@ -4355,6 +4363,12 @@ def _evaluate_seq_len_range_core(
             "batch_us_per_token_std": float(
                 avg_metrics.get("batch_us_per_token_std", float("nan"))
             ),
+            "batch_infer_warmup_skipped": int(
+                avg_metrics.get("batch_infer_warmup_skipped", timing_warmup_batches)
+            ),
+            "batch_infer_timed_batches": int(
+                avg_metrics.get("batch_infer_timed_batches", 0)
+            ),
         }
         results.append(row)
         msg = (
@@ -4382,7 +4396,8 @@ def _write_seq_len_range_results(results, plot_dir: str, basename: str):
             "seq_len,n_sequences,eval_batches,loss,perplexity,perplexity_batch_std,"
             "last_token_perplexity,last_token_perplexity_batch_std,accuracy,accuracy_batch_std,"
             "batch_infer_time_mean_s,batch_infer_time_std_s,batch_tokens_per_sec_mean,"
-            "batch_tokens_per_sec_std,batch_us_per_token_mean,batch_us_per_token_std\n"
+            "batch_tokens_per_sec_std,batch_us_per_token_mean,batch_us_per_token_std,"
+            "batch_infer_warmup_skipped,batch_infer_timed_batches\n"
         )
         for r in results:
             fh.write(
@@ -4397,7 +4412,9 @@ def _write_seq_len_range_results(results, plot_dir: str, basename: str):
                 f"{float(r.get('batch_tokens_per_sec_mean', float('nan'))):.6f},"
                 f"{float(r.get('batch_tokens_per_sec_std', float('nan'))):.6f},"
                 f"{float(r.get('batch_us_per_token_mean', float('nan'))):.6f},"
-                f"{float(r.get('batch_us_per_token_std', float('nan'))):.6f}\n"
+                f"{float(r.get('batch_us_per_token_std', float('nan'))):.6f},"
+                f"{int(r.get('batch_infer_warmup_skipped', 0))},"
+                f"{int(r.get('batch_infer_timed_batches', 0))}\n"
             )
 
     json_path = os.path.join(plot_dir, f"{basename}.json")
@@ -5016,6 +5033,7 @@ def evaluate_sequence_length_range(
     last_ppl_scale: str = "log",
     acc_scale: str = "linear",
     measure_batch_timing: bool = False,
+    timing_warmup_batches: int = 1,
 ):
     """
     Evaluate a checkpoint across a range of sequence lengths (min_seq_len to
@@ -5120,6 +5138,7 @@ def evaluate_sequence_length_range(
         batch_size=batch_size,
         nanogpt_ppl_metric=nanogpt_ppl_metric,
         measure_batch_timing=measure_batch_timing,
+        timing_warmup_batches=timing_warmup_batches,
     )
 
     if not results:
@@ -5327,6 +5346,7 @@ def evaluate_sequence_length_range_list(
     acc_scale: str = "linear",
     show_aggregate_mean: bool = True,
     measure_batch_timing: bool = False,
+    timing_warmup_batches: int = 1,
 ):
     """
     Evaluate multiple checkpoints over a range of sequence lengths and plot
@@ -5422,6 +5442,7 @@ def evaluate_sequence_length_range_list(
             batch_size=batch_size,
             nanogpt_ppl_metric=nanogpt_ppl_metric,
             measure_batch_timing=measure_batch_timing,
+            timing_warmup_batches=timing_warmup_batches,
         )
 
         if not results:
@@ -6312,6 +6333,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--seq_len_runtime_warmup_batches",
+        type=int,
+        default=1,
+        help=(
+            "When --seq_len_measure_runtime is set, skip this many initial eval batches "
+            "per sequence length before collecting runtime stats (default: 1)."
+        ),
+    )
+    parser.add_argument(
         "--print_log_file",
         type=str,
         default=None,
@@ -6844,6 +6874,7 @@ if __name__ == "__main__":
             acc_scale=args.seq_len_acc_scale,
             show_aggregate_mean=not args.hide_seq_len_aggregate_mean,
             measure_batch_timing=args.seq_len_measure_runtime,
+            timing_warmup_batches=args.seq_len_runtime_warmup_batches,
         )
         exit(0)
 
@@ -6893,6 +6924,7 @@ if __name__ == "__main__":
             ),
             acc_scale=args.seq_len_acc_scale,
             measure_batch_timing=args.seq_len_measure_runtime,
+            timing_warmup_batches=args.seq_len_runtime_warmup_batches,
         )
         exit(0)
 
