@@ -18,10 +18,11 @@ import orbax.checkpoint as ocp
 import datetime
 import shutil
 import subprocess
+import time
 
 matplotlib.use("Agg")  # Non-interactive backend for saving plots
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter, NullFormatter
+from matplotlib.ticker import FuncFormatter, NullFormatter, LogLocator
 
 from causal_ldru_v2 import CausalLDRUConfig, create_causal_ldru_model, BinaryOperator
 from causal_ldru_v2 import (
@@ -69,8 +70,12 @@ def _plain_tick_label(x: float) -> str:
 def _apply_y_axis_style(ax, scale: str) -> None:
     if scale == "log":
         ax.set_yscale("log")
+        ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1))
+        ax.yaxis.set_minor_formatter(FuncFormatter(lambda x, _: _plain_tick_label(x)))
+        ax.tick_params(axis="y", which="minor", labelsize=8, pad=2)
+    else:
+        ax.yaxis.set_minor_formatter(NullFormatter())
     ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: _plain_tick_label(x)))
-    ax.yaxis.set_minor_formatter(NullFormatter())
 
 
 def _resolve_plot_value(primary, fallback, default):
@@ -1579,7 +1584,7 @@ def create_datasets_for_training(
 ):
     train_data, val_data, test_data = None, None, None
     if stride is None:
-        stride = max(1, seq_length // 2)
+        stride = min(max(1, 64), seq_length)
     if stride <= 0:
         raise ValueError("stride must be > 0")
     # Create dataset
@@ -3182,6 +3187,7 @@ def evaluate_model(
     nanogpt_batching: bool = False,
     seq_length: Optional[int] = None,
     nanogpt_ppl_metric: bool = False,
+    measure_batch_timing: bool = False,
 ):
     """Evaluate model on validation data."""
     if nanogpt_batching:
@@ -3218,8 +3224,14 @@ def evaluate_model(
     losses = []
     accuracies = []
     perplexities = []
+    nanogpt_perplexities = []
+    last_token_perplexities = []
+    last_token_nanogpt_perplexities = []
     per_position_perplexities = []  # For seq2seq models
     per_position_losses = []
+    batch_infer_times = []
+    batch_tokens_per_sec = []
+    batch_us_per_token = []
 
     # ---- choose loss function ONCE ----
     if compiled_eval_step is None:
@@ -3245,18 +3257,37 @@ def evaluate_model(
         rng_key, step_key = jax.random.split(rng_key)
 
         # ---- fast compiled call ----
-        loss, metrics = compiled_eval_step(params, step_key, batch)
+        if measure_batch_timing:
+            start_time = time.perf_counter()
+            loss, metrics = compiled_eval_step(params, step_key, batch)
+            jax.block_until_ready(loss)
+            elapsed_s = float(time.perf_counter() - start_time)
+            batch_infer_times.append(elapsed_s)
+            if hasattr(batch, "shape") and len(batch.shape) >= 2:
+                tokens_in_batch = int(batch.shape[0]) * int(batch.shape[1])
+            else:
+                tokens_in_batch = int(np.size(batch))
+            if tokens_in_batch > 0 and elapsed_s > 0.0:
+                batch_tokens_per_sec.append(tokens_in_batch / elapsed_s)
+                batch_us_per_token.append((elapsed_s * 1_000_000.0) / tokens_in_batch)
+        else:
+            loss, metrics = compiled_eval_step(params, step_key, batch)
 
         losses.append(float(loss))
         accuracies.append(float(metrics["accuracy"]))
         perplexities.append(float(metrics["perplexity"]))
+        nanogpt_perplexities.append(float(np.exp(float(loss))))
 
         # collect per-position metrics
         if seq2seq and "per_position_perplexity" in metrics:
-            per_position_perplexities.append(
-                np.array(metrics["per_position_perplexity"])
-            )
-            per_position_losses.append(np.array(metrics["per_position_loss"]))
+            per_pos_ppl = np.array(metrics["per_position_perplexity"])
+            per_pos_loss = np.array(metrics["per_position_loss"])
+            per_position_perplexities.append(per_pos_ppl)
+            per_position_losses.append(per_pos_loss)
+            if per_pos_ppl.size > 0:
+                last_token_perplexities.append(float(per_pos_ppl[-1]))
+            if per_pos_loss.size > 0:
+                last_token_nanogpt_perplexities.append(float(np.exp(per_pos_loss[-1])))
 
         pbar.set_postfix(
             {
@@ -3277,8 +3308,26 @@ def evaluate_model(
 
     avg_loss = np.mean(losses)
     avg_metrics = {"accuracy": np.mean(accuracies), "perplexity": np.mean(perplexities)}
+    avg_metrics["eval_batches"] = int(len(losses))
+    avg_metrics["accuracy_batch_std"] = float(np.std(accuracies))
+    avg_metrics["perplexity_batch_std"] = float(np.std(perplexities))
+    if measure_batch_timing and len(batch_infer_times) > 0:
+        times_arr = np.array(batch_infer_times, dtype=float)
+        avg_metrics["batch_infer_time_mean_s"] = float(np.mean(times_arr))
+        avg_metrics["batch_infer_time_std_s"] = float(np.std(times_arr))
+        avg_metrics["batch_infer_time_p50_s"] = float(np.percentile(times_arr, 50))
+        avg_metrics["batch_infer_time_p90_s"] = float(np.percentile(times_arr, 90))
+        if len(batch_tokens_per_sec) > 0:
+            tps_arr = np.array(batch_tokens_per_sec, dtype=float)
+            avg_metrics["batch_tokens_per_sec_mean"] = float(np.mean(tps_arr))
+            avg_metrics["batch_tokens_per_sec_std"] = float(np.std(tps_arr))
+        if len(batch_us_per_token) > 0:
+            us_arr = np.array(batch_us_per_token, dtype=float)
+            avg_metrics["batch_us_per_token_mean"] = float(np.mean(us_arr))
+            avg_metrics["batch_us_per_token_std"] = float(np.std(us_arr))
     if nanogpt_ppl_metric:
         avg_metrics["nanogpt_perplexity"] = float(np.exp(avg_loss))
+        avg_metrics["nanogpt_perplexity_batch_std"] = float(np.std(nanogpt_perplexities))
 
     # Add per-position metrics for seq2seq models
     if seq2seq and len(per_position_perplexities) > 0:
@@ -3290,10 +3339,18 @@ def evaluate_model(
         avg_metrics["per_position_loss"] = avg_per_position_loss
         avg_metrics["last_token_perplexity"] = float(avg_per_position_perplexity[-1])
         avg_metrics["last_token_loss"] = float(avg_per_position_loss[-1])
+        if len(last_token_perplexities) > 0:
+            avg_metrics["last_token_perplexity_batch_std"] = float(
+                np.std(last_token_perplexities)
+            )
         if nanogpt_ppl_metric:
             avg_metrics["last_token_perplexity_nanogpt"] = float(
                 np.exp(avg_per_position_loss[-1])
             )
+            if len(last_token_nanogpt_perplexities) > 0:
+                avg_metrics["last_token_perplexity_nanogpt_batch_std"] = float(
+                    np.std(last_token_nanogpt_perplexities)
+                )
 
         # Additional summary statistics
         avg_metrics["min_position_perplexity"] = np.min(avg_per_position_perplexity)
@@ -4212,6 +4269,7 @@ def _evaluate_seq_len_range_core(
     seq_lengths: List[int],
     batch_size: int,
     nanogpt_ppl_metric: bool,
+    measure_batch_timing: bool = False,
 ):
     results = []
     rng_key = jax.random.PRNGKey(0)
@@ -4242,32 +4300,77 @@ def _evaluate_seq_len_range_core(
             seq2seq=seq2seq,
             eval_model=eval_model,
             nanogpt_ppl_metric=nanogpt_ppl_metric,
+            measure_batch_timing=measure_batch_timing,
         )
 
         ppl_value = float(avg_metrics["perplexity"])
+        ppl_std = float(avg_metrics.get("perplexity_batch_std", float("nan")))
         if nanogpt_ppl_metric and "nanogpt_perplexity" in avg_metrics:
             ppl_value = float(avg_metrics["nanogpt_perplexity"])
+            ppl_std = float(
+                avg_metrics.get("nanogpt_perplexity_batch_std", float("nan"))
+            )
 
         last_token_ppl = float("nan")
+        last_token_ppl_std = float("nan")
         if nanogpt_ppl_metric and "last_token_perplexity_nanogpt" in avg_metrics:
             last_token_ppl = float(avg_metrics["last_token_perplexity_nanogpt"])
+            last_token_ppl_std = float(
+                avg_metrics.get("last_token_perplexity_nanogpt_batch_std", float("nan"))
+            )
         elif "last_token_perplexity" in avg_metrics:
             last_token_ppl = float(avg_metrics["last_token_perplexity"])
+            last_token_ppl_std = float(
+                avg_metrics.get("last_token_perplexity_batch_std", float("nan"))
+            )
 
         row = {
             "seq_len": seq_len,
             "n_sequences": int(len(sequences)),
             "loss": float(avg_loss),
             "perplexity": ppl_value,
+            "perplexity_batch_std": ppl_std,
             "last_token_perplexity": last_token_ppl,
+            "last_token_perplexity_batch_std": last_token_ppl_std,
             "accuracy": float(avg_metrics["accuracy"]),
+            "accuracy_batch_std": float(
+                avg_metrics.get("accuracy_batch_std", float("nan"))
+            ),
+            "eval_batches": int(avg_metrics.get("eval_batches", 0)),
+            "batch_infer_time_mean_s": float(
+                avg_metrics.get("batch_infer_time_mean_s", float("nan"))
+            ),
+            "batch_infer_time_std_s": float(
+                avg_metrics.get("batch_infer_time_std_s", float("nan"))
+            ),
+            "batch_tokens_per_sec_mean": float(
+                avg_metrics.get("batch_tokens_per_sec_mean", float("nan"))
+            ),
+            "batch_tokens_per_sec_std": float(
+                avg_metrics.get("batch_tokens_per_sec_std", float("nan"))
+            ),
+            "batch_us_per_token_mean": float(
+                avg_metrics.get("batch_us_per_token_mean", float("nan"))
+            ),
+            "batch_us_per_token_std": float(
+                avg_metrics.get("batch_us_per_token_std", float("nan"))
+            ),
         }
         results.append(row)
-        print(
+        msg = (
             f"  seq_len={seq_len:4d} | n={row['n_sequences']:6,} | "
-            f"loss={row['loss']:.4f} | ppl={row['perplexity']:.4f} | "
+            f"loss={row['loss']:.4f} | ppl={row['perplexity']:.4f}"
+            f"±{row['perplexity_batch_std']:.4f} | "
             f"last_ppl={row['last_token_perplexity']:.4f} | acc={row['accuracy']:.4f}"
         )
+        if np.isfinite(row["batch_infer_time_mean_s"]):
+            msg += (
+                f" | batch_t={row['batch_infer_time_mean_s']:.4f}s"
+                f"±{row['batch_infer_time_std_s']:.4f}s"
+            )
+        if np.isfinite(row["batch_us_per_token_mean"]):
+            msg += f" | us/tok={row['batch_us_per_token_mean']:.2f}"
+        print(msg)
 
     return results
 
@@ -4275,11 +4378,26 @@ def _evaluate_seq_len_range_core(
 def _write_seq_len_range_results(results, plot_dir: str, basename: str):
     csv_path = os.path.join(plot_dir, f"{basename}.csv")
     with open(csv_path, "w") as fh:
-        fh.write("seq_len,n_sequences,loss,perplexity,last_token_perplexity,accuracy\n")
+        fh.write(
+            "seq_len,n_sequences,eval_batches,loss,perplexity,perplexity_batch_std,"
+            "last_token_perplexity,last_token_perplexity_batch_std,accuracy,accuracy_batch_std,"
+            "batch_infer_time_mean_s,batch_infer_time_std_s,batch_tokens_per_sec_mean,"
+            "batch_tokens_per_sec_std,batch_us_per_token_mean,batch_us_per_token_std\n"
+        )
         for r in results:
             fh.write(
-                f"{r['seq_len']},{r['n_sequences']},{r['loss']:.6f},{r['perplexity']:.6f},"
-                f"{r['last_token_perplexity']:.6f},{r['accuracy']:.6f}\n"
+                f"{r['seq_len']},{r['n_sequences']},{int(r.get('eval_batches', 0))},"
+                f"{r['loss']:.6f},{r['perplexity']:.6f},"
+                f"{float(r.get('perplexity_batch_std', float('nan'))):.6f},"
+                f"{r['last_token_perplexity']:.6f},"
+                f"{float(r.get('last_token_perplexity_batch_std', float('nan'))):.6f},"
+                f"{r['accuracy']:.6f},{float(r.get('accuracy_batch_std', float('nan'))):.6f},"
+                f"{float(r.get('batch_infer_time_mean_s', float('nan'))):.6f},"
+                f"{float(r.get('batch_infer_time_std_s', float('nan'))):.6f},"
+                f"{float(r.get('batch_tokens_per_sec_mean', float('nan'))):.6f},"
+                f"{float(r.get('batch_tokens_per_sec_std', float('nan'))):.6f},"
+                f"{float(r.get('batch_us_per_token_mean', float('nan'))):.6f},"
+                f"{float(r.get('batch_us_per_token_std', float('nan'))):.6f}\n"
             )
 
     json_path = os.path.join(plot_dir, f"{basename}.json")
@@ -4333,6 +4451,12 @@ def _aggregate_seq_len_results(results_by_model, seq_lengths):
             _extract_metric_value(row, "last_token_perplexity")
             for row in per_model_rows
         ]
+        batch_time_vals = [
+            _extract_metric_value(row, "batch_infer_time_mean_s") for row in per_model_rows
+        ]
+        batch_us_vals = [
+            _extract_metric_value(row, "batch_us_per_token_mean") for row in per_model_rows
+        ]
 
         perplexity_arr = np.array(
             [np.nan if v is None else v for v in perplexity_vals], dtype=float
@@ -4347,6 +4471,24 @@ def _aggregate_seq_len_results(results_by_model, seq_lengths):
         last_token_arr = np.array(
             [np.nan if v is None else v for v in last_token_vals], dtype=float
         )
+        batch_time_arr = np.array(
+            [np.nan if v is None else v for v in batch_time_vals], dtype=float
+        )
+        batch_us_arr = np.array(
+            [np.nan if v is None else v for v in batch_us_vals], dtype=float
+        )
+        if np.any(np.isfinite(batch_time_arr)):
+            batch_time_mean = float(np.nanmean(batch_time_arr))
+            batch_time_std = float(np.nanstd(batch_time_arr))
+        else:
+            batch_time_mean = float("nan")
+            batch_time_std = float("nan")
+        if np.any(np.isfinite(batch_us_arr)):
+            batch_us_mean = float(np.nanmean(batch_us_arr))
+            batch_us_std = float(np.nanstd(batch_us_arr))
+        else:
+            batch_us_mean = float("nan")
+            batch_us_std = float("nan")
 
         aggregates.append(
             {
@@ -4358,6 +4500,10 @@ def _aggregate_seq_len_results(results_by_model, seq_lengths):
                 "accuracy_std": float(np.nanstd(accuracy_arr)),
                 "last_token_perplexity_mean": float(np.nanmean(last_token_arr)),
                 "last_token_perplexity_std": float(np.nanstd(last_token_arr)),
+                "batch_infer_time_mean_s_mean": batch_time_mean,
+                "batch_infer_time_mean_s_std": batch_time_std,
+                "batch_us_per_token_mean_mean": batch_us_mean,
+                "batch_us_per_token_mean_std": batch_us_std,
             }
         )
 
@@ -4369,7 +4515,9 @@ def _write_seq_len_range_aggregate_results(rows, plot_dir: str, basename: str):
     with open(csv_path, "w") as fh:
         fh.write(
             "seq_len,n_models,perplexity_mean,perplexity_std,accuracy_mean,"
-            "accuracy_std,last_token_perplexity_mean,last_token_perplexity_std\n"
+            "accuracy_std,last_token_perplexity_mean,last_token_perplexity_std,"
+            "batch_infer_time_mean_s_mean,batch_infer_time_mean_s_std,"
+            "batch_us_per_token_mean_mean,batch_us_per_token_mean_std\n"
         )
         for row in rows:
             fh.write(
@@ -4377,7 +4525,11 @@ def _write_seq_len_range_aggregate_results(rows, plot_dir: str, basename: str):
                 f"{row['perplexity_mean']:.6f},{row['perplexity_std']:.6f},"
                 f"{row['accuracy_mean']:.6f},{row['accuracy_std']:.6f},"
                 f"{row['last_token_perplexity_mean']:.6f},"
-                f"{row['last_token_perplexity_std']:.6f}\n"
+                f"{row['last_token_perplexity_std']:.6f},"
+                f"{float(row.get('batch_infer_time_mean_s_mean', float('nan'))):.6f},"
+                f"{float(row.get('batch_infer_time_mean_s_std', float('nan'))):.6f},"
+                f"{float(row.get('batch_us_per_token_mean_mean', float('nan'))):.6f},"
+                f"{float(row.get('batch_us_per_token_mean_std', float('nan'))):.6f}\n"
             )
 
     json_path = os.path.join(plot_dir, f"{basename}.json")
@@ -4458,6 +4610,7 @@ def regenerate_seq_len_range_plots_from_output_dir(
     avg_ppl_scale: str = "log",
     last_ppl_scale: str = "log",
     acc_scale: str = "linear",
+    show_aggregate_mean: bool = True,
 ):
     """
     Regenerate aggregate plots from cached sequence-length results only.
@@ -4486,6 +4639,7 @@ def regenerate_seq_len_range_plots_from_output_dir(
         aggregate_rows=aggregate_rows,
         y_min=avg_ppl_y_min,
         y_max=avg_ppl_y_max,
+        show_aggregate_mean=show_aggregate_mean,
     )
     _plot_multi_model_seq_len_metric(
         results_by_model,
@@ -4496,6 +4650,7 @@ def regenerate_seq_len_range_plots_from_output_dir(
         aggregate_rows=aggregate_rows,
         y_min=last_ppl_y_min,
         y_max=last_ppl_y_max,
+        show_aggregate_mean=show_aggregate_mean,
     )
     _plot_multi_model_seq_len_metric(
         results_by_model,
@@ -4508,6 +4663,7 @@ def regenerate_seq_len_range_plots_from_output_dir(
         y_min=acc_y_min,
         y_max=acc_y_max,
         auto_tight_accuracy=True,
+        show_aggregate_mean=show_aggregate_mean,
     )
     _plot_avg_seq_len_metric(
         aggregate_rows,
@@ -4542,6 +4698,42 @@ def regenerate_seq_len_range_plots_from_output_dir(
         y_min=acc_y_min,
         y_max=acc_y_max,
         auto_tight_accuracy=True,
+    )
+    _plot_multi_model_seq_len_metric(
+        results_by_model,
+        metric_name="batch_infer_time_mean_s",
+        y_label="Avg Batch Inference Time (s)",
+        plot_path=os.path.join(plot_dir, "avg_batch_inference_time_vs_seq_len.png"),
+        log_scale=False,
+        aggregate_rows=aggregate_rows,
+        show_aggregate_mean=show_aggregate_mean,
+    )
+    _plot_avg_seq_len_metric(
+        aggregate_rows,
+        metric_key="batch_infer_time_mean_s_mean",
+        std_key="batch_infer_time_mean_s_std",
+        y_label="Avg Batch Inference Time (s)",
+        plot_path=os.path.join(
+            plot_dir, "avg_batch_inference_time_vs_seq_len_mean_std.png"
+        ),
+        log_scale=False,
+    )
+    _plot_multi_model_seq_len_metric(
+        results_by_model,
+        metric_name="batch_us_per_token_mean",
+        y_label="Avg Inference Time per Token (us)",
+        plot_path=os.path.join(plot_dir, "avg_us_per_token_vs_seq_len.png"),
+        log_scale=False,
+        aggregate_rows=aggregate_rows,
+        show_aggregate_mean=show_aggregate_mean,
+    )
+    _plot_avg_seq_len_metric(
+        aggregate_rows,
+        metric_key="batch_us_per_token_mean_mean",
+        std_key="batch_us_per_token_mean_std",
+        y_label="Avg Inference Time per Token (us)",
+        plot_path=os.path.join(plot_dir, "avg_us_per_token_vs_seq_len_mean_std.png"),
+        log_scale=False,
     )
 
     return {
@@ -4671,37 +4863,70 @@ def _plot_multi_model_seq_len_metric(
     y_min: Optional[float] = None,
     y_max: Optional[float] = None,
     auto_tight_accuracy: bool = False,
+    show_aggregate_mean: bool = True,
 ):
     fig, ax = plt.subplots(figsize=(10, 5))
     cmap = plt.get_cmap("tab10")
     plotted_any = False
+    metric_std_key = {
+        "perplexity": "perplexity_batch_std",
+        "last_token_perplexity": "last_token_perplexity_batch_std",
+        "accuracy": "accuracy_batch_std",
+        "batch_infer_time_mean_s": "batch_infer_time_std_s",
+        "batch_us_per_token_mean": "batch_us_per_token_std",
+    }.get(metric_name)
 
     for idx, (model_name, rows) in enumerate(
         sorted(results_by_model.items(), key=lambda item: _natural_sort_key(item[0]))
     ):
         seq_lens = []
         values = []
+        std_values = []
         for row in rows:
             value = _extract_metric_value(row, metric_name)
             if value is None or (isinstance(value, float) and np.isnan(value)):
                 continue
             seq_lens.append(row["seq_len"])
             values.append(float(value))
+            if metric_std_key is None:
+                std_values.append(float("nan"))
+            else:
+                std_values.append(float(row.get(metric_std_key, float("nan"))))
         if not seq_lens:
             continue
         plotted_any = True
         color = cmap(idx % cmap.N)
-        ax.plot(
-            seq_lens,
-            values,
-            color=color,
-            marker="o",
-            markersize=4,
-            linewidth=1.5,
-            label=model_name,
-        )
+        std_arr = np.array(std_values, dtype=float)
+        if np.any(np.isfinite(std_arr)):
+            safe_std = np.where(
+                np.isfinite(std_arr) & (std_arr >= 0.0),
+                std_arr,
+                0.0,
+            )
+            ax.errorbar(
+                seq_lens,
+                values,
+                yerr=safe_std,
+                color=color,
+                marker="o",
+                markersize=4,
+                linewidth=1.5,
+                capsize=2.5,
+                elinewidth=0.9,
+                label=model_name,
+            )
+        else:
+            ax.plot(
+                seq_lens,
+                values,
+                color=color,
+                marker="o",
+                markersize=4,
+                linewidth=1.5,
+                label=model_name,
+            )
 
-    if aggregate_rows:
+    if aggregate_rows and show_aggregate_mean:
         agg_seq_lens = []
         agg_values = []
         agg_key = f"{metric_name}_mean"
@@ -4790,6 +5015,7 @@ def evaluate_sequence_length_range(
     avg_ppl_scale: str = "log",
     last_ppl_scale: str = "log",
     acc_scale: str = "linear",
+    measure_batch_timing: bool = False,
 ):
     """
     Evaluate a checkpoint across a range of sequence lengths (min_seq_len to
@@ -4893,6 +5119,7 @@ def evaluate_sequence_length_range(
         seq_lengths=seq_lengths,
         batch_size=batch_size,
         nanogpt_ppl_metric=nanogpt_ppl_metric,
+        measure_batch_timing=measure_batch_timing,
     )
 
     if not results:
@@ -4908,7 +5135,14 @@ def evaluate_sequence_length_range(
     # --- plot ---
     seq_lens_arr = np.array([r["seq_len"] for r in results])
     perplexities = np.array([r["perplexity"] for r in results])
+    perplexity_stds = np.array(
+        [float(r.get("perplexity_batch_std", np.nan)) for r in results], dtype=float
+    )
     last_token_perplexities = np.array([r["last_token_perplexity"] for r in results])
+    last_token_perplexity_stds = np.array(
+        [float(r.get("last_token_perplexity_batch_std", np.nan)) for r in results],
+        dtype=float,
+    )
     accuracies = np.array([r["accuracy"] for r in results])
 
     fig, ax1 = plt.subplots(figsize=(10, 5))
@@ -4916,26 +5150,66 @@ def evaluate_sequence_length_range(
     color_ppl = "#4C72B0"
     color_last = "#55A868"
     if plot_metric in ("pplx", "both"):
-        ax1.plot(
-            seq_lens_arr,
-            perplexities,
-            color=color_ppl,
-            marker="o",
-            markersize=4,
-            linewidth=1.5,
-            label="Perplexity",
-        )
+        if np.any(np.isfinite(perplexity_stds)):
+            safe_ppl_err = np.where(
+                np.isfinite(perplexity_stds) & (perplexity_stds >= 0.0),
+                perplexity_stds,
+                0.0,
+            )
+            ax1.errorbar(
+                seq_lens_arr,
+                perplexities,
+                yerr=safe_ppl_err,
+                color=color_ppl,
+                marker="o",
+                markersize=4,
+                linewidth=1.5,
+                capsize=3,
+                elinewidth=1.0,
+                label="Perplexity",
+            )
+        else:
+            ax1.plot(
+                seq_lens_arr,
+                perplexities,
+                color=color_ppl,
+                marker="o",
+                markersize=4,
+                linewidth=1.5,
+                label="Perplexity",
+            )
     if plot_metric in ("last_token", "both"):
-        ax1.plot(
-            seq_lens_arr,
-            last_token_perplexities,
-            color=color_last,
-            marker="^",
-            markersize=4,
-            linewidth=1.5,
-            linestyle="-.",
-            label="Last-token Perplexity",
-        )
+        if np.any(np.isfinite(last_token_perplexity_stds)):
+            safe_last_err = np.where(
+                np.isfinite(last_token_perplexity_stds)
+                & (last_token_perplexity_stds >= 0.0),
+                last_token_perplexity_stds,
+                0.0,
+            )
+            ax1.errorbar(
+                seq_lens_arr,
+                last_token_perplexities,
+                yerr=safe_last_err,
+                color=color_last,
+                marker="^",
+                markersize=4,
+                linewidth=1.5,
+                linestyle="-.",
+                capsize=3,
+                elinewidth=1.0,
+                label="Last-token Perplexity",
+            )
+        else:
+            ax1.plot(
+                seq_lens_arr,
+                last_token_perplexities,
+                color=color_last,
+                marker="^",
+                markersize=4,
+                linewidth=1.5,
+                linestyle="-.",
+                label="Last-token Perplexity",
+            )
     ax1.set_xlabel("Sequence Length", fontsize=12)
     ax1.set_ylabel("Perplexity", fontsize=12)
     ax1.tick_params(axis="y")
@@ -4998,6 +5272,24 @@ def evaluate_sequence_length_range(
     plt.close(fig)
     print(f"  Plot → {plot_path}")
 
+    if measure_batch_timing:
+        _plot_avg_seq_len_metric(
+            results,
+            metric_key="batch_infer_time_mean_s",
+            std_key="batch_infer_time_std_s",
+            y_label="Avg Batch Inference Time (s)",
+            plot_path=os.path.join(plot_dir, "avg_batch_inference_time_vs_seq_len.png"),
+            log_scale=False,
+        )
+        _plot_avg_seq_len_metric(
+            results,
+            metric_key="batch_us_per_token_mean",
+            std_key="batch_us_per_token_std",
+            y_label="Avg Inference Time per Token (us)",
+            plot_path=os.path.join(plot_dir, "avg_us_per_token_vs_seq_len.png"),
+            log_scale=False,
+        )
+
     print(
         f"\n  Best PPL  : {perplexities.min():.4f} at seq_len={seq_lens_arr[perplexities.argmin()]}"
     )
@@ -5033,6 +5325,8 @@ def evaluate_sequence_length_range_list(
     avg_ppl_scale: str = "log",
     last_ppl_scale: str = "log",
     acc_scale: str = "linear",
+    show_aggregate_mean: bool = True,
+    measure_batch_timing: bool = False,
 ):
     """
     Evaluate multiple checkpoints over a range of sequence lengths and plot
@@ -5127,6 +5421,7 @@ def evaluate_sequence_length_range_list(
             seq_lengths=seq_lengths,
             batch_size=batch_size,
             nanogpt_ppl_metric=nanogpt_ppl_metric,
+            measure_batch_timing=measure_batch_timing,
         )
 
         if not results:
@@ -5165,6 +5460,7 @@ def evaluate_sequence_length_range_list(
         aggregate_rows=aggregate_rows,
         y_min=avg_ppl_y_min,
         y_max=avg_ppl_y_max,
+        show_aggregate_mean=show_aggregate_mean,
     )
     _plot_multi_model_seq_len_metric(
         results_by_model,
@@ -5175,6 +5471,7 @@ def evaluate_sequence_length_range_list(
         aggregate_rows=aggregate_rows,
         y_min=last_ppl_y_min,
         y_max=last_ppl_y_max,
+        show_aggregate_mean=show_aggregate_mean,
     )
     _plot_multi_model_seq_len_metric(
         results_by_model,
@@ -5187,6 +5484,7 @@ def evaluate_sequence_length_range_list(
         y_min=acc_y_min,
         y_max=acc_y_max,
         auto_tight_accuracy=True,
+        show_aggregate_mean=show_aggregate_mean,
     )
     _plot_avg_seq_len_metric(
         aggregate_rows,
@@ -5221,6 +5519,42 @@ def evaluate_sequence_length_range_list(
         y_min=acc_y_min,
         y_max=acc_y_max,
         auto_tight_accuracy=True,
+    )
+    _plot_multi_model_seq_len_metric(
+        results_by_model,
+        metric_name="batch_infer_time_mean_s",
+        y_label="Avg Batch Inference Time (s)",
+        plot_path=os.path.join(plot_dir, "avg_batch_inference_time_vs_seq_len.png"),
+        log_scale=False,
+        aggregate_rows=aggregate_rows,
+        show_aggregate_mean=show_aggregate_mean,
+    )
+    _plot_avg_seq_len_metric(
+        aggregate_rows,
+        metric_key="batch_infer_time_mean_s_mean",
+        std_key="batch_infer_time_mean_s_std",
+        y_label="Avg Batch Inference Time (s)",
+        plot_path=os.path.join(
+            plot_dir, "avg_batch_inference_time_vs_seq_len_mean_std.png"
+        ),
+        log_scale=False,
+    )
+    _plot_multi_model_seq_len_metric(
+        results_by_model,
+        metric_name="batch_us_per_token_mean",
+        y_label="Avg Inference Time per Token (us)",
+        plot_path=os.path.join(plot_dir, "avg_us_per_token_vs_seq_len.png"),
+        log_scale=False,
+        aggregate_rows=aggregate_rows,
+        show_aggregate_mean=show_aggregate_mean,
+    )
+    _plot_avg_seq_len_metric(
+        aggregate_rows,
+        metric_key="batch_us_per_token_mean_mean",
+        std_key="batch_us_per_token_mean_std",
+        y_label="Avg Inference Time per Token (us)",
+        plot_path=os.path.join(plot_dir, "avg_us_per_token_vs_seq_len_mean_std.png"),
+        log_scale=False,
     )
 
     return {
@@ -5960,6 +6294,24 @@ if __name__ == "__main__":
         help="Y-axis scale for accuracy plots (default: linear).",
     )
     parser.add_argument(
+        "--hide_seq_len_aggregate_mean",
+        action="store_true",
+        default=False,
+        help=(
+            "Hide the dashed aggregate mean line in multi-model sequence-length plots "
+            "(including --regen_seq_len_range_plots_from)."
+        ),
+    )
+    parser.add_argument(
+        "--seq_len_measure_runtime",
+        action="store_true",
+        default=False,
+        help=(
+            "Measure per-batch inference runtime during sequence-length evaluation and "
+            "emit runtime trend plots. Adds synchronization overhead."
+        ),
+    )
+    parser.add_argument(
         "--print_log_file",
         type=str,
         default=None,
@@ -6217,6 +6569,7 @@ if __name__ == "__main__":
                 args.seq_len_last_ppl_scale, args.seq_len_ppl_scale, "log"
             ),
             acc_scale=args.seq_len_acc_scale,
+            show_aggregate_mean=not args.hide_seq_len_aggregate_mean,
         )
         exit(0)
 
@@ -6295,6 +6648,7 @@ if __name__ == "__main__":
                 y_max=_resolve_plot_value(
                     args.seq_len_avg_ppl_max, args.seq_len_ppl_max, None
                 ),
+                show_aggregate_mean=not args.hide_seq_len_aggregate_mean,
             )
             _plot_multi_model_seq_len_metric(
                 results_by_model,
@@ -6316,6 +6670,7 @@ if __name__ == "__main__":
                 y_max=_resolve_plot_value(
                     args.seq_len_last_ppl_max, args.seq_len_ppl_max, None
                 ),
+                show_aggregate_mean=not args.hide_seq_len_aggregate_mean,
             )
             _plot_multi_model_seq_len_metric(
                 results_by_model,
@@ -6328,6 +6683,7 @@ if __name__ == "__main__":
                 y_min=args.seq_len_acc_min,
                 y_max=args.seq_len_acc_max,
                 auto_tight_accuracy=True,
+                show_aggregate_mean=not args.hide_seq_len_aggregate_mean,
             )
             _plot_avg_seq_len_metric(
                 aggregate_rows,
@@ -6386,6 +6742,49 @@ if __name__ == "__main__":
                 y_max=args.seq_len_acc_max,
                 auto_tight_accuracy=True,
             )
+            _plot_multi_model_seq_len_metric(
+                results_by_model,
+                metric_name="batch_infer_time_mean_s",
+                y_label="Avg Batch Inference Time (s)",
+                plot_path=os.path.join(
+                    aggregate_plot_dir, "avg_batch_inference_time_vs_seq_len.png"
+                ),
+                log_scale=False,
+                aggregate_rows=aggregate_rows,
+                show_aggregate_mean=not args.hide_seq_len_aggregate_mean,
+            )
+            _plot_avg_seq_len_metric(
+                aggregate_rows,
+                metric_key="batch_infer_time_mean_s_mean",
+                std_key="batch_infer_time_mean_s_std",
+                y_label="Avg Batch Inference Time (s)",
+                plot_path=os.path.join(
+                    aggregate_plot_dir,
+                    "avg_batch_inference_time_vs_seq_len_mean_std.png",
+                ),
+                log_scale=False,
+            )
+            _plot_multi_model_seq_len_metric(
+                results_by_model,
+                metric_name="batch_us_per_token_mean",
+                y_label="Avg Inference Time per Token (us)",
+                plot_path=os.path.join(
+                    aggregate_plot_dir, "avg_us_per_token_vs_seq_len.png"
+                ),
+                log_scale=False,
+                aggregate_rows=aggregate_rows,
+                show_aggregate_mean=not args.hide_seq_len_aggregate_mean,
+            )
+            _plot_avg_seq_len_metric(
+                aggregate_rows,
+                metric_key="batch_us_per_token_mean_mean",
+                std_key="batch_us_per_token_mean_std",
+                y_label="Avg Inference Time per Token (us)",
+                plot_path=os.path.join(
+                    aggregate_plot_dir, "avg_us_per_token_vs_seq_len_mean_std.png"
+                ),
+                log_scale=False,
+            )
             exit(0)
         _run_legacy_ldru_eval(args)
         exit(0)
@@ -6443,6 +6842,8 @@ if __name__ == "__main__":
                 args.seq_len_last_ppl_scale, args.seq_len_ppl_scale, "log"
             ),
             acc_scale=args.seq_len_acc_scale,
+            show_aggregate_mean=not args.hide_seq_len_aggregate_mean,
+            measure_batch_timing=args.seq_len_measure_runtime,
         )
         exit(0)
 
@@ -6491,6 +6892,7 @@ if __name__ == "__main__":
                 args.seq_len_last_ppl_scale, args.seq_len_ppl_scale, "log"
             ),
             acc_scale=args.seq_len_acc_scale,
+            measure_batch_timing=args.seq_len_measure_runtime,
         )
         exit(0)
 
