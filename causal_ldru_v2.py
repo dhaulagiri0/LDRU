@@ -357,10 +357,7 @@ class CausalLDRULayer(hk.Module):
             return associative_scan(combine, x, inner_fn=post_merge_fn)
 
         incl = jax.vmap(scan_one)(h)  # [B, L, E]
-
-        # shift right by one slot and include identity at start
-        identity = jnp.zeros((B, 1, E), dtype=h.dtype)
-        return jnp.concatenate((identity, incl[:, 1:, :]), axis=1)
+        return incl
 
     def sequential_pairwise_final_scan(
         self,
@@ -584,9 +581,7 @@ class CausalLDRULayer(hk.Module):
 
         incl = jax.vmap(scan_one)(h)  # h: [B, L, E]
 
-        # shift right by one slot and include identity at start
-        identity = jnp.zeros((h.shape[0], 1, h.shape[2]), dtype=h.dtype)  # [B, 1, E]
-        return jnp.concatenate((identity, incl[:, 1:, :]), axis=1)
+        return incl
 
     def assoc_scan_custom(
         self, h, binary_operator, post_merge_fn=None, reverse_op: bool = False
@@ -612,9 +607,7 @@ class CausalLDRULayer(hk.Module):
 
         incl = jax.vmap(scan_one)(h)  # h: [B, L, E]
 
-        # shift right by one slot and include identity at start
-        identity = jnp.zeros((h.shape[0], 1, h.shape[2]), dtype=h.dtype)  # [B, 1, E]
-        return jnp.concatenate((identity, incl[:, 1:, :]), axis=1)
+        return incl
 
     @staticmethod
     def expand_to_power_of_2_with_random_zeros(
@@ -1084,7 +1077,7 @@ class CausalLDRUEncoder(hk.Module):
         h = x
 
         # Apply multiple LDRU layers with residual connections
-        first_layer = CausalLDRULayer(self.config, use_mlp=True)
+        first_layer = CausalLDRULayer(self.config, use_mlp=False)
         h = first_layer(h) + 0.1 * h  # Small residual for stability
         for layer_idx in range(self.config.num_layers - 1):
             layer = CausalLDRULayer(self.config)

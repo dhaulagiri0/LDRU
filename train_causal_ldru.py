@@ -1767,6 +1767,7 @@ def train_model(
     log_dir: str,
     config: LDRUExperimenstConfig,
     rng_seed: int = 42,
+    eval_seed: int = 123,
     enable_logging: bool = True,
     text_file_path: str = None,
     validation_text_file_path: str = None,
@@ -1849,6 +1850,7 @@ def train_model(
     # Initialize RNG
     rng_key = jax.random.PRNGKey(rng_seed)
     rng_key, init_key, data_key = jax.random.split(rng_key, 3)
+    eval_key = jax.random.PRNGKey(eval_seed)
 
     use_pretokenized_bins = train_seq_bin_path is not None
     if not use_pretokenized_bins:
@@ -2493,7 +2495,7 @@ def train_model(
             val_loss, val_metrics = evaluate_model_on_dataset(
                 params,
                 model,
-                rng_key,
+                eval_key,
                 val_data,
                 epoch,
                 batch_size,
@@ -2568,7 +2570,7 @@ def train_model(
             _, _ = evaluate_model_on_dataset(
                 params,
                 model,
-                rng_key,
+                eval_key,
                 test_data,
                 epoch,
                 batch_size,
@@ -6075,6 +6077,12 @@ if __name__ == "__main__":
         help="Random seed for JAX PRNG (default: 42).",
     )
     parser.add_argument(
+        "--eval_seed",
+        type=int,
+        default=123,
+        help="Random seed for evaluation data (default: 123)"
+    )
+    parser.add_argument(
         "--binary_operator",
         type=str,
         default="default",
@@ -7356,6 +7364,7 @@ if __name__ == "__main__":
         log_dir=LOG_DIR,
         config=config,
         rng_seed=args.rng_seed,
+        eval_seed=args.eval_seed,
         enable_logging=enable_logging,
         text_file_path=text_file_path,
         model_creation_fn=model_creation_fn,
