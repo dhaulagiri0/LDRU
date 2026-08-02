@@ -1117,6 +1117,120 @@ def create_nanogpt_token_stream_loader(
         yield batch
 
 
+def _load_json_file(path: str) -> dict:
+    if not path:
+        return {}
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Metadata file not found: {path}")
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError(f"Metadata file must contain a JSON object: {path}")
+    return data
+
+
+def _resolve_eval_seq_bin_dtype(
+    eval_seq_bin_dtype: str, eval_seq_meta_json: Optional[str]
+) -> str:
+    if eval_seq_bin_dtype != "auto":
+        return eval_seq_bin_dtype
+
+    meta = _load_json_file(eval_seq_meta_json) if eval_seq_meta_json else {}
+    token_stream_cfg = meta.get("token_stream_config", {}) if isinstance(meta, dict) else {}
+    meta_dtype = token_stream_cfg.get("dtype")
+    if isinstance(meta_dtype, str) and meta_dtype:
+        return meta_dtype
+
+    return "uint16"
+
+
+def _resolve_eval_seq_bin_format(
+    eval_seq_bin_format: str, eval_seq_meta_json: Optional[str]
+) -> str:
+    if eval_seq_bin_format != "auto":
+        return eval_seq_bin_format
+
+    meta = _load_json_file(eval_seq_meta_json) if eval_seq_meta_json else {}
+    meta_format = meta.get("format") if isinstance(meta, dict) else None
+    if isinstance(meta_format, str) and meta_format:
+        return meta_format
+
+    return "token_stream"
+
+
+def _build_seq_len_eval_source(
+    *,
+    eval_text_file: Optional[str],
+    eval_seq_bin_path: Optional[str],
+    eval_seq_bin_format: str,
+    eval_seq_bin_dtype: str,
+    eval_seq_bin_length: Optional[int],
+    eval_seq_meta_json: Optional[str],
+) -> dict:
+    if eval_seq_bin_path:
+        resolved_format = _resolve_eval_seq_bin_format(
+            eval_seq_bin_format, eval_seq_meta_json
+        )
+        resolved_dtype = _resolve_eval_seq_bin_dtype(
+            eval_seq_bin_dtype, eval_seq_meta_json
+        )
+        if resolved_format == "token_stream":
+            token_stream = load_pretokenized_token_stream(
+                eval_seq_bin_path, dtype_name=resolved_dtype
+            )
+            return {
+                "kind": "token_stream",
+                "token_stream": token_stream,
+                "dtype_name": resolved_dtype,
+                "source_path": eval_seq_bin_path,
+            }
+        if resolved_format == "sequence":
+            if eval_seq_bin_length is None:
+                raise ValueError(
+                    "--eval_seq_bin_length is required when --eval_seq_bin_format sequence."
+                )
+            return {
+                "kind": "sequence",
+                "seq_bin_path": eval_seq_bin_path,
+                "seq_bin_length": int(eval_seq_bin_length),
+                "dtype_name": resolved_dtype,
+                "source_path": eval_seq_bin_path,
+            }
+        raise ValueError(
+            f"Unsupported --eval_seq_bin_format '{resolved_format}'. "
+            "Expected one of: auto, sequence, token_stream."
+        )
+
+    if not eval_text_file:
+        raise ValueError(
+            "Need either eval_text_file or eval_seq_bin_path for seq-len evaluation."
+        )
+    with open(eval_text_file, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    return {"kind": "text", "text": text, "source_path": eval_text_file}
+
+
+def _build_seq_len_eval_sequences(
+    source: dict, tokenizer: BaseTokenizer, seq_len: int, stride: int
+) -> np.ndarray:
+    kind = source["kind"]
+    if kind == "text":
+        return create_text_dataset(source["text"], tokenizer, seq_len, stride)
+    if kind == "token_stream":
+        return token_stream_to_sequence_view(source["token_stream"], seq_len, stride)
+    if kind == "sequence":
+        expected_len = int(source["seq_bin_length"])
+        if expected_len != seq_len:
+            raise ValueError(
+                f"--eval_seq_bin_format sequence only supports a fixed seq_len={expected_len}; "
+                f"requested seq_len={seq_len}. Use token_stream bins for seq-len sweeps."
+            )
+        return load_pretokenized_sequences(
+            source["seq_bin_path"], seq_length=seq_len, dtype_name=source["dtype_name"]
+        )
+    raise ValueError(f"Unknown seq-len eval source kind: {kind}")
+
+
 def _pop_random_batch(
     shuffle_buffer: List[np.ndarray], batch_size: int, rng: np.random.Generator
 ) -> np.ndarray:
@@ -4271,7 +4385,7 @@ def _evaluate_seq_len_range_core(
     use_transformer: bool,
     use_transformer_ldru: bool,
     use_ldru_transformer: bool,
-    text: str,
+    eval_source: dict,
     seq_lengths: List[int],
     batch_size: int,
     nanogpt_ppl_metric: bool,
@@ -4283,7 +4397,9 @@ def _evaluate_seq_len_range_core(
 
     for seq_len in tqdm.tqdm(seq_lengths, desc="Seq lengths"):
         stride = max(1, seq_len * 2)
-        sequences = create_text_dataset(text, tokenizer, seq_len, stride)
+        sequences = _build_seq_len_eval_sequences(
+            eval_source, tokenizer, seq_len, stride
+        )
 
         if len(sequences) == 0:
             print(f"  [seq_len={seq_len}] No sequences produced – skipping.")
@@ -5009,7 +5125,7 @@ def _plot_multi_model_seq_len_metric(
 
 def evaluate_sequence_length_range(
     checkpoint_path: str,
-    eval_text_file: str,
+    eval_text_file: Optional[str] = None,
     step: int = 1,
     min_seq_len: int = 4,
     max_seq_len: int = 64,
@@ -5023,6 +5139,11 @@ def evaluate_sequence_length_range(
     scan_post_merge_mlp: Optional[bool] = None,
     tokenizer_path: Optional[str] = None,
     tokenizer_type: TokenizerType = TokenizerType.SENTENCEPIECE,
+    eval_seq_bin_path: Optional[str] = None,
+    eval_seq_bin_format: str = "auto",
+    eval_seq_bin_dtype: str = "auto",
+    eval_seq_bin_length: Optional[int] = None,
+    eval_seq_meta_json: Optional[str] = None,
     avg_ppl_y_min: Optional[float] = None,
     avg_ppl_y_max: Optional[float] = None,
     last_ppl_y_min: Optional[float] = None,
@@ -5103,9 +5224,15 @@ def evaluate_sequence_length_range(
         _detect_eval_model_flags(checkpoint_path)
     )
 
-    # --- read the raw text once ---
-    with open(eval_text_file, "r", encoding="utf-8") as fh:
-        text = fh.read()
+    source = _build_seq_len_eval_source(
+        eval_text_file=eval_text_file,
+        eval_seq_bin_path=eval_seq_bin_path,
+        eval_seq_bin_format=eval_seq_bin_format,
+        eval_seq_bin_dtype=eval_seq_bin_dtype,
+        eval_seq_bin_length=eval_seq_bin_length,
+        eval_seq_meta_json=eval_seq_meta_json,
+    )
+    source_desc = source["source_path"]
 
     seq_lengths = list(range(min_seq_len, max_seq_len + 1, 128))
 
@@ -5118,7 +5245,7 @@ def evaluate_sequence_length_range(
     print(f"  Sequence-Length Range Evaluation")
     print(f"{'=' * 60}")
     print(f"  Checkpoint : {checkpoint_path}")
-    print(f"  Eval file  : {eval_text_file}")
+    print(f"  Eval source: {source_desc}")
     print(f"  Model type : {model_type_str}")
     print(f"  Lengths    : {min_seq_len} → {max_seq_len} (step 128)")
     print(f"  Output dir : {plot_dir}")
@@ -5133,7 +5260,7 @@ def evaluate_sequence_length_range(
         use_transformer=use_transformer,
         use_transformer_ldru=use_transformer_ldru,
         use_ldru_transformer=use_ldru_transformer,
-        text=text,
+        eval_source=source,
         seq_lengths=seq_lengths,
         batch_size=batch_size,
         nanogpt_ppl_metric=nanogpt_ppl_metric,
@@ -5322,7 +5449,7 @@ def evaluate_sequence_length_range(
 
 def evaluate_sequence_length_range_list(
     list_path: str,
-    eval_text_file: str,
+    eval_text_file: Optional[str] = None,
     step: int = 1,
     min_seq_len: int = 4,
     max_seq_len: int = 64,
@@ -5335,6 +5462,11 @@ def evaluate_sequence_length_range_list(
     scan_post_merge_mlp: Optional[bool] = None,
     tokenizer_path: Optional[str] = None,
     tokenizer_type: TokenizerType = TokenizerType.SENTENCEPIECE,
+    eval_seq_bin_path: Optional[str] = None,
+    eval_seq_bin_format: str = "auto",
+    eval_seq_bin_dtype: str = "auto",
+    eval_seq_bin_length: Optional[int] = None,
+    eval_seq_meta_json: Optional[str] = None,
     avg_ppl_y_min: Optional[float] = None,
     avg_ppl_y_max: Optional[float] = None,
     last_ppl_y_min: Optional[float] = None,
@@ -5374,12 +5506,20 @@ def evaluate_sequence_length_range_list(
 
     seq_lengths = list(range(min_seq_len, max_seq_len + 1, 128))
 
-    with open(eval_text_file, "r", encoding="utf-8") as fh:
-        text = fh.read()
-
     tokenizer_override = _load_tokenizer_override(tokenizer_path, tokenizer_type)
     if tokenizer_override is not None:
         print(f"Using shared tokenizer override from: {tokenizer_path}")
+
+    # Load the source once; it will be re-windowed per seq_len.
+    source = _build_seq_len_eval_source(
+        eval_text_file=eval_text_file,
+        eval_seq_bin_path=eval_seq_bin_path,
+        eval_seq_bin_format=eval_seq_bin_format,
+        eval_seq_bin_dtype=eval_seq_bin_dtype,
+        eval_seq_bin_length=eval_seq_bin_length,
+        eval_seq_meta_json=eval_seq_meta_json,
+    )
+    source_desc = source["source_path"]
 
     list_stem = os.path.splitext(os.path.basename(list_path))[0]
     if plot_dir is None:
@@ -5391,7 +5531,7 @@ def evaluate_sequence_length_range_list(
     print(f"{'=' * 60}")
     print(f"  List file : {list_path}")
     print(f"  Models    : {len(checkpoint_paths)}")
-    print(f"  Eval file : {eval_text_file}")
+    print(f"  Eval source: {source_desc}")
     print(f"  Lengths   : {min_seq_len} → {max_seq_len} (step 128)")
     print(f"  Output dir: {plot_dir}")
     print(f"{'=' * 60}\n")
@@ -5437,7 +5577,7 @@ def evaluate_sequence_length_range_list(
             use_transformer=use_transformer,
             use_transformer_ldru=use_transformer_ldru,
             use_ldru_transformer=use_ldru_transformer,
-            text=text,
+            eval_source=source,
             seq_lengths=seq_lengths,
             batch_size=batch_size,
             nanogpt_ppl_metric=nanogpt_ppl_metric,
@@ -6071,6 +6211,55 @@ if __name__ == "__main__":
         help="Path to .txt file to evaluate on (used with --evaluate or --compare)",
     )
     parser.add_argument(
+        "--eval_seq_bin",
+        type=str,
+        default=None,
+        help=(
+            "Path to a pretokenized .bin file for sequence-length evaluation. "
+            "Use with --eval_seq_bin_format token_stream for OpenWebText2 token streams."
+        ),
+    )
+    parser.add_argument(
+        "--eval_seq_bin_format",
+        type=str,
+        default="auto",
+        choices=["auto", "sequence", "token_stream"],
+        help=(
+            "Binary format for --eval_seq_bin. "
+            "'token_stream' windows the flat token stream at runtime; "
+            "'sequence' expects fixed-length rows; "
+            "'auto' uses --eval_seq_meta_json when available, otherwise token_stream."
+        ),
+    )
+    parser.add_argument(
+        "--eval_seq_bin_dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "uint16", "uint32", "int32"],
+        help=(
+            "Dtype for --eval_seq_bin. "
+            "'auto' uses --eval_seq_meta_json when available, otherwise uint16."
+        ),
+    )
+    parser.add_argument(
+        "--eval_seq_bin_length",
+        type=int,
+        default=None,
+        help=(
+            "Sequence length stored in a sequence-format --eval_seq_bin. "
+            "Required when --eval_seq_bin_format sequence."
+        ),
+    )
+    parser.add_argument(
+        "--eval_seq_meta_json",
+        type=str,
+        default=None,
+        help=(
+            "Optional metadata JSON from pretokenization, used to infer format/dtype "
+            "when --eval_seq_bin_format or --eval_seq_bin_dtype are auto."
+        ),
+    )
+    parser.add_argument(
         "--seq_length",
         type=int,
         default=None,
@@ -6192,7 +6381,7 @@ if __name__ == "__main__":
         default=None,
         metavar="CHECKPOINT_DIR",
         help="Evaluate a checkpoint over a range of sequence lengths. "
-        "Use with --eval_file, --min_seq_len, and --max_seq_len.",
+        "Use with --eval_file or --eval_seq_bin, plus --min_seq_len and --max_seq_len.",
     )
     parser.add_argument(
         "--eval_seq_len_range_list",
@@ -6201,7 +6390,7 @@ if __name__ == "__main__":
         metavar="LIST_FILE",
         help=(
             "Evaluate multiple checkpoints over a sequence-length range. "
-            "Provide a text file with one checkpoint path per line "
+            "Use with --eval_file or --eval_seq_bin. Provide a text file with one checkpoint path per line "
             "(blank lines and # comments are ignored)."
         ),
     )
@@ -6829,11 +7018,13 @@ if __name__ == "__main__":
     if args.eval_seq_len_range_list:
         use_pow2_random = bool(args.pow_2_expansion_random or args.blelloch_random)
         use_pow2_expand = bool(args.expand_to_power_of_2 or use_pow2_random)
-        eval_file = args.eval_file if args.eval_file else args.text_file
-        if not eval_file:
+        eval_file = args.eval_file if args.eval_file else None
+        if eval_file is None and not args.eval_seq_bin:
+            eval_file = args.text_file
+        if not eval_file and not args.eval_seq_bin:
             print(
-                "Error: --eval_seq_len_range_list requires --eval_file "
-                "(or --text_file)."
+                "Error: --eval_seq_len_range_list requires either --eval_file "
+                "(or --text_file) or --eval_seq_bin."
             )
             exit(1)
         evaluate_sequence_length_range_list(
@@ -6851,6 +7042,11 @@ if __name__ == "__main__":
             scan_post_merge_mlp=args.scan_post_merge_mlp,
             tokenizer_path=args.tokenizer_path,
             tokenizer_type=args.tokenizer_type,
+            eval_seq_bin_path=args.eval_seq_bin,
+            eval_seq_bin_format=args.eval_seq_bin_format,
+            eval_seq_bin_dtype=args.eval_seq_bin_dtype,
+            eval_seq_bin_length=args.eval_seq_bin_length,
+            eval_seq_meta_json=args.eval_seq_meta_json,
             avg_ppl_y_min=_resolve_plot_value(
                 args.seq_len_avg_ppl_min, args.seq_len_ppl_min, None
             ),
@@ -6882,9 +7078,14 @@ if __name__ == "__main__":
     if args.eval_seq_len_range:
         use_pow2_random = bool(args.pow_2_expansion_random or args.blelloch_random)
         use_pow2_expand = bool(args.expand_to_power_of_2 or use_pow2_random)
-        eval_file = args.eval_file if args.eval_file else args.text_file
-        if not eval_file:
-            print("Error: --eval_seq_len_range requires --eval_file (or --text_file).")
+        eval_file = args.eval_file if args.eval_file else None
+        if eval_file is None and not args.eval_seq_bin:
+            eval_file = args.text_file
+        if not eval_file and not args.eval_seq_bin:
+            print(
+                "Error: --eval_seq_len_range requires either --eval_file "
+                "(or --text_file) or --eval_seq_bin."
+            )
             exit(1)
         evaluate_sequence_length_range(
             checkpoint_path=args.eval_seq_len_range,
@@ -6902,6 +7103,11 @@ if __name__ == "__main__":
             scan_post_merge_mlp=args.scan_post_merge_mlp,
             tokenizer_path=args.tokenizer_path,
             tokenizer_type=args.tokenizer_type,
+            eval_seq_bin_path=args.eval_seq_bin,
+            eval_seq_bin_format=args.eval_seq_bin_format,
+            eval_seq_bin_dtype=args.eval_seq_bin_dtype,
+            eval_seq_bin_length=args.eval_seq_bin_length,
+            eval_seq_meta_json=args.eval_seq_meta_json,
             avg_ppl_y_min=_resolve_plot_value(
                 args.seq_len_avg_ppl_min, args.seq_len_ppl_min, None
             ),
